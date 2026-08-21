@@ -92,8 +92,12 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/drive.file",
     ]],
-    [GOOGLE_SHARED_DRIVE_RESOURCE, ["https://www.googleapis.com/auth/drive.readonly"]],
+    [GOOGLE_SHARED_DRIVE_RESOURCE, [
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/drive.file",
+    ]],
     [GOOGLE_DRIVE_FILE_RESOURCE, [
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
@@ -105,19 +109,34 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
     ]);
   });
 
-  it("requires account and file grants to expand beyond metadata-only consent", () => {
-    const oldMetadataGrant = [
+  it("expands old writable Drive grants without widening exact-file or direct bindings", () => {
+    const oldAccountGrant = [
       ...IDENTITY_SCOPES,
       "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/documents.readonly",
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
     ];
-    const granted = grantedResourcesFromScopes(oldMetadataGrant);
-
-    expect(granted).not.toContain(GOOGLE_DRIVE_RESOURCE.urlPattern);
-    expect(granted).not.toContain(GOOGLE_DRIVE_FILE_RESOURCE.urlPattern);
-    expect(grantedResourcesFromScopes([
+    const oldSharedDriveGrant = [
       ...IDENTITY_SCOPES,
       "https://www.googleapis.com/auth/drive.readonly",
-    ])).toContain(GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern);
+    ];
+
+    expect(grantedResourcesFromScopes(oldAccountGrant))
+      .not.toContain(GOOGLE_DRIVE_RESOURCE.urlPattern);
+    expect(grantedResourcesFromScopes(oldSharedDriveGrant))
+      .not.toContain(GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern);
+    expect(grantedResourcesFromScopes(oldAccountGrant))
+      .toContain(GOOGLE_DRIVE_FILE_RESOURCE.urlPattern);
+    expect(resourceUrlPatternsToOAuthScopes([GOOGLE_DOC_RESOURCE.urlPattern])).toEqual([
+      ...IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]);
+    expect(resourceUrlPatternsToOAuthScopes([GOOGLE_SHEETS_RESOURCE.urlPattern])).toEqual([
+      ...IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]);
   });
   it("deduplicates scopes shared between resources", () => {
     let scopes = resourceUrlPatternsToOAuthScopes(

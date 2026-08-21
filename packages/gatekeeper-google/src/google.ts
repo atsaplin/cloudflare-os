@@ -3012,7 +3012,7 @@ export class GoogleDriveGatekeeperImpl
       title: file.name,
       snippet: `Read metadata and, when native, Google Doc or Sheet content from Drive file "${file.name}"`,
       suggestedBindingName: "GOOGLE_DRIVE",
-      tsType: "GoogleDriveSession",
+      tsType: "GoogleDriveReadSession",
     };
   }
 

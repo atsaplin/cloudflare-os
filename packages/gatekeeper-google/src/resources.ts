@@ -145,12 +145,17 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
       "https://www.googleapis.com/auth/drive.metadata.readonly",
       "https://www.googleapis.com/auth/documents.readonly",
       "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/drive.file",
     ],
   },
   {
     resource: GOOGLE_SHARED_DRIVE_RESOURCE,
-    // `drive.readonly` already authorizes Docs and Sheets content; do not add redundant API scopes.
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+    scopes: [
+      // `drive.readonly` already authorizes Docs and Sheets content.
+      "https://www.googleapis.com/auth/drive.readonly",
+      // Limit writes to files this app creates or the user explicitly opens with it.
+      "https://www.googleapis.com/auth/drive.file",
+    ],
   },
   {
     resource: GOOGLE_DRIVE_FILE_RESOURCE,
