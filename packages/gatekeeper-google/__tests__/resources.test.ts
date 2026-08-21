@@ -55,14 +55,14 @@ describe("resource declarations", () => {
     expect(new Set(Object.values(RESOURCE_BY_KIND)).size).toBe(SUPPORTED_RESOURCES.length);
   });
 
-  it("advertises native Docs and Sheets only on Drive resources", () => {
+  it("advertises creation only on broad Drive resources", () => {
     expect([
       GOOGLE_DRIVE_RESOURCE.description,
       GOOGLE_SHARED_DRIVE_RESOURCE.description,
       GOOGLE_DRIVE_FILE_RESOURCE.description,
     ]).toEqual([
-      "Find files and folders, and read native Google Docs and Sheets, in My Drive or Shared with me.",
-      "Find files and folders, and read native Google Docs and Sheets, in one organization-owned shared drive.",
+      "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in My Drive or Shared with me.",
+      "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in one organization-owned shared drive.",
       "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
     ]);
   });

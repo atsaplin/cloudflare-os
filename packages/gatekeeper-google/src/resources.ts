@@ -70,19 +70,19 @@ export const BIGQUERY_RESOURCE: SupportedResource = {
   grantable: true,
 };
 
-/** Files, folders, and read-only native content visible to the connected Google Drive account. */
+/** Files, read-only native content, and blank item creation across one Drive account. */
 export const GOOGLE_DRIVE_RESOURCE: SupportedResource = {
   urlPattern: "https://drive.google.com/drive/my-drive",
   title: "Google Drive Account",
-  description: "Find files and folders, and read native Google Docs and Sheets, in My Drive or Shared with me.",
+  description: "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in My Drive or Shared with me.",
   grantable: true,
 };
 
-/** Files, folders, and read-only native content in one Google Workspace shared drive. */
+/** Files, read-only native content, and blank item creation in one Workspace shared drive. */
 export const GOOGLE_SHARED_DRIVE_RESOURCE: SupportedResource = {
   urlPattern: "https://drive.google.com/drive/folders/:driveId",
   title: "Google Workspace Shared Drive",
-  description: "Find files and folders, and read native Google Docs and Sheets, in one organization-owned shared drive.",
+  description: "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in one organization-owned shared drive.",
   grantable: true,
 };
 
