@@ -1,5 +1,7 @@
 import { RpcStub, RpcTarget } from "cloudflare:workers";
-import type { ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ActionDescription, ApprovalQueue, HookController, HookDescription, ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoogleDocsApi } from "../../src/docs-api";
 import { DriveApi } from "../../src/drive-api";
@@ -8,16 +10,28 @@ import { GoogleSheetsApi } from "../../src/sheets-api";
 
 const DOC_MIME = "application/vnd.google-apps.document";
 const SHEET_MIME = "application/vnd.google-apps.spreadsheet";
+let providerUrls: string[];
 
 async function getAccessToken(): Promise<string> {
   return "access-token";
 }
 
-class TestApprovalQueue extends RpcTarget {
+class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   readonly observations: ObservationDescription[] = [];
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push(description);
+  }
+
+  async submitAction(_action: number, _description: ActionDescription): Promise<void> {
+    throw new Error("Unexpected action submission");
+  }
+
+  async bindHook<Hook extends RpcTarget>(
+    _controller: Fetcher<HookController<Hook>>, _callback: RpcStub<Hook>,
+    _description: HookDescription,
+  ): Promise<void> {
+    throw new Error("Unexpected hook binding");
   }
 }
 
@@ -56,17 +70,20 @@ function installProvider() {
 
 function newSession() {
   const queue = new TestApprovalQueue();
+  const queueStub: RpcStub<ApprovalQueue> = new RpcStub(queue);
   const session = new GoogleDriveSessionImpl(
     new DriveApi(getAccessToken),
     new GoogleDocsApi(getAccessToken),
     new GoogleSheetsApi(getAccessToken),
     { kind: "account" },
-    new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>,
+    queueStub,
   );
   return { queue, session };
 }
 
-beforeEach(() => installProvider());
+beforeEach(() => {
+  providerUrls = installProvider();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Drive nested native sessions", () => {
@@ -85,13 +102,12 @@ describe("Drive nested native sessions", () => {
   });
 
   it("returns the existing Sheet target with bounded range validation", async () => {
-    const urls = installProvider();
     const { session } = newSession();
 
     const sheet = await session.openGoogleSheet("sheet-1");
 
     await expect(sheet.readRange("A:A")).rejects.toThrow(/Invalid or unbounded A1 range/);
-    expect(urls.some(url => url.includes("sheets.googleapis.com"))).toBe(false);
+    expect(providerUrls.some(url => url.includes("sheets.googleapis.com"))).toBe(false);
   });
 
   it("gives each child an independently disposable approval-queue stub", async () => {

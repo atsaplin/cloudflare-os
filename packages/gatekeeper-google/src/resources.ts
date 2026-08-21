@@ -149,6 +149,7 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
   },
   {
     resource: GOOGLE_SHARED_DRIVE_RESOURCE,
+    // `drive.readonly` already authorizes Docs and Sheets content; do not add redundant API scopes.
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
   },
   {
