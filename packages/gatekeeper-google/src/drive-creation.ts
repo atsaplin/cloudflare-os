@@ -6,10 +6,9 @@ import {
   type DriveBindingScope, type DriveCreationParent,
 } from "./drive-session";
 import type { DriveCreationHandle, DriveCreationKind } from "./drive-types";
+import { PendingActionStore, type PendingActionStorage } from "./pending-action-store";
 import { obsContext } from "./observability";
 
-const ACTION_PREFIX = "pending:action:";
-const NEXT_ACTION_ID_KEY = "pending:nextActionId";
 const OUTCOME_PREFIX = "drive:create:outcome:";
 const NEXT_OUTCOME_SEQUENCE_KEY = "drive:create:nextOutcomeSequence";
 const MAX_PENDING_CREATIONS = 100;
@@ -32,12 +31,7 @@ const logger = obsContext.createLogger({
 });
 
 /** Synchronous Durable Object KV operations used by Drive creation state. */
-export interface DriveCreationStorage {
-  get<T>(key: string): T | undefined;
-  put<T>(key: string, value: T): void;
-  delete(key: string): void;
-  list<T>(options: { prefix: string }): Iterable<[string, T]>;
-}
+export type DriveCreationStorage = PendingActionStorage;
 
 /** Narrow provider surface used by creation callbacks. */
 export type DriveCreationApi = Pick<
@@ -49,20 +43,24 @@ export type DriveCreationAction = {
   kind: DriveCreationKind;
   name: string;
   parentId: string;
+  parentAuthority: DriveCreationParent["authority"];
   requestId: string;
 };
 
 /** Persisted callback outcome; provider metadata is intentionally represented only by file ID. */
 export type StoredDriveCreationOutcome =
+  | { status: "applying"; createdFileId?: string }
   | { status: "rejected" }
-  | { status: "failed"; message: string }
+  | { status: "failed"; message: string; createdFileId?: string }
   | { status: "created"; kind: DriveCreationKind; fileId: string }
   | { status: "reverted" };
 
 /** Current authoritative state before created metadata is freshly observed. */
 export type StoredDriveCreationState =
-  | { status: "pending" }
-  | StoredDriveCreationOutcome;
+  | { status: "pending"; lastError?: string }
+  | { status: "rejected" }
+  | { status: "created"; kind: DriveCreationKind; fileId: string }
+  | { status: "reverted" };
 
 type StoredOutcomeRecord = {
   sequence: number;
@@ -71,33 +69,42 @@ type StoredOutcomeRecord = {
 
 /** Durable action and bounded outcome storage for one Drive binding. */
 export class DriveCreationStore {
-  constructor(private storage: DriveCreationStorage) {}
+  #actions: PendingActionStore<DriveCreationAction>;
+
+  constructor(private storage: DriveCreationStorage) {
+    this.#actions = new PendingActionStore(storage);
+  }
 
   submit(action: DriveCreationAction): number {
-    let id = this.storage.get<number>(NEXT_ACTION_ID_KEY) ?? 1;
-    this.storage.put(NEXT_ACTION_ID_KEY, id + 1);
-    this.storage.put(this.#actionKey(id), action);
-    return id;
+    return this.#actions.submit(action);
   }
 
   pendingCount(): number {
-    return [...this.storage.list({ prefix: ACTION_PREFIX })].length;
+    return this.#actions.list().length;
   }
 
   getAction(id: number): DriveCreationAction | undefined {
-    return this.storage.get<DriveCreationAction>(this.#actionKey(id));
+    return this.#actions.get(id);
   }
 
   removeAction(id: number): void {
-    this.storage.delete(this.#actionKey(id));
+    this.#actions.remove(id);
   }
 
   getOutcome(id: number): StoredDriveCreationOutcome | undefined {
     return this.storage.get<StoredOutcomeRecord>(this.#outcomeKey(id))?.outcome;
   }
 
-  putFailure(id: number, message: string): void {
-    this.#putOutcome(id, { status: "failed", message });
+  putApplying(id: number, createdFileId?: string): void {
+    this.#putOutcome(id, {
+      status: "applying", ...(createdFileId ? { createdFileId } : {}),
+    });
+  }
+
+  putFailure(id: number, message: string, createdFileId?: string): void {
+    this.#putOutcome(id, {
+      status: "failed", message, ...(createdFileId ? { createdFileId } : {}),
+    });
   }
 
   finish(id: number, outcome: Exclude<StoredDriveCreationOutcome, { status: "failed" }>): void {
@@ -109,10 +116,6 @@ export class DriveCreationStore {
   cleanupTerminal(id: number): void {
     this.removeAction(id);
     this.#pruneTerminalOutcomes();
-  }
-
-  #actionKey(id: number): string {
-    return `${ACTION_PREFIX}${id}`;
   }
 
   #outcomeKey(id: number): string {
@@ -167,6 +170,7 @@ export async function submitDriveCreation(options: {
     kind: options.kind,
     name: options.name,
     parentId: options.parent.id,
+    parentAuthority: options.parent.authority,
     requestId: options.requestId ?? crypto.randomUUID(),
   };
   let store = new DriveCreationStore(options.storage);
@@ -191,7 +195,8 @@ export async function submitDriveCreation(options: {
   return { id, kind: action.kind, name: action.name };
 }
 
-type DriveCreationRuntime = {
+/** Provider and durable state required by Drive creation callbacks. */
+export type DriveCreationRuntime = {
   storage: DriveCreationStorage;
   api: DriveCreationApi;
   scope: DriveBindingScope;
@@ -203,6 +208,10 @@ export function readDriveCreationState(
 ): StoredDriveCreationState {
   let store = new DriveCreationStore(storage);
   let outcome = store.getOutcome(actionId);
+  if (outcome?.status === "failed") {
+    return { status: "pending", lastError: outcome.message };
+  }
+  if (outcome?.status === "applying") return { status: "pending" };
   if (outcome) return outcome;
   if (store.getAction(actionId)) return { status: "pending" };
   throw new Error(`Unknown Google Drive creation action: ${actionId}`);
@@ -212,19 +221,26 @@ export function readDriveCreationState(
 export async function applyDriveCreation(
   runtime: DriveCreationRuntime, actionId: number,
 ): Promise<void> {
+  if (runtime.scope.kind === "file") {
+    throw new Error("The requested file is outside this Drive binding.");
+  }
   let store = new DriveCreationStore(runtime.storage);
   let outcome = store.getOutcome(actionId);
-  if (outcome && outcome.status !== "failed") {
+  if (outcome && outcome.status !== "failed" && outcome.status !== "applying") {
     store.cleanupTerminal(actionId);
     return;
   }
   let action = store.getAction(actionId);
   if (!action) throw new Error(`Unknown pending Google Drive creation action: ${actionId}`);
+  let knownCreatedFileId = outcome?.status === "failed" || outcome?.status === "applying"
+    ? outcome.createdFileId
+    : undefined;
+  store.putApplying(actionId, knownCreatedFileId);
 
-  let created: DriveFile;
+  let created: DriveFile | undefined;
   try {
     let parent = await runtime.api.getFile(action.parentId);
-    validateDriveCreationParent(runtime.scope, parent);
+    validateDriveCreationParent(runtime.scope, parent, action.parentAuthority);
     created = await runtime.api.findFileByCreationRequestId(action.requestId) ??
       await runtime.api.createFile({
         name: action.name,
@@ -234,7 +250,7 @@ export async function applyDriveCreation(
       });
     validateCreatedFile(runtime.scope, action, created);
   } catch (error) {
-    store.putFailure(actionId, failureMessage(error));
+    store.putFailure(actionId, failureMessage(error), created?.id ?? knownCreatedFileId);
     logger.warn("Drive creation action failed", {
       event: "drive.creation.apply.failed", actionId, operation: "apply", error,
     });
@@ -244,15 +260,58 @@ export async function applyDriveCreation(
   store.finish(actionId, { status: "created", kind: action.kind, fileId: created.id });
 }
 
-/** Record rejection before removing retryable pending state. */
-export function rejectDriveCreation(storage: DriveCreationStorage, actionId: number): void {
-  let store = new DriveCreationStore(storage);
+/** Serialize callbacks for each action while retaining crash recovery in durable state. */
+export class DriveCreationCoordinator {
+  #inFlight = new Map<number, Promise<void>>();
+
+  /** Apply one approved creation after any earlier callback for the same action. */
+  apply(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
+    return this.#run(actionId, () => applyDriveCreation(runtime, actionId));
+  }
+
+  /** Reject one creation after any earlier callback for the same action. */
+  reject(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
+    return this.#run(actionId, () => rejectDriveCreation(runtime, actionId));
+  }
+
+  /** Revert one creation after any earlier callback for the same action. */
+  revert(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
+    return this.#run(actionId, () => revertDriveCreation(runtime, actionId));
+  }
+
+  #run(actionId: number, operation: () => Promise<void>): Promise<void> {
+    let previous = this.#inFlight.get(actionId) ?? Promise.resolve();
+    let current = previous.catch(() => {}).then(operation).finally(() => {
+      if (this.#inFlight.get(actionId) === current) this.#inFlight.delete(actionId);
+    });
+    this.#inFlight.set(actionId, current);
+    return current;
+  }
+}
+
+/** Reject pending creation, first removing any file produced by a failed attempt. */
+export async function rejectDriveCreation(
+  runtime: DriveCreationRuntime, actionId: number,
+): Promise<void> {
+  let store = new DriveCreationStore(runtime.storage);
   let outcome = store.getOutcome(actionId);
-  if (outcome && outcome.status !== "failed") {
+  if (outcome?.status === "rejected") {
     store.cleanupTerminal(actionId);
     return;
   }
-  if (store.getAction(actionId)) store.finish(actionId, { status: "rejected" });
+  if (outcome?.status === "applying") {
+    throw new Error(`Google Drive creation action ${actionId} is currently being applied`);
+  }
+  if (outcome?.status === "created" || outcome?.status === "reverted") {
+    throw new Error(`Google Drive creation action ${actionId} has already been applied`);
+  }
+  if (!store.getAction(actionId)) {
+    throw new Error(`Unknown pending Google Drive creation action: ${actionId}`);
+  }
+  if (outcome?.status === "failed" && outcome.createdFileId) {
+    await trashCreatedFile(runtime, outcome.createdFileId);
+  }
+  store.finish(actionId, { status: "rejected" });
 }
 
 /** Trash a currently authorized created item and record its reverted state. */
@@ -262,10 +321,18 @@ export async function revertDriveCreation(
   let store = new DriveCreationStore(runtime.storage);
   let outcome = store.getOutcome(actionId);
   if (outcome?.status === "reverted") return;
-  if (outcome?.status !== "created") {
+  let fileId: string | undefined;
+  if (outcome?.status === "created") fileId = outcome.fileId;
+  else if (outcome?.status === "failed") fileId = outcome.createdFileId;
+  if (!fileId) {
     throw new Error(`Google Drive creation action ${actionId} cannot be reverted`);
   }
-  let file = await runtime.api.getFile(outcome.fileId);
+  await trashCreatedFile(runtime, fileId);
+  store.finish(actionId, { status: "reverted" });
+}
+
+async function trashCreatedFile(runtime: DriveCreationRuntime, fileId: string): Promise<void> {
+  let file = await runtime.api.getFile(fileId);
   if (runtime.scope.kind === "file" || !isDriveFileInScope(runtime.scope, file)) {
     throw new Error("The requested file is outside this Drive binding.");
   }
@@ -273,7 +340,6 @@ export async function revertDriveCreation(
     throw new Error("The created Google Drive item cannot currently be moved to trash");
   }
   await runtime.api.trashFile(file.id);
-  store.finish(actionId, { status: "reverted" });
 }
 
 function validateCreatedFile(

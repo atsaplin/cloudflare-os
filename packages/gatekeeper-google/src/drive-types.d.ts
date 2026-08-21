@@ -1,4 +1,3 @@
-import type { RpcTarget } from "cloudflare:workers";
 import type { GoogleDocReadSession } from "./docs-read-types";
 import type { GoogleSpreadsheetSession } from "./sheets-types";
 
@@ -117,7 +116,7 @@ export type DriveCreationKind = "googleDoc" | "googleSheet" | "folder";
 export interface DriveCreationOptions {
   /** Non-empty name for the new item. */
   name: string;
-  /** Destination folder ID; defaults to My Drive root or the bound shared-drive root. */
+  /** Destination folder ID; defaults to the binding root and otherwise must name a folder created by this app. */
   parentId?: string;
 }
 
@@ -131,11 +130,10 @@ export interface DriveCreationHandle {
   name: string;
 }
 
-/** Current outcome of a Drive creation request. */
+/** Current outcome of a Drive creation request. Failed attempts remain pending and can be retried or rejected. */
 export type DriveCreationOutcome =
-  | { status: "pending" }
+  | { status: "pending"; lastError?: string }
   | { status: "rejected" }
-  | { status: "failed"; message: string }
   | { status: "reverted" }
   | { status: "created"; kind: DriveCreationKind; entry: DriveEntry };
 
@@ -144,7 +142,7 @@ export type DriveCreationOutcome =
  *
  * Methods do not follow shortcut targets, edit Drive, or read non-native file contents.
  */
-export interface GoogleDriveReadSession extends RpcTarget {
+export interface GoogleDriveReadSession {
   /** Return the immutable binding scope with current display metadata. */
   getScope(): Promise<DriveScope>;
 
@@ -190,6 +188,6 @@ export interface GoogleDriveSession extends GoogleDriveReadSession {
   createGoogleSheet(options: DriveCreationOptions): Promise<DriveCreationHandle>;
   /** Queue creation of a folder. */
   createFolder(options: DriveCreationOptions): Promise<DriveCreationHandle>;
-  /** Read the current outcome for a previously returned handle. */
+  /** Read the current outcome. Old terminal outcomes are retained only within the binding's bounded history. */
   getCreationResult(handle: DriveCreationHandle): Promise<DriveCreationOutcome>;
 }

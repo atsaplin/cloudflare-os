@@ -10,6 +10,7 @@ const MAX_BATCH_RESPONSE_BYTES = 1_000_000;
 const MAX_JSON_RESPONSE_BYTES = 5_000_000;
 const DRIVE_API_TIMEOUT_MS = 30_000;
 const CREATION_REQUEST_PROPERTY = "gadgetsCreationRequestId";
+const MAX_CREATION_MARKER_PAGES = 100;
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const logger = obsContext.createLogger({
@@ -29,8 +30,15 @@ export type DriveFile = {
   webViewLink?: string;
   shortcutDetails?: { targetId?: string; targetMimeType?: string };
   trashed?: boolean;
+  appProperties?: { gadgetsCreationRequestId?: string };
   capabilities?: { canAddChildren?: boolean; canTrash?: boolean };
 };
+
+/** Whether current metadata proves that this OAuth client created the file. */
+export function hasDriveCreationMarker(file: DriveFile): boolean {
+  let requestId = file.appProperties?.[CREATION_REQUEST_PROPERTY];
+  return requestId !== undefined && UUID_V4_PATTERN.test(requestId);
+}
 
 /** Current metadata for one shared drive. */
 export type DriveInfo = { id: string; name: string };
@@ -38,7 +46,7 @@ export type DriveInfo = { id: string; name: string };
 const DRIVE_FILE_ITEM_FIELDS = [
   "id", "name", "mimeType", "modifiedTime", "size", "parents", "driveId",
   "owners(displayName,emailAddress)", "webViewLink",
-  "shortcutDetails(targetId,targetMimeType)", "trashed",
+  "shortcutDetails(targetId,targetMimeType)", "trashed", "appProperties",
   "capabilities(canAddChildren,canTrash)",
 ].join(",");
 
@@ -221,6 +229,14 @@ function parseDriveFile(value: unknown): DriveFile {
   }
   let parents = optionalStringArray(value.parents, "file parents");
   let trashed = optionalBoolean(value.trashed, "file trashed state");
+  let appProperties: DriveFile["appProperties"];
+  if (value.appProperties !== undefined) {
+    if (!isRecord(value.appProperties)) throw new Error("Invalid Google Drive app properties");
+    let requestId = optionalString(
+      value.appProperties[CREATION_REQUEST_PROPERTY], "creation request app property",
+    );
+    appProperties = requestId ? { [CREATION_REQUEST_PROPERTY]: requestId } : {};
+  }
   let capabilities = parseDriveCapabilities(value.capabilities);
   return {
     id: value.id,
@@ -232,6 +248,7 @@ function parseDriveFile(value: unknown): DriveFile {
     ...(owners ? { owners } : {}),
     ...(shortcutDetails ? { shortcutDetails } : {}),
     ...(trashed === undefined ? {} : { trashed }),
+    ...(appProperties ? { appProperties } : {}),
     ...(capabilities ? { capabilities } : {}),
   };
 }
@@ -350,18 +367,25 @@ export class DriveApi {
       supportsAllDrives: "true",
       includeItemsFromAllDrives: "true",
     });
-    let body = await this.#getUnknown("/files", params, "find created file");
-    if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
-    let files: DriveFile[] = [];
-    if (body.files !== undefined) {
-      if (!Array.isArray(body.files)) throw new Error("Invalid Google Drive file-list response");
-      files = body.files.map(parseDriveFile);
+    let found: DriveFile | undefined;
+    for (let page = 0; page < MAX_CREATION_MARKER_PAGES; page++) {
+      let body = await this.#getUnknown("/files", params, "find created file");
+      if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
+      if (body.files !== undefined) {
+        if (!Array.isArray(body.files)) throw new Error("Invalid Google Drive file-list response");
+        for (let value of body.files) {
+          let file = parseDriveFile(value);
+          if (found) {
+            throw new Error("Multiple Google Drive files matched one creation request");
+          }
+          found = file;
+        }
+      }
+      let nextPageToken = optionalString(body.nextPageToken, "nextPageToken");
+      if (!nextPageToken) return found;
+      params.set("pageToken", nextPageToken);
     }
-    let nextPageToken = optionalString(body.nextPageToken, "nextPageToken");
-    if (files.length > 1 || nextPageToken !== undefined) {
-      throw new Error("Multiple Google Drive files matched one creation request");
-    }
-    return files[0];
+    throw new Error("Google Drive creation marker lookup exceeded its page limit");
   }
 
   /** Move one Drive item to trash. */

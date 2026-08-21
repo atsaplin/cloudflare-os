@@ -1,6 +1,6 @@
 import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { CursorPager, type Pager } from "./cursor";
-import type { DriveApi, DriveFile, DriveListFilesOptions } from "./drive-api";
+import { hasDriveCreationMarker, type DriveApi, type DriveFile, type DriveListFilesOptions } from "./drive-api";
 import type { ObserverCheck } from "./observers";
 import type {
   DriveEntry, DriveListOptions, DriveOrder, DriveScope, DriveSearchQuery,
@@ -19,8 +19,15 @@ export type DriveBindingScope =
   | { kind: "sharedDrive"; driveId: string }
   | { kind: "file"; fileId: string };
 
+/** How a creation destination is authorized under the per-file OAuth grant. */
+export type DriveCreationParentAuthority = "root" | "appCreated";
+
 /** Canonical destination metadata safe to persist after observation authorization. */
-export type DriveCreationParent = { id: string; name: string };
+export type DriveCreationParent = {
+  id: string;
+  name: string;
+  authority: DriveCreationParentAuthority;
+};
 
 /** Whether current provider metadata remains inside immutable binding authority. */
 export function isDriveFileInScope(scope: DriveBindingScope, file: DriveFile): boolean {
@@ -33,7 +40,7 @@ export function isDriveFileInScope(scope: DriveBindingScope, file: DriveFile): b
 
 /** Validate current provider metadata as a writable creation destination. */
 export function validateDriveCreationParent(
-  scope: DriveBindingScope, file: DriveFile,
+  scope: DriveBindingScope, file: DriveFile, authority: DriveCreationParentAuthority,
 ): DriveCreationParent {
   if (scope.kind === "file" || !isDriveFileInScope(scope, file)) {
     throw new Error("The requested file is outside this Drive binding.");
@@ -41,10 +48,16 @@ export function validateDriveCreationParent(
   if (file.mimeType !== FOLDER_MIME_TYPE) {
     throw new Error("Drive creation parent must identify a folder");
   }
+  if (file.trashed !== false) {
+    throw new Error("Drive creation parent is trashed");
+  }
+  if (authority === "appCreated" && !hasDriveCreationMarker(file)) {
+    throw new Error("Drive creation parent must be the root or a folder created by this app");
+  }
   if (file.capabilities?.canAddChildren !== true) {
     throw new Error("Drive creation parent does not allow adding children");
   }
-  return { id: file.id, name: file.name };
+  return { id: file.id, name: file.name, authority };
 }
 
 type DriveSessionApi = Pick<DriveApi, "listFiles" | "getFile" | "getDrive">;
@@ -196,20 +209,14 @@ export class DriveSessionCore {
     let requestedId = parentId ??
       (this.#scope.kind === "sharedDrive" ? this.#scope.driveId : "root");
     let parent = await this.#api.getFile(requestedId);
-    let resolved = validateDriveCreationParent(this.#scope, parent);
+    let authority: DriveCreationParentAuthority = parentId === undefined ? "root" : "appCreated";
+    let resolved = validateDriveCreationParent(this.#scope, parent, authority);
     await this.#authorizeIds(
       [parent.id],
       "Check Google Drive creation destination",
       "Check that the requested creation destination belongs to this Drive binding.",
     );
     return resolved;
-  }
-
-  /** Re-fetch and validate a previously resolved creation destination before mutation. */
-  async revalidateCreationParent(parentId: string): Promise<DriveCreationParent> {
-    if (this.#scope.kind === "file") this.#outsideScope();
-    if (!parentId.trim()) throw new Error("parentId must not be empty");
-    return validateDriveCreationParent(this.#scope, await this.#api.getFile(parentId));
   }
 
   async list(options: DriveListOptions = {}): Promise<Pager<DriveEntry>> {

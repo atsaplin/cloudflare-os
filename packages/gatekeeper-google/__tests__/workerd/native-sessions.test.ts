@@ -199,7 +199,7 @@ describe("Drive nested native sessions", () => {
 describe("Drive creation RPC", () => {
   it("round-trips handles and authoritative created outcomes through a real RPC stub", async () => {
     const { driveApi, queue, session, storage } = newSession();
-    const rpc: RpcStub<GoogleDriveSession> = new RpcStub(session);
+    const rpc = new RpcStub(session);
 
     const doc = await rpc.createGoogleDoc({ name: "Quarterly plan" });
     const sheet = await rpc.createGoogleSheet({ name: "Forecast" });

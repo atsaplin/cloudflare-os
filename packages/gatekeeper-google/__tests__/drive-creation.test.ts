@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  applyDriveCreation, DriveCreationStore, readDriveCreationState, rejectDriveCreation,
-  revertDriveCreation, submitDriveCreation,
+  applyDriveCreation, DriveCreationCoordinator, DriveCreationStore, readDriveCreationState,
+  rejectDriveCreation, revertDriveCreation, submitDriveCreation,
   type DriveCreationApi, type DriveCreationStorage,
 } from "../src/drive-creation";
 import type { DriveFile } from "../src/drive-api";
@@ -55,6 +55,7 @@ const parent = (overrides: Partial<DriveFile> = {}): DriveFile => file({
   name: "Plans",
   mimeType: FOLDER_MIME_TYPE,
   parents: ["root"],
+  appProperties: { gadgetsCreationRequestId: REQUEST_ID },
   capabilities: { canAddChildren: true },
   ...overrides,
 });
@@ -73,6 +74,7 @@ const action = {
   kind: "googleDoc" as const,
   name: "Quarterly plan",
   parentId: "parent-1",
+  parentAuthority: "appCreated" as const,
   requestId: REQUEST_ID,
 };
 
@@ -88,7 +90,7 @@ async function submit(
     approvalQueue,
     kind: overrides.kind ?? "googleDoc",
     name: overrides.name ?? "Quarterly plan",
-    parent: { id: "parent-1", name: "Plans" },
+    parent: { id: "parent-1", name: "Plans", authority: "appCreated" },
     requestId: REQUEST_ID,
   });
 }
@@ -105,7 +107,8 @@ describe("Drive creation submission", () => {
       id: 1, kind: "googleDoc", name,
     });
     expect(new DriveCreationStore(storage).getAction(1)).toEqual({
-      kind: "googleDoc", name, parentId: "parent-1", requestId: REQUEST_ID,
+      kind: "googleDoc", name, parentId: "parent-1", parentAuthority: "appCreated",
+      requestId: REQUEST_ID,
     });
     expect(approvalQueue.submitAction).toHaveBeenCalledTimes(1);
     let [id, description] = approvalQueue.submitAction.mock.calls[0]!;
@@ -157,7 +160,9 @@ describe("Drive creation action lifecycle", () => {
     let handle = await submit(storage);
     expect(readDriveCreationState(storage, handle.id)).toEqual({ status: "pending" });
 
-    rejectDriveCreation(storage, handle.id);
+    await rejectDriveCreation(
+      { storage, api: fakeApi(), scope: { kind: "account" } }, handle.id,
+    );
 
     expect(readDriveCreationState(storage, handle.id)).toEqual({ status: "rejected" });
     expect(new DriveCreationStore(storage).getAction(handle.id)).toBeUndefined();
@@ -165,7 +170,7 @@ describe("Drive creation action lifecycle", () => {
       .toBeLessThan(storage.events.indexOf("delete:pending:action:1"));
   });
 
-  it("stores provider failure while keeping the action retryable", async () => {
+  it("reports a failed attempt as retryable pending state", async () => {
     let storage = new FakeKv();
     let handle = await submit(storage);
     let api = fakeApi({
@@ -176,9 +181,113 @@ describe("Drive creation action lifecycle", () => {
       { storage, api, scope: { kind: "account" } }, handle.id,
     )).rejects.toThrow("provider unavailable");
     expect(readDriveCreationState(storage, handle.id)).toEqual({
-      status: "failed", message: "provider unavailable",
+      status: "pending", lastError: "provider unavailable",
     });
     expect(new DriveCreationStore(storage).getAction(handle.id)).toEqual(action);
+  });
+
+  it("serializes concurrent apply callbacks for one creation", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let resolveCreate!: (value: DriveFile) => void;
+    let createFile = vi.fn(() => new Promise<DriveFile>(resolve => { resolveCreate = resolve; }));
+    let api = fakeApi({ createFile });
+    let coordinator = new DriveCreationCoordinator();
+    let runtime = { storage, api, scope: { kind: "account" } as const };
+
+    let first = coordinator.apply(runtime, handle.id);
+    let second = coordinator.apply(runtime, handle.id);
+    await vi.waitFor(() => expect(createFile).toHaveBeenCalledTimes(1));
+    resolveCreate(file());
+    await Promise.all([first, second]);
+
+    expect(createFile).toHaveBeenCalledTimes(1);
+    expect(readDriveCreationState(storage, handle.id).status).toBe("created");
+  });
+
+  it("recovers an apply left durably in progress after an instance restart", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let store = new DriveCreationStore(storage);
+    store.putApplying(handle.id);
+    let api = fakeApi();
+
+    await applyDriveCreation({ storage, api, scope: { kind: "account" } }, handle.id);
+
+    expect(api.findFileByCreationRequestId).toHaveBeenCalledTimes(1);
+    expect(api.createFile).toHaveBeenCalledTimes(1);
+    expect(readDriveCreationState(storage, handle.id).status).toBe("created");
+  });
+
+  it("refuses rejection while the same creation is being applied", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let resolveCreate!: (value: DriveFile) => void;
+    let api = fakeApi({
+      createFile: vi.fn(() => new Promise<DriveFile>(resolve => { resolveCreate = resolve; })),
+    });
+    let runtime = { storage, api, scope: { kind: "account" } as const };
+    let applying = new DriveCreationCoordinator().apply(runtime, handle.id);
+    await vi.waitFor(() => expect(api.createFile).toHaveBeenCalledTimes(1));
+
+    await expect(rejectDriveCreation(runtime, handle.id)).rejects.toThrow(/currently being applied/);
+    resolveCreate(file());
+    await applying;
+    expect(readDriveCreationState(storage, handle.id).status).toBe("created");
+  });
+
+  it("serializes rejection behind an in-flight apply callback", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let resolveCreate!: (value: DriveFile) => void;
+    let api = fakeApi({
+      createFile: vi.fn(() => new Promise<DriveFile>(resolve => { resolveCreate = resolve; })),
+    });
+    let coordinator = new DriveCreationCoordinator();
+    let runtime = { storage, api, scope: { kind: "account" } as const };
+    let applying = coordinator.apply(runtime, handle.id);
+    await vi.waitFor(() => expect(api.createFile).toHaveBeenCalledTimes(1));
+
+    let rejecting = coordinator.reject(runtime, handle.id);
+    resolveCreate(file());
+    await applying;
+    await expect(rejecting).rejects.toThrow(/already been applied/);
+    expect(api.createFile).toHaveBeenCalledTimes(1);
+    expect(readDriveCreationState(storage, handle.id).status).toBe("created");
+  });
+
+  it("retains and cleans up a created file when response validation fails", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let api = fakeApi({ createFile: vi.fn(async () => file({ name: "Unexpected" })) });
+    let runtime = { storage, api, scope: { kind: "account" } as const };
+
+    await expect(applyDriveCreation(runtime, handle.id))
+      .rejects.toThrow("creation marker matched unexpected file metadata");
+    expect(new DriveCreationStore(storage).getOutcome(handle.id)).toEqual({
+      status: "failed",
+      message: "Google Drive creation marker matched unexpected file metadata",
+      createdFileId: "created-1",
+    });
+
+    await rejectDriveCreation(runtime, handle.id);
+    expect(api.trashFile).toHaveBeenCalledWith("created-1");
+    expect(readDriveCreationState(storage, handle.id)).toEqual({ status: "rejected" });
+  });
+
+  it("preserves a known created file ID when a later retry fails early", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let api = fakeApi({ createFile: vi.fn(async () => file({ name: "Unexpected" })) });
+    let runtime = { storage, api, scope: { kind: "account" } as const };
+    await expect(applyDriveCreation(runtime, handle.id)).rejects.toThrow();
+    api.getFile = vi.fn(async () => { throw new Error("parent unavailable"); });
+
+    await expect(applyDriveCreation(runtime, handle.id)).rejects.toThrow("parent unavailable");
+
+    expect(new DriveCreationStore(storage).getOutcome(handle.id)).toEqual({
+      status: "failed", message: "parent unavailable", createdFileId: "created-1",
+    });
   });
 
   it("records creation before removing pending state and trashes it on revert", async () => {
@@ -264,8 +373,21 @@ describe("Drive creation action lifecycle", () => {
     await expect(applyDriveCreation({ storage, api, scope }, handle.id))
       .rejects.toThrow("creation marker matched unexpected file metadata");
     expect(createFile).not.toHaveBeenCalled();
-    expect(readDriveCreationState(storage, handle.id).status).toBe("failed");
+    expect(readDriveCreationState(storage, handle.id).status).toBe("pending");
     expect(new DriveCreationStore(storage).getAction(handle.id)).toBeDefined();
+  });
+
+  it("rejects a file-scoped apply callback before marker lookup or creation", async () => {
+    let storage = new FakeKv();
+    let handle = await submit(storage);
+    let api = fakeApi();
+
+    await expect(applyDriveCreation(
+      { storage, api, scope: { kind: "file", fileId: "parent-1" } }, handle.id,
+    )).rejects.toThrow(/outside this Drive binding/);
+    expect(api.getFile).not.toHaveBeenCalled();
+    expect(api.findFileByCreationRequestId).not.toHaveBeenCalled();
+    expect(api.createFile).not.toHaveBeenCalled();
   });
 
   it("fails before marker lookup when the approved parent moved out of scope", async () => {

@@ -66,7 +66,6 @@ describe("embedded agent declarations", () => {
 
   it("keeps the Drive declaration aligned after module-only imports", () => {
     const modulePrefix =
-      'import type { RpcTarget } from "cloudflare:workers";\n' +
       'import type { GoogleDocReadSession } from "./docs-read-types";\n' +
       'import type { GoogleSpreadsheetSession } from "./sheets-types";\n\n';
     const driveTypes = source("drive-types.d.ts");

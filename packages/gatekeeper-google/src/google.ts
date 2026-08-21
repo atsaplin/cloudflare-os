@@ -78,10 +78,10 @@ import {
 import { ObserverCheck, ObserverTracker } from "./observers";
 import { CursorPager, Pager } from "./cursor";
 import { formatApprovalField, sanitizeApprovalTitle } from "./approval-format";
+import { PendingActionStore } from "./pending-action-store";
 import {
-  applyDriveCreation, assertDriveCreationCapacity, readDriveCreationState, rejectDriveCreation,
-  revertDriveCreation, submitDriveCreation, validateDriveCreationName,
-  type DriveCreationStorage,
+  assertDriveCreationCapacity, DriveCreationCoordinator, readDriveCreationState,
+  submitDriveCreation, validateDriveCreationName, type DriveCreationStorage,
 } from "./drive-creation";
 
 const GOOGLE_DOC_TYPES_CODE = [DOCS_READ_TYPES_CODE, DOCS_TYPES_CODE].join("\n");
@@ -1006,43 +1006,6 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
   }
 }
 
-class PendingActionStore<Action> {
-  #kv: DurableObjectStorage["kv"];
-
-  constructor(kv: DurableObjectStorage["kv"]) {
-    this.#kv = kv;
-  }
-
-  #actionKey(id: number): string {
-    return `pending:action:${id}`;
-  }
-
-  submit(action: Action): number {
-    let id = this.#kv.get<number>("pending:nextActionId") ?? 1;
-    this.#kv.put("pending:nextActionId", id + 1);
-    this.#kv.put(this.#actionKey(id), action);
-    return id;
-  }
-
-  get(id: number): Action | undefined {
-    return this.#kv.get<Action>(this.#actionKey(id));
-  }
-
-  put(id: number, action: Action): void {
-    this.#kv.put(this.#actionKey(id), action);
-  }
-
-  list(): {id: number, action: Action}[] {
-    return [...this.#kv.list<Action>({prefix: "pending:action:"})]
-        .map(([key, action]) => ({id: Number(key.slice("pending:action:".length)), action}))
-        .filter(({id}) => Number.isFinite(id))
-        .toSorted((a, b) => a.id - b.id);
-  }
-
-  remove(id: number): void {
-    this.#kv.delete(this.#actionKey(id));
-  }
-}
 
 // =======================================================================================
 // Gmail capability stubs
@@ -2972,6 +2935,7 @@ type GoogleDriveGatekeeperImplProps = {
 export class GoogleDriveGatekeeperImpl
     extends DurableObject<Env, GoogleDriveGatekeeperImplProps>
     implements Gatekeeper<GoogleDriveSession> {
+  #creationCoordinator = new DriveCreationCoordinator();
   #tokens = new AccessTokenCache(opts => {
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
@@ -3039,15 +3003,15 @@ export class GoogleDriveGatekeeperImpl
   }
 
   async applyAction(action: number): Promise<void> {
-    await applyDriveCreation(this.#creationRuntime(), action);
+    await this.#creationCoordinator.apply(this.#creationRuntime(), action);
   }
 
   async rejectAction(action: number): Promise<void> {
-    rejectDriveCreation(this.ctx.storage.kv, action);
+    await this.#creationCoordinator.reject(this.#creationRuntime(), action);
   }
 
   async revertAction(action: number): Promise<void> {
-    await revertDriveCreation(this.#creationRuntime(), action);
+    await this.#creationCoordinator.revert(this.#creationRuntime(), action);
   }
 
   #creationRuntime() {
