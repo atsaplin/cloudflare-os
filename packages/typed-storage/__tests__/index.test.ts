@@ -611,3 +611,60 @@ describe("non-unique index by array", () => {
     expect([...index.list()]).toStrictEqual([BOB, DAVE, DAVE]);
   });
 });
+
+describe("non-unique index rebuild", () => {
+  const INDEXED_SCHEMA = {
+    collections: {
+      users: collection<User>()({
+        primaryKey: "name",
+        nonUniqueIndexes: {
+          byLevel: (user: User) => user.level == 0 ? null : user.level
+        }
+      })
+    }
+  };
+
+  it("backfills an index declared after records were written", () => {
+    let mockStorage = makeMockStorage();
+    let legacy = createTypedStorage(mockStorage, {
+      collections: { users: collection<User>()({ primaryKey: "name" }) }
+    });
+    legacy.users.put(BOB);
+    legacy.users.put(ALICE);
+    legacy.users.put(CAROL);
+    legacy.users.put(EVE);
+
+    let storage = createTypedStorage(mockStorage, INDEXED_SCHEMA);
+
+    // Declared over pre-existing records, the index starts empty -- and resolving one of those
+    // records would throw on the index's remove.
+    expect([...storage.users.byLevel.list()]).toStrictEqual([]);
+    expect(() => storage.users.put({...ALICE, level: 0})).toThrow("inconsistent");
+
+    storage.users.byLevel.rebuild();
+    expect([...storage.users.byLevel.list()]).toStrictEqual([BOB, ALICE, CAROL]);
+    expect([...storage.users.byLevel.get(8)]).toStrictEqual([ALICE, CAROL]);
+
+    // Writes after the rebuild keep the index consistent, including key removal.
+    storage.users.put({...ALICE, level: 0});
+    expect([...storage.users.byLevel.list()]).toStrictEqual([BOB, CAROL]);
+  });
+
+  it("discards stale entries for records changed behind the index's back", () => {
+    let mockStorage = makeMockStorage();
+    let storage = createTypedStorage(mockStorage, INDEXED_SCHEMA);
+    storage.users.put(ALICE);
+    storage.users.put(DAVE);
+
+    // Mutate through a view without the index, leaving it stale: DAVE gone, BOB unindexed.
+    let legacy = createTypedStorage(mockStorage, {
+      collections: { users: collection<User>()({ primaryKey: "name" }) }
+    });
+    legacy.users.delete("dave");
+    legacy.users.put(BOB);
+
+    storage.users.byLevel.rebuild();
+    expect([...storage.users.byLevel.list()]).toStrictEqual([BOB, ALICE]);
+    expect([...storage.users.byLevel.get(1)]).toStrictEqual([]);
+  });
+});

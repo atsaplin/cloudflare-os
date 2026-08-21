@@ -68,6 +68,14 @@ export interface NonUniqueIndex<T, Key> {
   get(key: Key): Iterable<T>;
   list(options?: ListOptions<Key>): Iterable<T>;
   delete(key: Key): number;
+
+  /**
+   * Discard the index's contents and re-derive them from the collection's records. Indexes are
+   * only maintained at write time, so an index declared after records already exist starts empty
+   * (and updates to those records would corrupt it, or throw); a migration must rebuild() such an
+   * index before the records are touched.
+   */
+  rebuild(): void;
 }
 
 type Key = string | number;
@@ -375,14 +383,15 @@ function createCollection<
 
   // Add a subscriber subscribing on behalf of an index based on the given IndexFunction. This
   // code is shared for unique and non-unique indexes. This code in particular takes care of the
-  // case where the index function returns an array.
+  // case where the index function returns an array. Returns the subscriber's add(), so callers
+  // can also feed pre-existing records into the index (see rebuild()).
   function addIndexSubscriber(
       idx: IndexFunction<T>,
       ops: {
         add(idxKey: Key, pk: Key, type: "Insertion" | "Update"): void;
         remove(idxKey: Key, pk: Key): void;
-      }) {
-    subscribers.add({
+      }): (record: T) => void {
+    let subscriber: Subscriber<T> = {
       add(record: T) {
         let pk = pkForT(record);
         let idxKeys = idx(record);
@@ -451,7 +460,9 @@ function createCollection<
           ops.remove(idxKeys, pk);
         }
       }
-    });
+    };
+    subscribers.add(subscriber);
+    return subscriber.add;
   }
 
   // ---------------------------------------------------------------------------
@@ -510,6 +521,32 @@ function createCollection<
   for (let [idxName, idx] of Object.entries(schema.nonUniqueIndexes || {})) {
     let idxKv = new KvPrefixedView<number>(storage.kv, `${name}.${idxName}`);
 
+    let addToIndex = addIndexSubscriber(idx as IndexFunction<T>, {
+      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
+        let id = idxKv.get(idxKey);
+        if (id === undefined) {
+          id = idxKv.getUnidqueId();
+          idxKv.put(idxKey, id);
+        }
+
+        let child = idxKv.getChild(id.toString());
+        child.put(pk, {});
+      },
+      remove(idxKey: Key, pk: Key) {
+        let id = idxKv.get(idxKey);
+        if (id === undefined) {
+          throw new Error(
+              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
+        }
+
+        let child = idxKv.getChild(id.toString());
+        child.delete(pk);
+        if (Array.from(child.list({limit: 1})).length == 0) {
+          idxKv.delete(idxKey);
+        }
+      }
+    });
+
     let index: NonUniqueIndex<T, Key> = {
       *get(key: Key): Generator<T, void> {
         let id = idxKv.get(key)
@@ -562,34 +599,23 @@ function createCollection<
           return count;
         }
       },
-    };
-    result[idxName] = index;
-
-    addIndexSubscriber(idx as IndexFunction<T>, {
-      add(idxKey: Key, pk: Key, type: "Insertion" | "Update") {
-        let id = idxKv.get(idxKey);
-        if (id === undefined) {
-          id = idxKv.getUnidqueId();
-          idxKv.put(idxKey, id);
-        }
-
-        let child = idxKv.getChild(id.toString());
-        child.put(pk, {});
-      },
-      remove(idxKey: Key, pk: Key) {
-        let id = idxKv.get(idxKey);
-        if (id === undefined) {
-          throw new Error(
-              `Index '${name}.${idxName}' is inconsistent: removed record is not present.`);
-        }
-
-        let child = idxKv.getChild(id.toString());
-        child.delete(pk);
-        if (Array.from(child.list({limit: 1})).length == 0) {
+      rebuild(): void {
+        // Each list is buffered upfront: the deletes and puts below would otherwise run under an
+        // open list() cursor.
+        for (let idxKey of Array.from(idxKv.listKeys())) {
+          let id = idxKv.get(idxKey)!;
+          let child = idxKv.getChild(id.toString());
+          for (let pk of Array.from(child.listKeys())) {
+            child.delete(pk);
+          }
           idxKv.delete(idxKey);
         }
-      }
-    });
+        for (let record of Array.from(collection.list())) {
+          addToIndex(record);
+        }
+      },
+    };
+    result[idxName] = index;
   }
 
   // ---------------------------------------------------------------------------
