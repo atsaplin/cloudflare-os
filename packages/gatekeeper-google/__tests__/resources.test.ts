@@ -123,15 +123,20 @@ describe("resourceUrlPatternsToOAuthScopes", () => {
   });
 
   it("requires account and file grants to expand beyond metadata-only consent", () => {
+    const drivePatterns = [
+      GOOGLE_DRIVE_RESOURCE.urlPattern,
+      GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern,
+      GOOGLE_DRIVE_FILE_RESOURCE.urlPattern,
+    ];
     const oldMetadataGrant = [
       ...IDENTITY_SCOPES,
       "https://www.googleapis.com/auth/drive.metadata.readonly",
     ];
-    const granted = grantedResourcesFromScopes(oldMetadataGrant);
+    const granted = resourcesCoveredByScopes(drivePatterns, oldMetadataGrant);
 
     expect(granted).not.toContain(GOOGLE_DRIVE_RESOURCE.urlPattern);
     expect(granted).not.toContain(GOOGLE_DRIVE_FILE_RESOURCE.urlPattern);
-    expect(grantedResourcesFromScopes([
+    expect(resourcesCoveredByScopes(drivePatterns, [
       ...IDENTITY_SCOPES,
       "https://www.googleapis.com/auth/drive.readonly",
     ])).toContain(GOOGLE_SHARED_DRIVE_RESOURCE.urlPattern);

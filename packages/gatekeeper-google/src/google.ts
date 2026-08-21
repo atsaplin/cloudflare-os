@@ -75,11 +75,32 @@ import {
 } from "./resources";
 import { type ObserverBatchResult, type ObserverCheck, ObserverTracker } from "./observers";
 import { CursorPager, Pager } from "./cursor";
+import {
+  DOCS_TYPES_MODULE_PREFIX, DRIVE_TYPES_MODULE_PREFIX, stripTypeModulePrefix,
+} from "./type-bundle";
 
-const GOOGLE_DOC_TYPES_CODE = [DOCS_READ_TYPES_CODE, DOCS_TYPES_CODE].join("\n");
-const GOOGLE_DRIVE_TYPES_CODE = [
-  DOCS_READ_TYPES_CODE, SHEETS_TYPES_CODE, DRIVE_TYPES_CODE,
-].join("\n");
+let googleDocTypesCode: string | undefined;
+let driveAgentTypesCode: string | undefined;
+let googleDriveTypesCode: string | undefined;
+
+function getGoogleDocTypesCode(): string {
+  return googleDocTypesCode ??= [
+    DOCS_READ_TYPES_CODE,
+    stripTypeModulePrefix(DOCS_TYPES_CODE, DOCS_TYPES_MODULE_PREFIX),
+  ].join("\n");
+}
+
+function getDriveAgentTypesCode(): string {
+  return driveAgentTypesCode ??= stripTypeModulePrefix(
+    DRIVE_TYPES_CODE, DRIVE_TYPES_MODULE_PREFIX,
+  );
+}
+
+function getGoogleDriveTypesCode(): string {
+  return googleDriveTypesCode ??= [
+    DOCS_READ_TYPES_CODE, SHEETS_TYPES_CODE, getDriveAgentTypesCode(),
+  ].join("\n");
+}
 
 // Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased).
 const VENDOR_ID = "google";
@@ -349,8 +370,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
 
   async getTypeScriptTypes(): Promise<string> {
     return [
-      TYPES_CODE, GOOGLE_DOC_TYPES_CODE, SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE,
-      BIGQUERY_TYPES_CODE, DRIVE_TYPES_CODE,
+      TYPES_CODE, getGoogleDocTypesCode(), SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE,
+      BIGQUERY_TYPES_CODE, getDriveAgentTypesCode(),
     ].join("\n");
   }
 }
@@ -1995,7 +2016,7 @@ export class GoogleDocGatekeeperImpl
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return GOOGLE_DOC_TYPES_CODE;
+    return getGoogleDocTypesCode();
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
@@ -3037,7 +3058,7 @@ export class GoogleDriveGatekeeperImpl
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return GOOGLE_DRIVE_TYPES_CODE;
+    return getGoogleDriveTypesCode();
   }
 
   async getAutoApprovableActions() {

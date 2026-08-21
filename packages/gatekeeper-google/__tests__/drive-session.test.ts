@@ -45,7 +45,7 @@ function core(overrides: {
         commit: () => events.push("commit"),
       };
     }),
-    authorize: overrides.authorize ?? (async (description: ObservationDescription) => {
+    authorize: async (description: ObservationDescription) => {
       authorizations.push(description);
       events.push("authorize");
       await overrides.authorize?.(description);

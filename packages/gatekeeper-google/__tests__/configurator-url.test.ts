@@ -61,14 +61,6 @@ function valuesFromUrlPattern(resourceUrl: string, resourceUrlPattern: string) {
   return out;
 }
 
-const configurableValues = (
-  configurator: { initialValuesFromResourceUrl?: (context: {
-    resourceUrl: string; resourceUrlPattern: string; ui: never;
-  }) => unknown },
-  resourceUrl: string,
-  resourceUrlPattern: string,
-) => configurator.initialValuesFromResourceUrl!({ resourceUrl, resourceUrlPattern, ui: noUi });
-
 const renderedCopy = (configurator: { render?: (context: never) => unknown }) =>
   JSON.stringify(configurator.render!({ values: {}, setValues() {}, ui: noUi } as never));
 describe("Gmail configurator URLs", () => {
