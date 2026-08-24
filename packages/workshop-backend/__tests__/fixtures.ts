@@ -9,8 +9,8 @@ import { OverseerDurableObject } from "../src/overseer.js";
 import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
 
-// The actions schema must match makeOverseerStorage's: the auto-approval drain reads the
-// pendingByGatekeeper index.
+// The actions schema must match makeOverseerStorage's: the auto-approval drain and the pending
+// history query read the pendingByGatekeeper index.
 export const ACTION_TEST_SCHEMA = {
   singletons: { nextActionId: 0 },
   collections: {

@@ -232,5 +232,8 @@ describe("paged action-log reads", () => {
     using workspace = await authenticated.newGadget();
 
     expect(await workspace.listActions({ filter: "action" })).toEqual({ entries: [] });
+    // The pending filter is a distinct union member; this proves the regenerated validator
+    // accepts it end to end.
+    expect(await workspace.listActions({ filter: "pending" })).toEqual({ entries: [] });
   });
 });

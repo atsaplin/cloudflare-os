@@ -1081,8 +1081,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
         nonUniqueIndexes: {
           // Sparse index over just the pending records, keyed by gatekeeper, so the auto-approval
-          // drain is O(pending) rather than a full-log scan. Backfilled by the version-3
-          // migration.
+          // drain and the pending-history query are O(pending) rather than full-log scans.
+          // Backfilled by the version-3 migration.
           pendingByGatekeeper(record: ActionRecord) {
             return record.state === "pending" ? record.gatekeeperId : null;
           }
@@ -9415,6 +9415,23 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new TypeError(`Invalid beforeId: ${beforeId}`);
     }
 
+    if (filter === "pending") {
+      // Served from the pendingByGatekeeper index rather than a log scan, so the work is
+      // O(pending), not O(log). The index has no range/limit or key-enumeration primitives yet,
+      // so each page re-materializes the full pending set to cut its id-ordered slice: the wire
+      // is page-bounded, but the per-page server work is not. Good enough while pending counts
+      // are human-scale; if typed-storage grows per-group range reads, this becomes a k-way
+      // merge over gatekeeper groups.
+      let pending = [...this.impl.storage.actions.pendingByGatekeeper.list()]
+          .filter(record => beforeId === undefined || record.id < beforeId)
+          .sort((a, b) => b.id - a.id);
+      let page = pending.slice(0, HISTORY_PAGE_DEFAULT_LIMIT);
+      return {
+        entries: page.map(actionRecordToLog),
+        nextBeforeId: pending.length > page.length ? page.at(-1)!.id : undefined,
+      };
+    }
+
     let entries: ActionLogEntry[] = [];
     let scanned = 0;
     let lastId = 0;
@@ -9422,7 +9439,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         {end: beforeId, reverse: true, limit: HISTORY_PAGE_SCAN_CAP})) {
       ++scanned;
       lastId = record.id;
-      if (record.state === "pending") continue;
       if (!matchesActionHistoryFilter(record, filter)) continue;
       entries.push(actionRecordToLog(record));
       if (entries.length >= HISTORY_PAGE_DEFAULT_LIMIT) break;

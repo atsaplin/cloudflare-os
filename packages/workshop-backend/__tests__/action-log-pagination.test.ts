@@ -4,7 +4,10 @@ import type { ActionLogEntry, ActionsSubscriber } from "@gadgets/workshop-shared
 import {
   HISTORY_PAGE_DEFAULT_LIMIT, HISTORY_PAGE_SCAN_CAP, PENDING_SCAN_PAGE_SIZE,
 } from "../src/overseer.js";
-import { makeActionStorage, openFakeOverseer, putAction } from "./fixtures.js";
+import { makeMockStorage } from "./mock-storage.js";
+import {
+  makeActionStorage, makePreIndexActionStorage, openFakeOverseer, putAction,
+} from "./fixtures.js";
 
 vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
 
@@ -204,6 +207,83 @@ describe("listActions", () => {
   });
 });
 
+describe("listActions with the pending filter", () => {
+  it("returns pendings of any type newest-first across gatekeepers, excluding resolved",
+      async () => {
+    let storage = makeActionStorage();
+    putAction(storage, 0, { gatekeeperId: 2 });
+    putAction(storage, 1, { state: "approved" });
+    putAction(storage, 2, { type: "bindHook", state: "pending", gatekeeperId: 1 });
+    putAction(storage, 3, { state: "rejected" });
+    putAction(storage, 4, { gatekeeperId: 3 });
+    let client = await openFakeOverseer(storage);
+
+    // The index groups by gatekeeper; the page must still be one id-ordered (descending) stream.
+    let page = await client.listActions({ filter: "pending" });
+    expect(page.entries.map(e => e.id)).toEqual([4, 2, 0]);
+    expect(page.nextBeforeId).toBeUndefined();
+  });
+
+  it("pages to exhaustion without overlap or gaps", async () => {
+    let storage = makeActionStorage();
+    let expected: number[] = [];
+    for (let id = 0; id < HISTORY_PAGE_DEFAULT_LIMIT * 2 + 30; id++) {
+      let pending = id % 3 !== 0;
+      putAction(storage, id, { state: pending ? "pending" : "approved", gatekeeperId: id % 4 });
+      if (pending) expected.unshift(id);
+    }
+    let client = await openFakeOverseer(storage);
+
+    let ids: number[] = [];
+    let beforeId: number | undefined;
+    do {
+      let page = await client.listActions({ filter: "pending", beforeId });
+      expect(page.entries.length).toBeLessThanOrEqual(HISTORY_PAGE_DEFAULT_LIMIT);
+      ids.push(...page.entries.map(e => e.id));
+      beforeId = page.nextBeforeId;
+    } while (beforeId !== undefined);
+
+    expect(ids).toEqual(expected);
+  });
+
+  it("reflects a resolution between pages: the record stops appearing", async () => {
+    let storage = makeActionStorage();
+    let total = HISTORY_PAGE_DEFAULT_LIMIT + 10;
+    for (let id = 0; id < total; id++) putAction(storage, id);
+    let client = await openFakeOverseer(storage);
+
+    let first = await client.listActions({ filter: "pending" });
+    expect(first.entries.length).toBe(HISTORY_PAGE_DEFAULT_LIMIT);
+    expect(first.nextBeforeId).toBe(10);
+
+    // Resolve a record that would have been on the second page.
+    let record = storage.actions.get(5)!;
+    record.state = "approved";
+    storage.actions.put(record);
+
+    let second = await client.listActions({ filter: "pending", beforeId: first.nextBeforeId });
+    expect(second.entries.map(e => e.id)).toEqual([9, 8, 7, 6, 4, 3, 2, 1, 0]);
+    expect(second.nextBeforeId).toBeUndefined();
+  });
+
+  it("sees pendings written before the index existed once a rebuild backfills it", async () => {
+    // Mirrors the version-3 migration: records predate the pendingByGatekeeper declaration, so
+    // the index starts empty until the migration's rebuild() runs.
+    let mock = makeMockStorage();
+    let legacy = makePreIndexActionStorage(mock);
+    putAction(legacy, 0);
+    putAction(legacy, 1, { state: "approved" });
+    putAction(legacy, 2);
+
+    let storage = makeActionStorage(mock);
+    storage.actions.pendingByGatekeeper.rebuild();
+    let client = await openFakeOverseer(storage);
+
+    let page = await client.listActions({ filter: "pending" });
+    expect(page.entries.map(e => e.id)).toEqual([2, 0]);
+  });
+});
+
 describe("UseOverseerInterface", () => {
   it("answers listActions with an empty terminal page and the subscription inertly", async () => {
     let storage = makeActionStorage();
@@ -213,6 +293,7 @@ describe("UseOverseerInterface", () => {
     let { subscriber, events } = makeSubscriber();
 
     expect(await client.listActions()).toEqual({ entries: [] });
+    expect(await client.listActions({ filter: "pending" })).toEqual({ entries: [] });
 
     using _sub = await client.subscribeToActions(subscriber);
     putAction(storage, 2);

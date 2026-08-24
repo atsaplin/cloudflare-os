@@ -1763,10 +1763,18 @@ export interface Overseer extends RpcTarget {
   newAgentSpawnerGatekeeper(config: AgentSpawnerConfig): Promise<GatekeeperClient<any>>;
 
   /**
-   * Fetch one page of resolved action history, newest first by id (creation order). Page size is
-   * a server constant, and the server also caps the raw records examined per call, so a filtered
-   * page may be short or even empty while older history remains: absence of `nextBeforeId` is the
-   * only terminator.
+   * Fetch one page of action history, newest first by id (creation order). The default filters
+   * ("all" or a record type) page resolved records; `filter: "pending"` pages the
+   * currently-pending records instead — the query half of the query-for-state/subscribe-for-deltas
+   * contract (see subscribeToActions()).
+   *
+   * Page size is a server constant, and the server also caps the raw records examined per call,
+   * so a filtered page may be short or even empty while older history remains: absence of
+   * `nextBeforeId` is the only terminator.
+   *
+   * A page reflects call-time state: a record resolved between pages stops appearing in later
+   * "pending" pages (and starts appearing in resolved ones); an action subscription carries its
+   * resolution as a live update.
    */
   listActions(options?: {beforeId?: number, filter?: ActionHistoryFilter})
       : Promise<ActionHistoryPage>;
@@ -2471,21 +2479,27 @@ export type AiChatHistoryPage = {
   };
 };
 
-/** Type filter for listActions(): one specific record type, or "all" for every resolved record. */
-export type ActionHistoryFilter = "all" | ActionLogEntry["type"];
+/**
+ * Filter for listActions(): "pending" for currently-pending records (of any type), or a resolved
+ * view — one specific record type, or "all" for every resolved record.
+ */
+export type ActionHistoryFilter = "all" | "pending" | ActionLogEntry["type"];
 
 /**
  * Whether a record passes an ActionHistoryFilter. Shared by the server's listActions() paging and
  * the client's live-merge so the two ends of the wire can't drift.
  */
 export function matchesActionHistoryFilter(
-    record: {type: ActionLogEntry["type"]}, filter: ActionHistoryFilter): boolean {
-  return filter === "all" || record.type === filter;
+    record: {type: ActionLogEntry["type"], state: ActionState},
+    filter: ActionHistoryFilter): boolean {
+  return filter === "pending"
+      ? record.state === "pending"
+      : record.state !== "pending" && (filter === "all" || record.type === filter);
 }
 
-/** One page of resolved action history from listActions(). */
+/** One page of action history from listActions(). */
 export type ActionHistoryPage = {
-  /** Resolved records, descending id (creation order, newest first). May be short or empty while
+  /** Matching records, descending id (creation order, newest first). May be short or empty while
    * older history remains — absence of `nextBeforeId` is the only terminator. */
   entries: ActionLogEntry[];
 
