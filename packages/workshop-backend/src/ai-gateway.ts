@@ -1,5 +1,9 @@
 import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
-import { UserAiModelRecord } from "./user.js";
+import type { UserAiModelRecord } from "./user.js";
+import {
+  discoverOpenRouterModels,
+  discoverWorkersAiModels,
+} from "./ai-gateway-models.js";
 
 // The model used for quick tasks like title generation when AI Gateway mode is active.
 //
@@ -21,6 +25,19 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
  */
 const HTTPS_ONLY_PROVIDERS = new Set(["google"]);
+
+function parseProvider(value: string): AiModelConfig["provider"] {
+  switch (value) {
+    case "anthropic":
+    case "openai":
+    case "google":
+    case "cloudflare":
+    case "openrouter":
+      return value;
+    default:
+      throw new Error(`Unsupported AI Gateway provider "${value}".`);
+  }
+}
 
 export class AiGatewayConfig {
   readonly gateway: string;
@@ -46,7 +63,9 @@ export class AiGatewayConfig {
    * `env.ai.toMarkdown()` through it (see web-fetch.ts), so unbinding would break that too.
    */
   readonly binding?: Ai;
-  readonly providers: Set<string>;
+  /** Workers AI binding used for model discovery, independent of the gateway transport choice. */
+  readonly workersAi?: Ai;
+  readonly providers: Set<AiModelConfig["provider"]>;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -58,9 +77,8 @@ export class AiGatewayConfig {
     // Normalized once, so a stray " False " opts out rather than reading as unset and silently
     // picking the other transport.
     const useBinding = env.CF_AI_GATEWAY_USE_BINDING?.trim().toLowerCase();
-    this.binding = useBinding === "false"
-        ? undefined
-        : (env as { WORKERS_AI?: Ai }).WORKERS_AI;
+    this.workersAi = (env as { WORKERS_AI?: Ai }).WORKERS_AI;
+    this.binding = useBinding === "false" ? undefined : this.workersAi;
     if (useBinding === "true" && !this.binding) {
       throw new Error(
           "CF_AI_GATEWAY_USE_BINDING requires the WORKERS_AI binding; without it the config " +
@@ -73,7 +91,8 @@ export class AiGatewayConfig {
     }
     this.sameAccountGateway = this.binding ? this.gateway : undefined;
     this.providers = new Set(
-      (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
+      (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map((value) => value.trim())
+        .filter((value) => value !== "").map(parseProvider)
     );
     const httpsOnly = [...this.providers].filter(p => HTTPS_ONLY_PROVIDERS.has(p));
     if (httpsOnly.length > 0 && !this.apiToken) {
@@ -97,39 +116,43 @@ export class AiGatewayConfig {
   /**
    * Get the list of models available through AI Gateway, as AiChatAuthorInfo entries.
    */
-  getModelList(): AiChatAuthorInfo[] {
-    let result: AiChatAuthorInfo[] = [];
-    for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-      if (this.providers.has(provider)) {
-        for (let [id, model] of Object.entries(models)) {
-          result.push({ type: "agent", id, name: model.name });
-        }
-      }
-    }
-    return result;
+  async getModelList(): Promise<AiChatAuthorInfo[]> {
+    return (await this.#getModelCatalog()).map((model) => model.profile);
   }
 
   /**
    * Look up an AI Gateway model by ID. Returns a UserAiModelRecord if the model is a
    * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
    */
-  resolveModel(modelId: string): UserAiModelRecord | undefined {
-    for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-      if (this.providers.has(provider) && modelId in models) {
-        return {
-          profile: { type: "agent", id: modelId, name: models[modelId].name },
-          config: {
-            provider: provider as AiModelConfig["provider"],
-            model: modelId,
-            // apiToken and apiUrl are ignored when AI Gateway mode is active -- getModel()
-            // reads the real values from env. We set them to empty strings here to satisfy
-            // the type.
-            apiToken: "",
-          },
-        };
+  async resolveModel(modelId: string): Promise<UserAiModelRecord | undefined> {
+    return (await this.#getModelCatalog()).find((model) => model.profile.id === modelId);
+  }
+
+  async #getModelCatalog(): Promise<UserAiModelRecord[]> {
+    const providers = [...this.providers];
+    const catalogs = providers.map(async (provider): Promise<UserAiModelRecord[]> => {
+      if (provider === "cloudflare") {
+        if (!this.workersAi) {
+          throw new Error("Workers AI model discovery requires the WORKERS_AI binding.");
+        }
+        return discoverWorkersAiModels(this.workersAi);
       }
-    }
-    return undefined;
+      if (provider === "openrouter") return discoverOpenRouterModels();
+
+      const models = SUGGESTED_MODELS[provider];
+      if (!models) return [];
+      return Object.entries(models).map(([id, model]) => ({
+        profile: { type: "agent", id, name: model.name },
+        config: {
+          provider,
+          model: id,
+          apiToken: "",
+          contextWindow: model.contextWindow,
+          ...(model.outputLimit === undefined ? {} : { outputLimit: model.outputLimit }),
+        },
+      }));
+    });
+    return (await Promise.all(catalogs)).flat();
   }
 
   /**

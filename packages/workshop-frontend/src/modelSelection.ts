@@ -5,6 +5,16 @@ const LAST_SELECTED_MODEL_KEY = "lastSelectedModel";
 /** Sentinel used for UI values and localStorage so an explicit null choice can persist. */
 export const NO_AGENT_OPTION_VALUE = "__gadgets_no_agent__";
 
+export function filterModels(
+  models: AiChatAuthorInfo[],
+  query: string,
+): AiChatAuthorInfo[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return models;
+  return models.filter((model) =>
+    model.name.toLowerCase().includes(normalized) || model.id.toLowerCase().includes(normalized));
+}
+
 export function getStoredSelectedModel(
   models: AiChatAuthorInfo[],
 ): string | null {

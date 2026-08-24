@@ -1137,12 +1137,15 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider =
+  "openai" | "anthropic" | "google" | "cloudflare" | "openrouter" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
   enabled: true;
   enabledProviders: AiModelProvider[];
+  /** Model IDs managed by the deployment and therefore not deletable by users. */
+  managedModelIds: string[];
 } | {
   enabled: false;
 };
@@ -1170,6 +1173,12 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+
+  /** Provider-reported total context window for dynamically discovered models. */
+  contextWindow?: number;
+
+  /** Provider-reported maximum response tokens for dynamically discovered models. */
+  outputLimit?: number;
 };
 
 /**
@@ -1196,6 +1205,7 @@ export const SUGGESTED_MODELS: Record<
       name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
   },
+  "openrouter": {},
   "anthropic": {
     // TODO: Include Fable -- but we need an admin option to disable it, since many orgs don't
     //   allow it for ZDR reasons. It's sort of overkill for building gadgets anyway.

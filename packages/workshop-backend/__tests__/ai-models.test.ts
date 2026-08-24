@@ -339,6 +339,31 @@ describe("getModel AI Gateway binding transport", () => {
     expect(headerNames).not.toContain("x-api-key");
   }, 15000);
 
+  it("drives OpenRouter through the binding with the gateway's stored key", async () => {
+    const handle = getModel(bindingEnv({
+      CF_AI_GATEWAY_PROVIDERS: "cloudflare,openrouter",
+    }), {
+      provider: "openrouter",
+      model: "anthropic/claude-sonnet-4.5",
+      apiToken: "",
+      contextWindow: 200_000,
+      outputLimit: 16_384,
+    }, INITIATOR);
+
+    expect(handle.model.baseUrl).toBe(
+      "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/openrouter");
+    expect(handle.model.contextWindow).toBe(200_000);
+    expect(handle.model.maxTokens).toBe(16_384);
+
+    const entry = await captureEntry(handle);
+    expect(entry.url).toBe(
+      "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/openrouter/" +
+      "chat/completions");
+    expect(JSON.parse(entry.body)).toMatchObject({ model: "anthropic/claude-sonnet-4.5" });
+    expect(Object.keys(entry.headers).map((name) => name.toLowerCase()))
+      .not.toContain("authorization");
+  }, 15000);
+
   it("lets a per-call fetch override the binding transport", async () => {
     // Tests and diagnostics inject options.fetch; it must win over the handle's binding fetch.
     // The URL is the model's, so it still names the binding route -- only the transport swaps.

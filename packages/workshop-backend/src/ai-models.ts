@@ -4,6 +4,7 @@ import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, FetchFunction, Model,
   ModelCost, OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
 } from "@earendil-works/pi-ai";
+import { hasApi } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -12,6 +13,7 @@ import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.mode
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
@@ -122,6 +124,10 @@ const API_STREAMS: Record<string, StreamFunction<Api, SimpleStreamOptions>> = {
   "openai-completions": openaiCompletionsStream as StreamFunction<Api, SimpleStreamOptions>,
   "google-generative-ai": googleGenerativeAiStream as StreamFunction<Api, SimpleStreamOptions>,
 };
+const OPENROUTER_PROVIDER = openrouterProvider();
+const OPENROUTER_MODELS = new Map(
+  OPENROUTER_PROVIDER.getModels().map((model) => [model.id, model]),
+);
 
 const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
@@ -131,6 +137,7 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
   switch (provider) {
     case "anthropic": return (ANTHROPIC_MODELS as Record<string, Model<Api>>)[modelId];
     case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
+    case "openrouter": return OPENROUTER_MODELS.get(modelId);
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
@@ -145,8 +152,8 @@ function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined
     : { contextWindow: number, maxTokens: number } {
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: suggested?.outputLimit ??
+    contextWindow: config.contextWindow ?? suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
+    maxTokens: config.outputLimit ?? suggested?.outputLimit ??
         (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
         catalog?.maxTokens ?? 4096,
   };
@@ -209,6 +216,19 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         cost: catalog?.cost ?? ZERO_COST,
         ...window,
         thinkingLevelMap: catalog?.thinkingLevelMap,
+        compat: catalog?.compat,
+      };
+    case "openrouter":
+      return {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "openrouter",
+        baseUrl: `${gatewayUrl}/openrouter`,
+        reasoning: catalog?.reasoning ?? true,
+        input: catalog?.input ?? ["text", "image"],
+        cost: catalog?.cost ?? ZERO_COST,
+        ...window,
         compat: catalog?.compat,
       };
     case "google":
@@ -341,6 +361,9 @@ function makeHandle(args: HandleArgs): ModelHandle {
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
       };
+      if (model.provider === "openrouter" && hasApi(model, "openai-completions")) {
+        return OPENROUTER_PROVIDER.streamSimple(model, context, merged);
+      }
       return streamFn(model, context, merged);
     },
   };
@@ -634,6 +657,23 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           cost: catalog?.cost ?? ZERO_COST,
           ...window,
           thinkingLevelMap: catalog?.thinkingLevelMap,
+          compat: catalog?.compat,
+        },
+        apiKey: config.apiToken,
+        sessionAffinity,
+      });
+    case "openrouter":
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: catalog?.name ?? config.model,
+          api: "openai-completions",
+          provider: "openrouter",
+          baseUrl: config.apiUrl ?? "https://openrouter.ai/api/v1",
+          reasoning: catalog?.reasoning ?? true,
+          input: catalog?.input ?? ["text", "image"],
+          cost: catalog?.cost ?? ZERO_COST,
+          ...window,
           compat: catalog?.compat,
         },
         apiKey: config.apiToken,

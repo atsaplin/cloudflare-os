@@ -58,6 +58,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styles from "./ChatInterface.module.css";
 import {
+  filterModels,
   getStoredSelectedModel,
   persistSelectedModel,
 } from "./modelSelection";
@@ -1953,6 +1954,7 @@ export const ChatInput = ({
     formatTokensFromDraft(initialDraft));
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [isSending, setIsSending] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
   // The chat the "may not have been sent" hint belongs to; the render condition scopes it, and
   // leaving the chat dismisses it.
   const [sendHiccup, setSendHiccup] = useState<{ chatKey?: number | null } | null>(null);
@@ -3242,6 +3244,7 @@ export const ChatInput = ({
   const selectedModelLabel = selectedModel == null
     ? "No agent"
     : models.find((model) => model.id === selectedModel)?.name ?? selectedModel;
+  const visibleModels = filterModels(models, modelSearch);
 
   const hasReadyAttachment = pendingAttachments.some(
     (attachment) => attachment.uploadState === "ready" && attachment.ref,
@@ -3614,7 +3617,7 @@ export const ChatInput = ({
 
           {/* Right actions */}
           <div className="ml-auto flex min-w-0 flex-shrink items-center gap-1.5">
-              <DropdownMenu>
+              <DropdownMenu onOpenChange={(open) => { if (!open) setModelSearch(""); }}>
                 <DropdownMenu.Trigger
                   render={
                     <button
@@ -3631,8 +3634,28 @@ export const ChatInput = ({
                     </button>
                   }
                 />
-                <DropdownMenu.Content className="themed-floating-shadow-lg !z-[1100] !min-w-[190px] rounded-2xl border border-kumo-line/70 bg-kumo-base p-1">
-                  {models.map((model) => {
+                <DropdownMenu.Content className="themed-floating-shadow-lg !z-[1100] !min-w-[280px] max-h-[min(70vh,520px)] overflow-y-auto rounded-2xl border border-kumo-line/70 bg-kumo-base p-1">
+                  <div
+                    className="sticky top-0 z-10 bg-kumo-base p-1"
+                    onKeyDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <div className="relative">
+                      <MagnifyingGlass
+                        size={14}
+                        className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-kumo-inactive"
+                      />
+                      <input
+                        type="search"
+                        value={modelSearch}
+                        onChange={(event) => setModelSearch(event.target.value)}
+                        placeholder={`Search ${models.length} models`}
+                        aria-label="Search models"
+                        className="h-8 w-full rounded-lg border border-kumo-line bg-kumo-base pl-8 pr-2 text-[12px] text-kumo-default outline-none placeholder:text-kumo-inactive focus:border-kumo-ring"
+                      />
+                    </div>
+                  </div>
+                  {visibleModels.map((model) => {
                     const active = selectedModel === model.id;
                     return (
                       <DropdownMenu.Item
@@ -3647,6 +3670,11 @@ export const ChatInput = ({
                       </DropdownMenu.Item>
                     );
                   })}
+                  {visibleModels.length === 0 && (
+                    <div className="px-3 py-4 text-center text-[12px] text-kumo-inactive">
+                      No matching models
+                    </div>
+                  )}
                   <div className="my-1 border-t border-kumo-line/70" />
                   <DropdownMenu.Item
                     onClick={() => onModelChange(null)}

@@ -20,9 +20,10 @@ import {
   Key,
   Plugs,
   Hexagon,
+  MagnifyingGlass,
 } from '@phosphor-icons/react'
 import AddModelModal from './AddModelModal'
-import { persistSelectedModel } from './modelSelection'
+import { filterModels, persistSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
@@ -84,9 +85,11 @@ export default function OnboardingWizard({
   // Model state
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
+  const [modelSearch, setModelSearch] = useState('')
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
   const [addModelOpen, setAddModelOpen] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(true)
+  const visibleModels = filterModels(models, modelSearch)
 
   // Connections state
   const [vendors, setVendors] = useState<VendorEntry[]>([])
@@ -489,8 +492,22 @@ export default function OnboardingWizard({
                   </div>
                 ) : (
                   <>
+                    <div className="relative mb-3">
+                      <MagnifyingGlass
+                        size={15}
+                        className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-kumo-inactive"
+                      />
+                      <input
+                        type="search"
+                        value={modelSearch}
+                        onChange={(event) => setModelSearch(event.target.value)}
+                        placeholder={`Search ${models.length} models`}
+                        aria-label="Search models"
+                        className="h-9 w-full rounded-lg border border-kumo-line bg-kumo-base pl-9 pr-3 text-sm text-kumo-default outline-none placeholder:text-kumo-inactive focus:border-kumo-brand"
+                      />
+                    </div>
                     <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                      {models.map((model) => (
+                      {visibleModels.map((model) => (
                         <button
                           key={model.id}
                           onClick={() => setSelectedModelId(model.id)}
@@ -533,14 +550,16 @@ export default function OnboardingWizard({
                         </button>
                       ))}
 
-                      {models.length === 0 && (
+                      {visibleModels.length === 0 && (
                         <div className="text-center py-8">
                           <p className="text-sm text-kumo-subtle mb-1">
-                            No models configured yet
+                            {models.length === 0 ? 'No models configured yet' : 'No matching models'}
                           </p>
-                          <p className="text-xs text-kumo-inactive">
-                            Add a model to get started
-                          </p>
+                          {models.length === 0 && (
+                            <p className="text-xs text-kumo-inactive">
+                              Add a model to get started
+                            </p>
+                          )}
                         </div>
                       )}
                     </div>

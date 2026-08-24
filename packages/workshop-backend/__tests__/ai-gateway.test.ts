@@ -122,6 +122,105 @@ describe("AiGatewayConfig transport selection", () => {
   });
 });
 
+describe("AiGatewayConfig model discovery", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("discovers every agent-compatible Workers AI and OpenRouter model", async () => {
+    const models = vi.fn(async () => [
+      {
+        id: "workers-id",
+        source: 1,
+        name: "@cf/example/tool-model",
+        description: "Agent model",
+        task: { id: "text", name: "Text Generation", description: "" },
+        tags: [],
+        properties: [
+          { property_id: "context_window", value: "64000" },
+          { property_id: "function_calling", value: "true" },
+        ],
+      },
+      {
+        id: "workers-no-tools",
+        source: 1,
+        name: "@cf/example/chat-only",
+        description: "Chat-only model",
+        task: { id: "text", name: "Text Generation", description: "" },
+        tags: [],
+        properties: [{ property_id: "context_window", value: "32000" }],
+      },
+    ]);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      data: [
+        {
+          id: "example/router-model",
+          name: "Example Router Model",
+          context_length: 128000,
+          architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+          supported_parameters: ["max_tokens", "tools"],
+          top_provider: { max_completion_tokens: 16000 },
+        },
+        {
+          id: "example/no-tools",
+          name: "No Tools",
+          context_length: 128000,
+          architecture: { input_modalities: ["text"], output_modalities: ["text"] },
+          supported_parameters: ["max_tokens"],
+          top_provider: { max_completion_tokens: 16000 },
+        },
+      ],
+    })));
+
+    const config = new AiGatewayConfig(env({
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_PROVIDERS: "cloudflare,openrouter",
+      WORKERS_AI: { models } as unknown as Ai,
+    }));
+
+    await expect(config.getModelList()).resolves.toEqual([
+      { type: "agent", id: "@cf/example/tool-model", name: "@cf/example/tool-model (Workers AI)" },
+      {
+        type: "agent",
+        id: "openrouter:example/router-model",
+        name: "Example Router Model (OpenRouter)",
+      },
+    ]);
+    await expect(config.resolveModel("@cf/example/tool-model")).resolves.toEqual({
+      profile: {
+        type: "agent",
+        id: "@cf/example/tool-model",
+        name: "@cf/example/tool-model (Workers AI)",
+      },
+      config: {
+        provider: "cloudflare",
+        model: "@cf/example/tool-model",
+        apiToken: "",
+        contextWindow: 64000,
+        outputLimit: 32768,
+      },
+    });
+    await expect(config.resolveModel("openrouter:example/router-model")).resolves.toEqual({
+      profile: {
+        type: "agent",
+        id: "openrouter:example/router-model",
+        name: "Example Router Model (OpenRouter)",
+      },
+      config: {
+        provider: "openrouter",
+        model: "example/router-model",
+        apiToken: "",
+        contextWindow: 128000,
+        outputLimit: 16000,
+      },
+    });
+
+    expect(models).toHaveBeenCalledWith({ task: "Text Generation" });
+    expect(fetch).toHaveBeenCalledWith(
+      "https://openrouter.ai/api/v1/models?output_modalities=text&supported_parameters=tools",
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+});
+
 describe("getAiGatewayLogCost", () => {
   afterEach(() => vi.unstubAllGlobals());
 

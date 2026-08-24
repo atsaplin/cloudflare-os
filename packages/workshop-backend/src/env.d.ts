@@ -16,7 +16,7 @@ declare global {
       // AI Gateway mode: when CF_AI_GATEWAY is set, supported providers are routed through
       // Cloudflare AI Gateway with server-managed keys. Users don't need their own keys.
       CF_AI_GATEWAY?: string;            // Gateway name (enables gateway mode)
-      CF_AI_GATEWAY_PROVIDERS?: string;   // Comma-separated list: "anthropic,openai,google,cloudflare"
+      CF_AI_GATEWAY_PROVIDERS?: string;   // Comma-separated model providers.
       CF_AI_GATEWAY_ACCOUNT_ID?: string;  // Gateway owner account ID (required with CF_AI_GATEWAY)
       CF_AI_GATEWAY_API_TOKEN?: string;   // Run + Read token; optional when the binding transport
                                           // applies (still required for google)

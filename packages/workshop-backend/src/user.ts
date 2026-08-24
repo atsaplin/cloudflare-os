@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -532,7 +532,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let gwConfig = getAiGatewayConfig(this.env);
     let gwModelIds = new Set<string>();
     if (gwConfig) {
-      for (let entry of gwConfig.getModelList()) {
+      for (let entry of await gwConfig.getModelList()) {
         result.push(entry);
         gwModelIds.add(entry.id);
       }
@@ -560,12 +560,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async deleteModel(id: string): Promise<void> {
     // In AI Gateway mode, don't allow deleting built-in suggested models.
     let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig) {
-      for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-        if (gwConfig.providers.has(provider) && id in models) {
-          throw new Error(`Cannot delete built-in model "${models[id].name}".`);
-        }
-      }
+    let managedModel = await gwConfig?.resolveModel(id);
+    if (managedModel) {
+      throw new Error(`Cannot delete built-in model "${managedModel.profile.name}".`);
     }
 
     this.storage.aiModels.delete(id);
@@ -592,7 +589,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (id !== null) {
       // Validate that the model exists in the user's configured models or as a gateway model.
       let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
+      let exists = !!this.storage.aiModels.get(id) || !!await gwConfig?.resolveModel(id);
       if (!exists) {
         throw new Error(`No such model: ${id}`);
       }
@@ -702,7 +699,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (modelId) {
       // In AI Gateway mode, resolve gateway models first.
       if (gwConfig) {
-        result.aiModel = gwConfig.resolveModel(modelId);
+        result.aiModel = await gwConfig.resolveModel(modelId);
       }
       if (!result.aiModel) {
         result.aiModel = this.storage.aiModels.get(modelId);
