@@ -78,6 +78,5 @@ export function measureHistory(history: readonly AiChatMessage[]) {
       if (call.error !== undefined) toolErrors++;
     }
   }
-  const toolFailureRate = toolCalls === 0 ? 0 : toolErrors / toolCalls;
-  return { modelTurns, toolCalls, toolErrors, toolFailureRate, agentErrors };
+  return { modelTurns, toolCalls, toolErrors, agentErrors };
 }

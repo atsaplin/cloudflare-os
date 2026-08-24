@@ -75,7 +75,7 @@ Each trial reports:
 - total task duration
 - time spent in each agent turn and verifier
 - LLM turns
-- tool calls, failed tool calls, and tool failure rate
+- tool calls and tool errors; their ratio gives the tool failure rate
 - agent errors
 - provider-reported token and cost metadata when available
 

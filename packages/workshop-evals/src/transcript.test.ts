@@ -50,9 +50,6 @@ it("normalizes Workshop messages and failed tools for vitest-evals", () => {
     modelTurns: 1,
     toolCalls: 1,
     toolErrors: 1,
-    toolFailureRate: 1,
     agentErrors: 1,
   });
-
-  expect(measureHistory([]).toolFailureRate).toBe(0);
 });

@@ -63,7 +63,7 @@ For each trial, the report shows:
 
 - how many task requirements passed, plus pass rate across repeated trials
 - total task duration and the time spent in each agent turn and verifier
-- LLM turns, tool calls, failed tool calls, and tool failure rate
+- LLM turns, tool calls, and tool errors; a report can derive the failure rate from the two counts
 - agent errors and provider errors present in the transcript
 - provider-reported tokens and cost when available
 - model, local or preview target, and trial number
