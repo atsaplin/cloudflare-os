@@ -8158,6 +8158,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     msg.timestamp = this.impl.getChatTimestamp();
     this.impl.storage.chats.put(msg);  // fires the subscriber update() → re-delivers the card
 
+    // Don't resume until every connection request from this turn was accepted. Scanning newest
+    // first bounds the lookup to the current turn and usually finds a pending sibling immediately.
+    for (let sibling of this.impl.storage.chats.list(
+        {prefix: `${keyString(msg.chatId)}.`, reverse: true})) {
+      if (sibling.type === "connectionRequest" && sibling.state !== "accepted") return;
+      if (sibling.type === "agentCallback" ||
+          (sibling.type === "message" &&
+           (sibling.author.type === "user" || sibling.author.type === "gadget"))) {
+        break;
+      }
+    }
     await this.#resumeSuspendedAgent(msg.chatId);
   }
 
