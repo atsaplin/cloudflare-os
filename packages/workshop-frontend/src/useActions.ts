@@ -2,15 +2,18 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
 import { RpcStub, RpcTarget } from 'capnweb'
 import { ActionLogEntry, ActionsSubscriber, Overseer } from '@gadgets/workshop-shared/api'
 
-// One ref-counted store per Overseer stub, shared across consumers. On subscribe the server
-// replays currently-pending records through entry() before resolving the call, so replay and
-// live updates arrive as one ordered stream and the RPC resolving is the "settled" signal.
-// Resolved history is demand-paged separately (see useActionHistory).
+// One ref-counted store per Overseer stub, shared across consumers. On open the store initiates
+// the live subscription first, then pages the currently-pending set via
+// listActions({filter: 'pending'}): capnweb e-order registers the subscriber server-side before
+// the first page reads, so every record is covered — pages snapshot call-time state, and
+// everything that changes after arrives on the subscription. Pages fold with live-wins
+// semantics; the last page loading is the "settled" signal. Resolved history is demand-paged
+// separately (see useActionHistory).
 
 export type ActionsState = {
   /**
-   * 'checking' until the subscription (and its pending replay) settles; 'error' if it failed
-   * (`pending` keeps whatever was gathered).
+   * 'checking' until the subscription is registered and the last pending page has loaded;
+   * 'error' if either failed (`pending` keeps whatever was gathered).
    */
   status: 'checking' | 'ready' | 'error'
 
@@ -22,7 +25,13 @@ type Store = {
   // Immutable object handed to useSyncExternalStore; rebuilt from the staged fields on commit.
   snapshot: ActionsState
   stagedPending: Map<number, ActionLogEntry>
+  // Records delivered on the live subscription (only — paged records are not entries), retained
+  // for useActionEntries' mount-time replay.
   stagedEntries: Map<number, ActionLogEntry>
+  // Every id the live subscription has delivered, in any state. A page's copy of one of these
+  // ids is stale by definition: the fold skips it, so a record resolved live is never re-marked
+  // pending by a page that predates the resolution.
+  liveSeenIds: Set<number>
   refCount: number
   listeners: Set<() => void>
   entryListeners: Set<(record: ActionLogEntry) => void>
@@ -45,6 +54,7 @@ function getStore(overseer: RpcStub<Overseer>): Store {
       snapshot: EMPTY_STATE,
       stagedPending: new Map(),
       stagedEntries: new Map(),
+      liveSeenIds: new Set(),
       refCount: 0,
       listeners: new Set(),
       entryListeners: new Set(),
@@ -81,11 +91,13 @@ function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
   const generation = ++store.generation
   store.stagedPending = new Map()
   store.stagedEntries = new Map()
+  store.liveSeenIds = new Set()
   store.snapshot = EMPTY_STATE
 
   class ActionsSubscriberImpl extends RpcTarget implements ActionsSubscriber {
     entry(record: ActionLogEntry): void {
       if (store.generation !== generation) return
+      store.liveSeenIds.add(record.id)
       store.stagedEntries.set(record.id, record)
       if (record.state === 'pending') store.stagedPending.set(record.id, record)
       else store.stagedPending.delete(record.id)
@@ -99,11 +111,21 @@ function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
       }
     }
 
-    // Settledness is signalled by subscribeToActions() resolving: replayed entries are delivered
-    // on the same ordered stream, before the resolution.
+    // Settledness is signalled by the pending page loop draining, not by the subscription.
     ready(): void {}
   }
 
+  const fail = (error: unknown) => {
+    if (store.generation !== generation) return
+    console.error('Failed to load pending actions:', error)
+    // Deliberately also downgrades an already-'ready' store: the pages can drain before the
+    // subscribe call's return trip fails, and a store with a dead live stream must not present
+    // as settled.
+    commit(store, 'error')
+  }
+
+  // Initiated first — the page loop below relies on capnweb e-order having registered the
+  // subscriber server-side before the first page reads.
   overseer.subscribeToActions(
     new ActionsSubscriberImpl() as unknown as RpcStub<ActionsSubscriber>,
   ).then(sub => {
@@ -112,12 +134,25 @@ function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
       return
     }
     store.subscription = sub
+  }, fail)
+
+  // One page in flight at a time. Records created mid-paging are live-only (their ids are above
+  // page 1's snapshot bound), so the fold only has to resolve one conflict class: a page's stale
+  // copy of a record the subscription already delivered, which liveSeenIds skips.
+  ;(async () => {
+    let beforeId: number | undefined
+    do {
+      const page = await overseer.listActions({ filter: 'pending', beforeId })
+      if (store.generation !== generation) return
+      for (const record of page.entries) {
+        if (!store.liveSeenIds.has(record.id)) store.stagedPending.set(record.id, record)
+      }
+      beforeId = page.nextBeforeId
+      scheduleNotify(store)
+    } while (beforeId !== undefined)
+    // Synchronous commit (not scheduleNotify) so a throttled background tab still settles.
     commit(store, 'ready')
-  }, (error: unknown) => {
-    if (store.generation !== generation) return
-    console.error('Failed to load pending actions:', error)
-    commit(store, 'error')
-  })
+  })().catch(fail)
 }
 
 function closeSubscription(store: Store) {
@@ -126,6 +161,7 @@ function closeSubscription(store: Store) {
   store.subscription = null
   store.stagedPending = new Map()
   store.stagedEntries = new Map()
+  store.liveSeenIds = new Set()
   store.snapshot = EMPTY_STATE
 }
 
@@ -171,10 +207,10 @@ export function useActions(overseer: RpcStub<Overseer> | null): ActionsState {
 }
 
 /**
- * Per-entry callback variant. Fires once per received entry (replayed pendings and live updates
- * alike); on mount it replays the records already received this session. That covers patching
- * content fetched over the same stub: anything fetched reflects the log at fetch time, and
- * everything that changed since arrived through the stream.
+ * Per-entry callback variant. Fires once per entry delivered on the live subscription (paged
+ * pending records are not entries); on mount it replays the records already received this
+ * session. That covers patching content fetched over the same stub: anything fetched reflects
+ * the log at fetch time, and everything that changed since arrived through the stream.
  */
 export function useActionEntries(
   overseer: RpcStub<Overseer> | null,

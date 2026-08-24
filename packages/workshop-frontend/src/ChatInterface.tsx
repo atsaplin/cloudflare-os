@@ -5740,8 +5740,9 @@ function ChatInterface({
     if (applyActionLogUpdateToCachedMessages(record)) scheduleUpdate();
   });
 
-  // On (re)connect, re-fetch cached action cards still shown as pending or blank: a resolution
-  // that happened while we were away isn't replayed by the pending-only subscription.
+  // On (re)connect, re-fetch cached action cards still shown as pending or blank: the action
+  // subscription carries live deltas only, so a resolution that happened while we were away
+  // never reaches us through it.
   useEffect(() => {
     let cancelled = false;
     for (const locations of cacheRef.current.actionMessages.values()) {

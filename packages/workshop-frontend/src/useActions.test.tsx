@@ -21,25 +21,34 @@ describe('useActions', () => {
     vi.restoreAllMocks()
   })
 
-  it('stays checking through the replay and settles when the subscribe call resolves', async () => {
+  it('initiates the subscription before the first pending page, with no startAfter', async () => {
     const server = makeOverseer()
     await view.render(<Probe overseer={server.overseer} />)
 
-    // No startAfter: the legacy full replay must not be requested.
+    // Subscribe-first is what lets the pages be a complete snapshot: capnweb e-order registers
+    // the subscriber server-side before the first page reads.
+    expect(server.ops).toEqual(['subscribe', 'listPending'])
+    // Single argument: the legacy full replay (startAfter) must not be requested.
     expect(server.subscribeCalls).toEqual([[expect.anything()]])
-    expect(latest.status).toBe('checking')
+    expect(server.pendingQueryCalls).toEqual([{ filter: 'pending', beforeId: undefined }])
+  })
 
-    await server.emit(entry(1))
+  it('stays checking until the last pending page loads', async () => {
+    const server = makeOverseer()
+    await view.render(<Probe overseer={server.overseer} />)
+
+    await server.resolveSubscription()
+    expect(latest.status).toBe('checking')  // the subscription alone doesn't settle
+
+    await server.resolvePendingQuery({ entries: [entry(1)], nextBeforeId: 1 })
     expect(latest.status).toBe('checking')
     flushFrames()
-    expect(latest.pending.map(e => e.id)).toEqual([1])  // counts accumulate mid-replay
+    expect(latest.pending.map(e => e.id)).toEqual([1])  // counts accumulate mid-paging
+    expect(server.pendingQueryCalls[1]).toEqual({ filter: 'pending', beforeId: 1 })
 
-    await server.emit(entry(7))
-    await server.resolveSubscription()  // settles synchronously, no frame needed
-    expect(latest.status).toBe('ready')
-    expect(latest.pending.map(e => e.id)).toEqual([1, 7])
-    flushFrames()
-    expect(latest.status).toBe('ready')
+    await server.resolvePendingQuery({ entries: [entry(0)] })
+    expect(latest.status).toBe('ready')  // settles synchronously, no frame needed
+    expect(latest.pending.map(e => e.id)).toEqual([0, 1])
   })
 
   it('sorts pendings oldest-first by createdAt, breaking ties by id', async () => {
@@ -69,6 +78,22 @@ describe('useActions', () => {
     expect(latest.pending).toEqual([])
   })
 
+  it('never re-marks a record pending after a live resolution beat its stale page copy',
+      async () => {
+    const server = makeOverseer()
+    await view.render(<Probe overseer={server.overseer} />)
+    await server.resolveSubscription()
+
+    // The record resolves on the live stream while its page is still in flight; the page's
+    // pending copy is a stale call-time snapshot and must lose.
+    await server.emit(entry(5))
+    await server.emit(entry(5, { state: 'approved' }))
+    await server.resolvePendingQuery({ entries: [entry(5)] })
+
+    expect(latest.status).toBe('ready')
+    expect(latest.pending).toEqual([])
+  })
+
   it('fences a released store and disposes its late-arriving subscription', async () => {
     const server = makeOverseer()
     await view.render(<Probe overseer={server.overseer} />)
@@ -82,16 +107,29 @@ describe('useActions', () => {
     await server.emit(entry(2))
   })
 
+  it('fences the page loop: a late page neither folds nor requests a successor', async () => {
+    const server = makeOverseer()
+    await view.render(<Probe overseer={server.overseer} />)
+    await server.resolveSubscription()
+
+    view.unmount()
+
+    await server.resolvePendingQuery({ entries: [entry(1)], nextBeforeId: 1 })
+    expect(server.pendingQueryCalls).toHaveLength(1)
+  })
+
   it('starts a fresh subscription when the stub changes', async () => {
     const first = makeOverseer()
     await view.render(<Probe overseer={first.overseer} />)
     await first.emit(entry(1))
     await first.resolveSubscription()
+    await first.resolvePendingQuery({ entries: [] })
     expect(latest.status).toBe('ready')
 
     const second = makeOverseer()
     await view.render(<Probe overseer={second.overseer} />)
     expect(second.subscribeCalls).toHaveLength(1)
+    expect(second.pendingQueryCalls).toHaveLength(1)
     expect(latest.status).toBe('checking')
     expect(latest.pending).toEqual([])
   })
@@ -108,6 +146,70 @@ describe('useActions', () => {
     expect(latest.pending.map(e => e.id)).toEqual([1])
     flushFrames()
     expect(latest.status).toBe('error')
+  })
+
+  it('reports error but keeps gathered pendings when a later page fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const server = makeOverseer()
+    await view.render(<Probe overseer={server.overseer} />)
+    await server.resolveSubscription()
+
+    await server.emit(entry(1))
+    await server.resolvePendingQuery({ entries: [entry(3)], nextBeforeId: 3 })
+    await server.rejectPendingQuery(new Error('DO overloaded'))
+
+    expect(latest.status).toBe('error')
+    expect(latest.pending.map(e => e.id)).toEqual([1, 3])
+    flushFrames()
+    expect(latest.status).toBe('error')
+  })
+
+  it('downgrades ready to error when the subscribe call fails after the pages drained',
+      async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const server = makeOverseer()
+    await view.render(<Probe overseer={server.overseer} />)
+
+    // The pages can drain before the subscribe call's return trip fails; a store with a dead
+    // live stream must not present as settled.
+    await server.resolvePendingQuery({ entries: [entry(2)] })
+    expect(latest.status).toBe('ready')
+
+    await server.rejectSubscription(new Error('broken tube'))
+    expect(latest.status).toBe('error')
+    expect(latest.pending.map(e => e.id)).toEqual([2])
+  })
+
+  it('fans out live entries only — paged pendings are not entries', async () => {
+    const server = makeOverseer()
+    const received: number[] = []
+    const late: number[] = []
+
+    function EntriesProbe({ sink }: { sink: number[] }) {
+      useActionEntries(server.overseer, record => sink.push(record.id))
+      return null
+    }
+
+    await view.render(
+      <>
+        <Probe overseer={server.overseer} />
+        <EntriesProbe key="first" sink={received} />
+      </>,
+    )
+    await server.resolveSubscription()
+    await server.resolvePendingQuery({ entries: [entry(1)] })
+    await server.emit(entry(2))
+    expect(received).toEqual([2])
+
+    // A late consumer's mount-time replay is live-only too.
+    await view.render(
+      <>
+        <Probe overseer={server.overseer} />
+        <EntriesProbe key="first" sink={received} />
+        <EntriesProbe key="late" sink={late} />
+      </>,
+    )
+    expect(late).toEqual([2])
   })
 
   it('isolates a throwing entry listener from other consumers', async () => {

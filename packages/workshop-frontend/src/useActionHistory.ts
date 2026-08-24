@@ -102,7 +102,6 @@ export function useActionHistory(
   useActionEntries(overseer, record => {
     const session = sessionRef.current
     if (!session.hasLoadedPage) return
-    if (record.state === 'pending') return
     if (!matchesActionHistoryFilter(record, filter)) return
     if (session.frontier !== undefined && record.id < session.frontier) return
     setView(prev => {
