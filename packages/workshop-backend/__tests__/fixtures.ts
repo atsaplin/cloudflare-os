@@ -9,8 +9,10 @@ import { OverseerDurableObject } from "../src/overseer.js";
 import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
 
-// The actions schema must match makeOverseerStorage's: the auto-approval drain and the pending
-// history query read the pendingByGatekeeper index.
+/**
+ * The actions schema must match makeOverseerStorage's: the auto-approval drain and the pending
+ * history query read the pendingByGatekeeper index.
+ */
 export const ACTION_TEST_SCHEMA = {
   singletons: { nextActionId: 0 },
   collections: {
@@ -34,8 +36,10 @@ export function makeActionStorage(mockStorage = makeMockStorage()) {
 
 export type ActionTestStorage = ReturnType<typeof makeActionStorage>;
 
-// Storage over the same records but without the index declared, for simulating a workspace
-// written before the index existed (see the migration-backfill tests).
+/**
+ * Storage over the same records but without the index declared, for simulating a workspace
+ * written before the index existed (see the migration-backfill tests).
+ */
 export function makePreIndexActionStorage(mockStorage: DurableObjectStorage) {
   return createTypedStorage(mockStorage, {
     singletons: { nextActionId: 0 },
@@ -43,7 +47,7 @@ export function makePreIndexActionStorage(mockStorage: DurableObjectStorage) {
   });
 }
 
-// Puts a record and keeps nextActionId ahead of it, as the real allocator does.
+/** Puts a record and keeps nextActionId ahead of it, as the real allocator does. */
 export function putAction(
     storage: Pick<ActionTestStorage, "actions" | "nextActionId">, id: number,
     opts: { state?: ActionRecord["state"], type?: ActionRecord["type"], gatekeeperId?: number,

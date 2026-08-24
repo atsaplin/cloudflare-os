@@ -9427,7 +9427,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       // merge over gatekeeper groups.
       let pending = [...this.impl.storage.actions.pendingByGatekeeper.list()]
           .filter(record => beforeId === undefined || record.id < beforeId)
-          .sort((a, b) => b.id - a.id);
+          .toSorted((a, b) => b.id - a.id);
       let page = pending.slice(0, HISTORY_PAGE_DEFAULT_LIMIT);
       return {
         entries: page.map(actionRecordToLog),
