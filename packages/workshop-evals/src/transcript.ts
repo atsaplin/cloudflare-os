@@ -60,7 +60,7 @@ export function toTranscriptEvents(history: readonly AiChatMessage[]): Transcrip
   return events;
 }
 
-/** Product-specific counts not already shown as generic trace fields. */
+/** Product-specific diagnostics not already shown as generic trace fields. */
 export function measureHistory(history: readonly AiChatMessage[]) {
   let modelTurns = 0;
   let toolCalls = 0;
@@ -78,5 +78,6 @@ export function measureHistory(history: readonly AiChatMessage[]) {
       if (call.error !== undefined) toolErrors++;
     }
   }
-  return { modelTurns, toolCalls, toolErrors, agentErrors };
+  const toolFailureRate = toolCalls === 0 ? 0 : toolErrors / toolCalls;
+  return { modelTurns, toolCalls, toolErrors, toolFailureRate, agentErrors };
 }

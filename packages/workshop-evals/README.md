@@ -59,8 +59,16 @@ The run writes `.wrangler/evals/results.json` in this package. Open the report U
 pnpm evals:ui
 ```
 
-The report includes behavioral scores, transcripts, tool calls and errors, timings, usage, and target
-metadata.
+For each trial, the report shows:
+
+- how many task requirements passed, plus pass rate across repeated trials
+- total task duration and the time spent in each agent turn and verifier
+- LLM turns, tool calls, failed tool calls, and tool failure rate
+- agent errors and provider errors present in the transcript
+- provider-reported tokens and cost when available
+- model, local or preview target, and trial number
+
+The current tasks use deterministic code and RPC checks. They do not use an LLM judge.
 
 ## CI
 

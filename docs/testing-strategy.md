@@ -69,19 +69,21 @@ A check must not require one implementation technique when several correct techn
 
 Each trial reports:
 
-- full task pass or failure
-- fraction of behavioral checks passed
-- model and target
-- total wall time
+- whether every requirement passed
+- fraction of requirements passed
+- model, target, and trial number
+- total task duration
 - time spent in each agent turn and verifier
-- model turns
-- tool calls and failed tool calls
+- LLM turns
+- tool calls, failed tool calls, and tool failure rate
 - agent errors
-- provider token and cost metadata when the Workshop exposes them
+- provider-reported token and cost metadata when available
 
-A tool error does not fail a task if the agent recovers and delivers the requested behavior. A
-platform or provider failure remains visible as an invalid or failed run and must not silently become
-a model score.
+All initial task scores come from deterministic code and RPC checks. No LLM judge is used.
+
+A tool error does not fail a task by itself if the agent recovers and delivers the requested
+behavior. An exception during a verifier check becomes a failed check. This first version does not
+classify platform failures separately from the task score.
 
 Repeated trials are required before comparing models or harnesses. Results must identify the model,
 harness commit, target, task version, and trial. A model comparison holds the harness fixed. A

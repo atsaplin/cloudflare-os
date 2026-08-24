@@ -61,6 +61,7 @@ export type EvalRunOutput = {
     modelTurns: number;
     toolCalls: number;
     toolErrors: number;
+    toolFailureRate: number;
     agentErrors: number;
   };
 };
