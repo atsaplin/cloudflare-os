@@ -1853,13 +1853,16 @@ export interface Overseer extends RpcTarget {
   /**
    * Subscribe to action adds/updates. Dispose the returned stub to unsubscribe.
    *
-   * On subscribe, currently-pending records are replayed through the subscriber (the server scans
-   * the log in bounded internal pages; ordering relative to live updates is simply the stream
-   * order), then ready() fires. Resolved history is fetched separately via listActions().
+   * The subscription delivers live deltas only — nothing pre-existing is replayed. Query for
+   * state, subscribe for deltas: fetch the current pending set via
+   * listActions({filter: "pending"}) and resolved history via the other filters. As with
+   * subscribeToChat(), initiate the subscribe call before those reads — there is no need to
+   * await its return, only to start it first — so nothing can slip between the snapshot the
+   * pages reflect and the stream.
    *
-   * `startAfter` is deprecated: its presence switches the replay from pending-only to every
-   * record, since pre-deploy clients derive their entire history view from replay. The value
-   * itself is ignored. New clients must omit it and page history via listActions().
+   * `startAfter` is deprecated: its presence makes the server replay every record through the
+   * subscriber before ready(), since pre-deploy clients derive their entire history view from
+   * replay. The value itself is ignored. New clients must omit it.
    * TODO: Delete it once pre-deploy clients have cycled out.
    */
   subscribeToActions(subscriber: RpcStub<ActionsSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
@@ -3348,6 +3351,12 @@ export type AiChatStreamEvent = {
 /** Interface implemented by the client to receive action-log upserts. */
 export interface ActionsSubscriber {
   entry(record: ActionLogEntry): void;
+
+  /**
+   * @deprecated Fires immediately after a modern (live-only) subscribe registers — it only ever
+   * marked the end of the replay, which now exists solely for the deprecated startAfter path.
+   * Dies with that path; clients should treat it as a no-op.
+   */
   ready(): void;
 }
 

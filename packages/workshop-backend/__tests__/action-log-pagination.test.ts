@@ -26,27 +26,31 @@ function makeSubscriber(entry?: (record: ActionLogEntry) => Promise<void>) {
 }
 
 describe("subscribeToActions", () => {
-  it("fires ready immediately on an empty log", async () => {
-    let client = await openFakeOverseer(makeActionStorage());
+  it("delivers no pre-existing records: ready fires immediately", async () => {
+    // Live deltas only — the current pending set is queried via listActions({filter: "pending"}).
+    let storage = makeActionStorage();
+    putAction(storage, 0);                                          // pending action
+    putAction(storage, 1, { state: "approved" });
+    putAction(storage, 2, { type: "bindHook", state: "pending" });  // pending, non-action type
+    let client = await openFakeOverseer(storage);
     let { subscriber, events } = makeSubscriber();
 
     using _sub = await client.subscribeToActions(subscriber);
     expect(events).toEqual(["ready"]);
   });
 
-  it("replays only pending records, of any type, ascending, then ready", async () => {
+  it("delivers adds and resolutions live, in stream order", async () => {
     let storage = makeActionStorage();
-    putAction(storage, 0);                                          // pending action
-    putAction(storage, 1, { state: "approved" });
-    putAction(storage, 2, { type: "observation", state: "approved" });
-    putAction(storage, 3, { type: "bindHook", state: "pending" });  // pending, non-action type
-    putAction(storage, 4, { state: "rejected" });
-    putAction(storage, 5);
     let client = await openFakeOverseer(storage);
     let { subscriber, events } = makeSubscriber();
 
     using _sub = await client.subscribeToActions(subscriber);
-    expect(events).toEqual([0, 3, 5, "ready"]);
+    putAction(storage, 0);
+    let record = storage.actions.get(0)!;
+    record.state = "approved";
+    storage.actions.put(record);
+
+    expect(events).toEqual(["ready", 0, 0]);  // the add, then the resolving update
   });
 
   it("replays every record, resolved included, for the deprecated startAfter", async () => {
@@ -62,48 +66,14 @@ describe("subscribeToActions", () => {
     expect(events).toEqual([0, 1, 2, 3, "ready"]);
   });
 
-  it("sweeps a multi-page log without gaps or duplicates", async () => {
-    let storage = makeActionStorage();
-    let expected: Array<number | "ready"> = [];
-    for (let id = 0; id < PENDING_SCAN_PAGE_SIZE * 2 + 40; id++) {
-      let pending = id % 3 !== 0;
-      putAction(storage, id, { state: pending ? "pending" : "approved" });
-      if (pending) expected.push(id);
-    }
-    expected.push("ready");
-    let client = await openFakeOverseer(storage);
-    let { subscriber, events } = makeSubscriber();
-
-    using _sub = await client.subscribeToActions(subscriber);
-    expect(events).toEqual(expected);
-  });
-
-  it("delivers a record created mid-sweep live, exactly once", async () => {
-    let storage = makeActionStorage();
-    // One full page plus one, so the sweep yields between pages.
-    for (let id = 0; id <= PENDING_SCAN_PAGE_SIZE; id++) putAction(storage, id);
-    let client = await openFakeOverseer(storage);
-    let { subscriber, events } = makeSubscriber();
-
-    let pending = client.subscribeToActions(subscriber);
-    let lateId = PENDING_SCAN_PAGE_SIZE + 1;
-    putAction(storage, lateId);  // past the sweep's bound: live subscription only
-    using _sub = await pending;
-
-    expect(events.filter(e => e === lateId)).toEqual([lateId]);
-    expect(events.at(-1)).toBe("ready");
-    expect(events.filter(e => typeof e === "number").toSorted((a, b) => a - b))
-        .toEqual([...Array(lateId + 1).keys()]);
-  });
-
-  it("rejects the subscribe call when the subscriber fails during replay", async () => {
+  it("rejects the deprecated full replay when the subscriber fails mid-sweep", async () => {
     let storage = makeActionStorage();
     // More than one page, so the sweep crosses a yield after the entry rejections settle.
     for (let id = 0; id <= PENDING_SCAN_PAGE_SIZE; id++) putAction(storage, id);
     let client = await openFakeOverseer(storage);
     let { subscriber, events } = makeSubscriber(async () => { throw new Error("entry failed"); });
 
-    await expect(client.subscribeToActions(subscriber))
+    await expect(client.subscribeToActions(subscriber, new Date(0)))
         .rejects.toThrow("Action subscriber failed during replay");
     expect(events).not.toContain("ready");
   });
@@ -119,7 +89,7 @@ describe("subscribeToActions", () => {
     await scheduler.wait(0);  // let the stub's disposer run
     putAction(storage, 1);
 
-    expect(events).toEqual([0, "ready"]);
+    expect(events).toEqual(["ready"]);
   });
 });
 

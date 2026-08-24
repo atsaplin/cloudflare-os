@@ -1308,7 +1308,10 @@ const LISTING_REFRESH_BATCH = 16;
 // Longest noun accepted on a format reference. Denormalized display data.
 const MAX_FORMAT_REF_NOUN = 128;
 
-/** Raw records examined per page of subscribeToActions()'s pending replay. Exported for tests. */
+/**
+ * Raw records examined per page of subscribeToActions()'s deprecated startAfter full replay
+ * (legacy-only; dies with that block). Exported for tests.
+ */
 export const PENDING_SCAN_PAGE_SIZE = 256;
 
 /** listActions() entries returned per page. Exported for tests. */
@@ -9797,9 +9800,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   async subscribeToActions(subscriber: RpcStub<ActionsSubscriber>, startAfter?: Date)
       : Promise<RpcStub<{}>> {
     let actions = this.impl.storage.actions;
-    // Pre-deploy clients pass startAfter and build their entire history view from replay; honor
-    // that by replaying everything, not just pendings. The value itself is ignored (see api.ts).
-    let replayAll = startAfter !== undefined;
 
     subscriber = subscriber.dup();  // keep stub after return
     let subscribed = false;
@@ -9828,27 +9828,32 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     actions.subscribe(dbSubscriber);
     subscribed = true;
 
-    // Replay currently-pending records before returning. nextActionId bounds the sweep: records
-    // created past it are delivered by the live subscription registered above. Pages are
-    // synchronous snapshots; the yield between pages keeps a huge log from starving other RPCs.
-    try {
-      let end = this.impl.storage.nextActionId.get();
-      let cursor: number | undefined;
-      for (;;) {
-        if (disposed) throw new Error("Action subscriber failed during replay");
-        let page = [...actions.list({startAfter: cursor, end, limit: PENDING_SCAN_PAGE_SIZE})];
-        for (let record of page) {
-          if (replayAll || record.state === "pending") {
+    // The subscription delivers live deltas only; clients query current pending state via
+    // listActions({filter: "pending"}) after initiating the subscribe (see api.ts).
+    if (startAfter !== undefined) {
+      // DEPRECATED: pre-deploy clients pass startAfter and build their entire history view from
+      // replay; honor that by replaying every record, paging with a yield between pages so a huge
+      // log doesn't starve other RPCs. The value itself is ignored (see api.ts). nextActionId
+      // bounds the sweep: records created past it are delivered by the live subscription
+      // registered above. Delete this block (and PENDING_SCAN_PAGE_SIZE) once pre-deploy clients
+      // have cycled out.
+      try {
+        let end = this.impl.storage.nextActionId.get();
+        let cursor: number | undefined;
+        for (;;) {
+          if (disposed) throw new Error("Action subscriber failed during replay");
+          let page = [...actions.list({startAfter: cursor, end, limit: PENDING_SCAN_PAGE_SIZE})];
+          for (let record of page) {
             subscriber.entry(actionRecordToLog(record)).catch(unsubscribe);
           }
+          if (page.length < PENDING_SCAN_PAGE_SIZE) break;
+          cursor = page.at(-1)!.id;
+          await scheduler.wait(0);
         }
-        if (page.length < PENDING_SCAN_PAGE_SIZE) break;
-        cursor = page.at(-1)!.id;
-        await scheduler.wait(0);
+      } catch (err) {
+        unsubscribe();
+        throw err;  // rejecting the subscribe call is the client's error signal
       }
-    } catch (err) {
-      unsubscribe();
-      throw err;  // rejecting the subscribe call is the client's error signal
     }
 
     if (!disposed) subscriber.ready().catch(unsubscribe);
