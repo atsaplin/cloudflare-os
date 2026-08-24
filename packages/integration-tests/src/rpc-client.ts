@@ -81,7 +81,7 @@ export function connect(
  * a single-install dev machine will not show it and CI will.
  */
 export function stubFor<T extends RpcTarget>(target: T): RpcStub<T> {
-  return new RpcStub(target) as unknown as RpcStub<T>;
+  return new RpcStub(target);
 }
 
 // The server stores and compares these bytes verbatim and never re-derives them, so the tests skip
@@ -94,7 +94,7 @@ export async function signUp(
     api: RpcStub<PublicApi>, username: string): Promise<RpcStub<AuthenticatedApi>> {
   const token = await api.createAccount(username, username, passwordHashFor(username));
   if (!token) throw new Error(`Signup failed for "${username}" -- username already taken?`);
-  return (await api.authenticate(token)) as unknown as RpcStub<AuthenticatedApi>;
+  return await api.authenticate(token);
 }
 
 export type ConnectedAccount = {
