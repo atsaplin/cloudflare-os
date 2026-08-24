@@ -1,5 +1,5 @@
 import type { AgentTurnResult } from "@gadgets/integration-tests/agent-session";
-import type { AiChatMessage, WorkpieceSummary } from "@gadgets/workshop-shared/api";
+import type { AiChatMessage } from "@gadgets/workshop-shared/api";
 import { createHarness } from "vitest-evals";
 import { EVAL_RUN_BUDGET_MS } from "./config.js";
 import type { EvalRunInput, EvalRunOutput, EvalTask, EvalTurnResult } from "./task.js";
@@ -15,65 +15,38 @@ const HARNESS_OVERHEAD_MS = 2 * 60_000;
 export function createWorkshopHarness(task: EvalTask, target: WorkshopTarget) {
   return createHarness<EvalRunInput, EvalRunOutput>({
     name: "workshop-agent",
-    run: async ({ input, signal, setArtifact }) => {
+    run: async ({ input, signal }) => {
       const startedAt = Date.now();
       const turnTimeoutMs = Math.floor(
         (EVAL_RUN_BUDGET_MS - HARNESS_OVERHEAD_MS) / task.turns.length,
       );
-      setArtifact("scenario", {
-        id: task.id,
-        title: task.title,
-        expectation: task.expectation,
-        model: input.model,
-        trial: input.trial,
-        target: target.kind,
-      });
 
       const opened = await openWorkshopTarget(target, input.model, turnTimeoutMs);
       try {
         const turns: EvalTurnResult[] = [];
         let history: AiChatMessage[] = [];
-        let workpieces: WorkpieceSummary[] = [];
-        let chatId: number | undefined;
         let usage: AgentTurnResult["usage"] = {};
 
-        for (const [index, turn] of task.turns.entries()) {
+        for (const turn of task.turns) {
           const agentStartedAt = Date.now();
           const result = await opened.session.run(turn.prompt, { signal });
           const agentDurationMs = Date.now() - agentStartedAt;
-          ({ chatId, history, workpieces } = result);
+          ({ history } = result);
           usage = result.usage;
 
           const verificationStartedAt = Date.now();
-          const verifier = new EvalVerifier(opened.session, result.chatId, result.workpieces);
+          const verifier = new EvalVerifier(opened.session, result.workpieces);
           turns.push({
-            index,
             checks: await verifier.collect(turn.verify),
             agentDurationMs,
             verificationDurationMs: Date.now() - verificationStartedAt,
           });
         }
-        if (chatId === undefined) throw new Error(`Eval task ${task.id} has no turns`);
 
-        const checks = turns.flatMap(turn => turn.checks);
         const metrics = measureHistory(history);
-        const output: EvalRunOutput = {
-          taskId: task.id,
-          taskTitle: task.title,
-          expectation: task.expectation,
-          target: target.kind,
-          model: input.model,
-          trial: input.trial,
-          workspaceId: opened.session.workspaceId,
-          chatId,
-          passed: checks.length > 0 && checks.every(check => check.pass),
-          turns,
-          workpieces: workpieces.map(({ id, type, title }) => ({ id, type, title })),
-          metrics,
-        };
 
         return {
-          output,
+          output: { turns, metrics },
           events: toTranscriptEvents(history),
           usage: {
             provider: "cloudflare",

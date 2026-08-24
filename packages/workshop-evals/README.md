@@ -70,9 +70,8 @@ the official `getsentry/vitest-evals` action to publish one combined report.
 
 ## Add a scenario
 
-1. Add `tasks/<name>.task.ts` with a prompt and RPC verifier.
-2. Add `evals/<name>.eval.ts` that imports the task and calls `defineTaskEval(task)`.
+Add `evals/<name>.eval.ts`. Define the prompt and RPC verifier with `defineEvalTask()`, then register
+the task with `defineTaskEval()`. Keep the scenario in one file.
 
-A verifier should check user-visible behavior and stable RPC contracts. It should not require a
-particular implementation technique. Multi-turn tasks should re-check earlier behavior after each
-extension.
+Verify user-visible behavior and stable RPC contracts without requiring one implementation
+technique. Multi-turn tasks should re-check earlier behavior after each extension.

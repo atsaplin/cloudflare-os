@@ -51,17 +51,14 @@ export function resolveGadget(
  * order, and one failed observation does not hide later evidence from the same trial.
  */
 export class EvalVerifier {
-  /** Chat whose provisional branch is under verification. */
-  readonly chatId: number;
   /** Workpieces visible after the turn settled. */
   readonly workpieces: readonly WorkpieceSummary[];
   readonly #session: VerifierSession;
   readonly #checks: EvalCheck[] = [];
   readonly #pending: Promise<void>[] = [];
 
-  constructor(session: VerifierSession, chatId: number, workpieces: readonly WorkpieceSummary[]) {
+  constructor(session: VerifierSession, workpieces: readonly WorkpieceSummary[]) {
     this.#session = session;
-    this.chatId = chatId;
     this.workpieces = workpieces;
   }
 

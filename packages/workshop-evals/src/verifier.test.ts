@@ -14,7 +14,7 @@ function gadget(id: number, title: string): WorkpieceSummary {
 function collect(
     verify: (verifier: EvalVerifier) => Promise<void>,
     workpieces: readonly WorkpieceSummary[] = []): Promise<EvalCheck[]> {
-  return new EvalVerifier(unusedSession, 1, workpieces).collect(verify);
+  return new EvalVerifier(unusedSession, workpieces).collect(verify);
 }
 
 describe("resolveGadget", () => {
