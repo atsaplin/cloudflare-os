@@ -101,21 +101,6 @@ timeline. Put a sentence of placeholder detail under each — I'll replace them 
           evidence: { beforeRevision: before.revision, written, reread },
         };
       });
-
-      await verifier.check("keeps-the-document-across-a-server-restart", async () => {
-        const before = await (async () => {
-          using api = await verifier.connect<DocsApi>(TITLE);
-          return DocumentSchema.parse(await api.getDocument());
-        })();
-        await verifier.restart();
-        using api = await verifier.connect<DocsApi>(TITLE);
-        const after = DocumentSchema.parse(await api.getDocument());
-        return {
-          pass: after.revision === before.revision && after.title === before.title &&
-            JSON.stringify(after.blocks) === JSON.stringify(before.blocks),
-          evidence: { before, after },
-        };
-      });
     },
   }],
 });

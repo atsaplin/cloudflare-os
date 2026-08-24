@@ -19,7 +19,7 @@ function describeError(error: unknown): string {
 }
 
 /** The session capabilities a verifier needs, which is far less than a whole agent session. */
-export type VerifierSession = Pick<AgentSession, "connectToGadget" | "restartGadgets">;
+export type VerifierSession = Pick<AgentSession, "connectToGadget">;
 
 // Declared signature plus an untyped implementation, matching `connectTyped` in agent-session.ts:
 // capnweb's recursive `RpcStub` generic does not survive being forwarded through another generic.
@@ -117,21 +117,6 @@ export class EvalVerifier {
     return connectTyped<Session>(this.#session, resolveGadget(this.workpieces, gadgetTitle));
   }
 
-  /**
-   * Abruptly restarts every Gadget server in the workspace, exactly as the platform does when code
-   * changes: storage is kept, memory is discarded.
-   *
-   * Any stub obtained before this call is invalidated and will throw, so take a fresh one with
-   * `connect` afterwards. Use it to check that state a Gadget reported really was persisted rather
-   * than held in a field — including derived indexes, which is where an in-memory `Set` of seen ids
-   * silently stops rejecting duplicates.
-   *
-   * Only call this from a task's final turn: it advances the workspace code version, which an agent
-   * replaying its history in a later turn would reject.
-   */
-  async restart(): Promise<void> {
-    await this.#session.restartGadgets();
-  }
 
   /**
    * Runs the task's verifier and returns its observations in registration order.

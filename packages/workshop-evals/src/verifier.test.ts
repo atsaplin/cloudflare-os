@@ -5,7 +5,6 @@ import type { EvalCheck } from "./task.js";
 
 const unusedSession: VerifierSession = {
   connectToGadget: () => { throw new Error("connectToGadget is not used by this test"); },
-  restartGadgets: () => { throw new Error("restartGadgets is not used by this test"); },
 };
 
 function gadget(id: number, title: string): WorkpieceSummary {

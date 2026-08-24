@@ -1,6 +1,4 @@
-import type {
-  AgentSourceSnapshot, AgentTurnResult,
-} from "@gadgets/integration-tests/agent-session";
+import type { AgentTurnResult } from "@gadgets/integration-tests/agent-session";
 import type { AiChatMessage, WorkpieceSummary } from "@gadgets/workshop-shared/api";
 import { createHarness } from "vitest-evals";
 import type { EvalRunInput, EvalRunOutput, EvalTask, EvalTurnResult } from "./task.js";
@@ -12,18 +10,6 @@ import { EvalVerifier } from "./verifier.js";
 const TEST_TIMEOUT_MS = 30 * 60_000;
 const HARNESS_OVERHEAD_MS = 2 * 60_000;
 
-function serializeSource(snapshot: AgentSourceSnapshot, workpieces: readonly WorkpieceSummary[]) {
-  return workpieces.flatMap(workpiece => {
-    if (workpiece.type !== "gadget" || workpiece.filesRoot === undefined) return [];
-    const source = snapshot.workpieces.get(workpiece.filesRoot);
-    if (source === undefined) return [];
-    return [{
-      id: workpiece.id,
-      title: workpiece.title,
-      files: Object.fromEntries(source.files),
-    }];
-  });
-}
 
 /** Adapt one real Workshop task to the generic vitest-evals harness contract. */
 export function createWorkshopHarness(task: EvalTask, target: WorkshopTarget) {
@@ -69,8 +55,6 @@ export function createWorkshopHarness(task: EvalTask, target: WorkshopTarget) {
         }
         if (chatId === undefined) throw new Error(`Eval task ${task.id} has no turns`);
 
-        const source = await opened.session.acceptChanges();
-        setArtifact("source", serializeSource(source, workpieces));
         const checks = turns.flatMap(turn => turn.checks);
         const metrics = measureHistory(history);
         const output: EvalRunOutput = {

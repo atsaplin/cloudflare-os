@@ -37,7 +37,7 @@ agent scenarios.
 - drive one chat across multiple turns
 - read canonical history and workpieces
 - connect to generated Gadget RPCs
-- restart Gadget servers and capture accepted source
+- accept the current chat's proposed changes
 
 `vitest-evals` owns generic evaluation infrastructure:
 
@@ -59,7 +59,7 @@ Checks observe outcomes through stable interfaces. Examples include:
 
 - arithmetic and validation through Gadget RPC
 - no overselling under concurrent RPC calls
-- storage surviving repeated server restarts
+- stored state surviving a later turn's code changes
 - a later turn preserving behavior from an earlier turn
 - creation of a real standard Doc rather than a custom imitation
 

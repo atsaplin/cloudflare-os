@@ -55,8 +55,8 @@ The run writes `.wrangler/evals/results.json` in this package. Open the report U
 pnpm evals:ui
 ```
 
-The report includes behavioral scores, transcripts, tool calls and errors, timings, usage, generated
-source, and target metadata.
+The report includes behavioral scores, transcripts, tool calls and errors, timings, usage, and target
+metadata.
 
 ## CI
 
