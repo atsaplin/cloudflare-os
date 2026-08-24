@@ -7,13 +7,14 @@ import {
 import { AgentTurnCompletion, loadAllChatHistory } from "../src/agent-session-internals.js";
 
 function metadata(active: boolean): AiChatMetadata {
-  return {
+  const result: AiChatMetadata = {
     id: 7,
     title: "test",
     started: new Date(0),
     lastActive: new Date(0),
-    ...(active ? { activeAgent: { type: "agent", id: "model", name: "Model" } } : {}),
   };
+  if (active) result.activeAgent = { type: "agent", id: "model", name: "Model" };
+  return result;
 }
 
 function message(sequence: number): AiChatMessage {

@@ -1,11 +1,12 @@
 import type { AiChatMessage, AiToolCall } from "@gadgets/workshop-shared/api";
 import { toJsonValue, type JsonValue, type TranscriptEvent } from "vitest-evals";
+import { z } from "zod";
+
+const ToolArgumentsSchema = z.record(z.string(), z.json());
 
 function toolArguments(call: AiToolCall): Record<string, JsonValue> | undefined {
-  const value = toJsonValue(call.input);
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value
-    : undefined;
+  const result = ToolArgumentsSchema.safeParse(call.input);
+  return result.success ? result.data : undefined;
 }
 
 /** Convert canonical Workshop history into the transcript format owned by vitest-evals. */
@@ -26,23 +27,34 @@ export function toTranscriptEvents(history: readonly AiChatMessage[]): Transcrip
     if (role !== "assistant") continue;
     for (const call of message.toolCalls ?? []) {
       const argumentsValue = toolArguments(call);
-      events.push({
+      const toolCall = {
         type: "tool_call",
         id: call.toolCallId,
         name: call.toolName,
-        ...(argumentsValue === undefined ? {} : { arguments: argumentsValue }),
         metadata,
-      });
+      } satisfies TranscriptEvent;
+      events.push(argumentsValue === undefined
+        ? toolCall
+        : { ...toolCall, arguments: argumentsValue });
+
+      if (call.error !== undefined) {
+        events.push({
+          type: "tool_result",
+          toolCallId: call.toolCallId,
+          name: call.toolName,
+          error: { name: "Error", message: call.error },
+          metadata,
+        });
+        continue;
+      }
       const output = "output" in call ? toJsonValue(call.output) : undefined;
-      events.push({
+      const result = {
         type: "tool_result",
         toolCallId: call.toolCallId,
         name: call.toolName,
-        ...(call.error === undefined
-          ? (output === undefined ? {} : { content: output })
-          : { error: { name: "Error", message: call.error } }),
         metadata,
-      });
+      } satisfies TranscriptEvent;
+      events.push(output === undefined ? result : { ...result, content: output });
     }
   }
   return events;

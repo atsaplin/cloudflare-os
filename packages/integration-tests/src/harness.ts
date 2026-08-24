@@ -122,14 +122,17 @@ export type Harness = {
       : ReturnType<TestHarness["fetch"]>;
 };
 
-export async function startHarness(opts: {
+/** Workers and bindings to start for one out-of-process integration-test harness. */
+export type HarnessOptions = {
   /** Retain the Workshop's checked-in Worker Loader so agents and Gadgets can execute code. */
   enableGadgetExecution?: boolean;
   gatekeepers: GatekeeperSpec[];
   patchWorkshop?: (config: WorkerConfig) => void;
   /** Defaults to this repo's root. Override when a gatekeeper lives outside it. */
   root?: string;
-}): Promise<Harness> {
+};
+
+export async function startHarness(opts: HarnessOptions): Promise<Harness> {
   // Each gatekeeper's config is read (and patched) exactly once; the service binding below points at
   // the name the booted worker will actually carry, patches included.
   const gatekeepers = opts.gatekeepers.map(gk => {

@@ -23,7 +23,9 @@ it("sends the Access application token and same-origin header on preview WebSock
   await once(http, "listening");
 
   const address = http.address();
-  if (address === null || typeof address === "string") throw new Error("Test server has no TCP port");
+  if (!(address instanceof Object) || !("port" in address)) {
+    throw new Error("Test server has no TCP port");
+  }
   const baseUrl = new URL(`http://127.0.0.1:${address.port}/preview`);
   const requestPromise = new Promise<IncomingMessage>(resolve => {
     ws.once("connection", (socket, request) => {

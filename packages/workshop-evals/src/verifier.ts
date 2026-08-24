@@ -13,8 +13,7 @@ const VERIFIER_THREW = "verifier.threw";
 // indistinguishable from an author who supplied no evidence at all.
 const UNSERIALIZABLE_EVIDENCE = "<evidence was not JSON-serializable>";
 
-function describeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+function truncateError(message: string): string {
   return message.length > EVIDENCE_LIMIT ? `${message.slice(0, EVIDENCE_LIMIT)}...` : message;
 }
 
@@ -80,20 +79,15 @@ export class EvalVerifier {
   async #run(index: number, id: string, body: () => Promise<EvalCheckOutcome>): Promise<void> {
     try {
       const outcome = await body();
-      if (typeof outcome === "boolean") {
-        this.#checks[index] = { id, pass: outcome };
-        return;
-      }
       const evidence = outcome.evidence === undefined
         ? undefined
         : toJsonValue(outcome.evidence) ?? UNSERIALIZABLE_EVIDENCE;
-      this.#checks[index] = {
-        id,
-        pass: outcome.pass,
-        ...(evidence === undefined ? {} : { evidence }),
-      };
+      const check: EvalCheck = { id, pass: outcome.pass };
+      if (evidence !== undefined) check.evidence = evidence;
+      this.#checks[index] = check;
     } catch (error) {
-      this.#checks[index] = { id, pass: false, evidence: describeError(error) };
+      const message = error instanceof Error ? error.message : String(error);
+      this.#checks[index] = { id, pass: false, evidence: truncateError(message) };
     }
   }
 
@@ -114,7 +108,8 @@ export class EvalVerifier {
     try {
       await verify(this);
     } catch (error) {
-      this.#checks.push({ id: VERIFIER_THREW, pass: false, evidence: describeError(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      this.#checks.push({ id: VERIFIER_THREW, pass: false, evidence: truncateError(message) });
     }
     await Promise.all(this.#pending);
     return this.#checks;

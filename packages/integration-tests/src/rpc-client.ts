@@ -65,8 +65,8 @@ export function connect(
     origin: baseUrl.origin,
     headers: { Cookie: `CF_Authorization=${options.accessToken}` },
   });
-  // `ws` implements the standard client protocol Cap'n Web consumes, but its Node declarations add
-  // binary modes and omit Workers-only server methods, so the otherwise-compatible types diverge.
+  // SAFETY: Cap'n Web uses the client methods shared by both implementations. The Workers type also
+  // requires server-only methods that a client socket never calls.
   return newWebSocketRpcSession<PublicApi>(nodeSocket as unknown as WebSocket);
 }
 

@@ -5,7 +5,7 @@ import type { EvalVerifier } from "./verifier.js";
 export type EvalExpectation = "required" | "frontier";
 
 /** Result of one deterministic observation of the Gadget the agent built. */
-export type EvalCheckOutcome = boolean | {
+export type EvalCheckOutcome = {
   pass: boolean;
   evidence?: unknown;
 };

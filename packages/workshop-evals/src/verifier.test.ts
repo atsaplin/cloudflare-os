@@ -35,7 +35,7 @@ describe("resolveGadget", () => {
 describe("EvalVerifier", () => {
   it("records outcomes with and without evidence", async () => {
     expect(await collect(async verifier => {
-      await verifier.check("bare", async () => true);
+      await verifier.check("bare", async () => ({ pass: true }));
       await verifier.check("detailed", async () => ({ pass: false, evidence: { seen: 2 } }));
     })).toEqual([
       { id: "bare", pass: true },
@@ -46,7 +46,7 @@ describe("EvalVerifier", () => {
   it("records a throw inside a check as a failure and keeps going", async () => {
     expect(await collect(async verifier => {
       await verifier.check("explodes", async () => { throw new Error("RPC refused"); });
-      await verifier.check("still-runs", async () => true);
+      await verifier.check("still-runs", async () => ({ pass: true }));
     })).toEqual([
       { id: "explodes", pass: false, evidence: "RPC refused" },
       { id: "still-runs", pass: true },
@@ -55,7 +55,7 @@ describe("EvalVerifier", () => {
 
   it("keeps the observations made before the verifier body itself threw", async () => {
     const checks = await collect(async verifier => {
-      await verifier.check("recorded", async () => true);
+      await verifier.check("recorded", async () => ({ pass: true }));
       throw new Error("resolveGadget failed outside a check");
     });
     expect(checks.at(0)).toEqual({ id: "recorded", pass: true });
@@ -67,9 +67,9 @@ describe("EvalVerifier", () => {
       await Promise.all([
         verifier.check("slow", async () => {
           await new Promise(resolve => setTimeout(resolve, 10));
-          return true;
+          return { pass: true };
         }),
-        verifier.check("fast", async () => true),
+        verifier.check("fast", async () => ({ pass: true })),
       ]);
     });
     expect(checks.map(check => check.id)).toEqual(["slow", "fast"]);
@@ -79,7 +79,7 @@ describe("EvalVerifier", () => {
     expect(await collect(async verifier => {
       void verifier.check("forgotten", async () => {
         await new Promise(resolve => setTimeout(resolve, 5));
-        return true;
+        return { pass: true };
       });
     })).toEqual([{ id: "forgotten", pass: true }]);
   });
@@ -93,8 +93,8 @@ describe("EvalVerifier", () => {
 
   it("records a duplicate check ID as a failure rather than losing the turn", async () => {
     const checks = await collect(async verifier => {
-      await verifier.check("same", async () => true);
-      await verifier.check("same", async () => true);
+      await verifier.check("same", async () => ({ pass: true }));
+      await verifier.check("same", async () => ({ pass: true }));
     });
     expect(checks.at(0)).toEqual({ id: "same", pass: true });
     expect(checks.at(1)?.evidence).toContain("Duplicate eval check ID");

@@ -1,5 +1,7 @@
-import { AgentSession } from "@gadgets/integration-tests/agent-session";
-import { startHarness, type WorkerConfig } from "@gadgets/integration-tests/harness";
+import { AgentSession, type AgentSessionOptions } from "@gadgets/integration-tests/agent-session";
+import {
+  startHarness, type HarnessOptions, type WorkerConfig,
+} from "@gadgets/integration-tests/harness";
 
 /** Existing credentials used to run models from a local workerd Workshop. */
 export type LocalModelAccess = {
@@ -23,10 +25,10 @@ export type WorkshopTarget = {
   accessToken: string;
 };
 
-/** One isolated Workshop session plus its target-specific cleanup. */
+/** One isolated Workshop session with target-specific asynchronous cleanup. */
 export type OpenedWorkshop = {
   session: AgentSession;
-  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
 
 function value(environment: NodeJS.ProcessEnv, key: string): string | undefined {
@@ -113,7 +115,7 @@ export async function openWorkshopTarget(
       const openedSession = session;
       return {
         session: openedSession,
-        close: async () => {
+        [Symbol.asyncDispose]: async () => {
           try {
             await openedSession.deleteWorkspace();
           } finally {
@@ -128,38 +130,41 @@ export async function openWorkshopTarget(
   }
 
   const modelAccess = target.modelAccess;
-  const harness = await startHarness({
+  const harnessOptions: HarnessOptions = {
     gatekeepers: [],
     enableGadgetExecution: true,
-    ...(modelAccess.kind === "gateway"
-      ? { patchWorkshop: config => configureGateway(config, modelAccess) }
-      : {}),
-  });
+  };
+  if (modelAccess.kind === "gateway") {
+    harnessOptions.patchWorkshop = config => configureGateway(config, modelAccess);
+  }
+  const sessionOptions: AgentSessionOptions = { modelId: model, timeoutMs };
+  if (modelAccess.kind === "direct") {
+    sessionOptions.userModel = {
+      profile: { type: "agent", id: model, name: model },
+      config: {
+        provider: "cloudflare",
+        model,
+        accountId: modelAccess.accountId,
+        apiToken: modelAccess.apiToken,
+      },
+    };
+  }
+
+  const harness = await startHarness(harnessOptions);
+  let session: AgentSession | undefined;
   try {
-    const session = await AgentSession.create(harness.url, {
-      modelId: model,
-      ...(modelAccess.kind === "direct" ? {
-        userModel: {
-          profile: { type: "agent", id: model, name: model },
-          config: {
-            provider: "cloudflare",
-            model,
-            accountId: modelAccess.accountId,
-            apiToken: modelAccess.apiToken,
-          },
-        },
-      } : {}),
-      timeoutMs,
-    });
+    session = await AgentSession.create(harness.url, sessionOptions);
     await session.waitForOutputFormats();
+    const openedSession = session;
     return {
-      session,
-      close: async () => {
-        session[Symbol.dispose]();
+      session: openedSession,
+      [Symbol.asyncDispose]: async () => {
+        openedSession[Symbol.dispose]();
         await harness.server.close();
       },
     };
   } catch (error) {
+    session?.[Symbol.dispose]();
     await harness.server.close();
     throw error;
   }

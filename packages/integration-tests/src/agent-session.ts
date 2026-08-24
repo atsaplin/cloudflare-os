@@ -211,17 +211,19 @@ export class AgentSession implements Disposable {
         await this.acceptChanges();
         history = await this.#loadHistory(this.#chatId);
       }
+      const usage: AgentTurnResult["usage"] = {};
+      if (completion.lastMetadata?.totalTokens !== undefined) {
+        usage.totalTokens = completion.lastMetadata.totalTokens;
+      }
+      if (completion.lastMetadata?.totalCost !== undefined) {
+        usage.costUsd = completion.lastMetadata.totalCost;
+      }
       return {
         chatId: this.#chatId,
         history,
         workpieces: this.workpieces(),
         agentErrors: history.flatMap(entry => entry.type === "error" ? [entry.message] : []),
-        usage: {
-          ...(completion.lastMetadata?.totalTokens === undefined
-            ? {} : { totalTokens: completion.lastMetadata.totalTokens }),
-          ...(completion.lastMetadata?.totalCost === undefined
-            ? {} : { costUsd: completion.lastMetadata.totalCost }),
-        },
+        usage,
       };
     } catch (error) {
       this.#failed = true;
@@ -289,11 +291,12 @@ export class AgentSession implements Disposable {
     }
   }
 
-  /** Delete the isolated workspace and all data created by the session. */
+  /** Delete the isolated workspace, then dispose every capability held by the session. */
   async deleteWorkspace(): Promise<void> {
     this.#assertUsable();
     if (this.#turn !== undefined) throw new Error("Cannot delete the workspace during an agent turn");
     await this.#overseer.deleteSelf();
+    this[Symbol.dispose]();
   }
 
   /** Dispose subscriptions, callback targets, RPC capabilities, and the WebSocket session. */
