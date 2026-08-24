@@ -967,6 +967,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       and every live chat was converted to the commit-pinned change stream (a
       //       `conversionBoundary` changes message plus a `codeBase`). The `code`/`snapshots`
       //       collections are dead stored data from this version on.
+      //   3 = the actions collection's `pendingByGatekeeper` index exists and is backfilled.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1076,7 +1077,16 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       }),
 
       actions: collection<ActionRecord>()({
-        primaryKey: "id"
+        primaryKey: "id",
+
+        nonUniqueIndexes: {
+          // Sparse index over just the pending records, keyed by gatekeeper, so the auto-approval
+          // drain is O(pending) rather than a full-log scan. Backfilled by the version-3
+          // migration.
+          pendingByGatekeeper(record: ActionRecord) {
+            return record.state === "pending" ? record.gatekeeperId : null;
+          }
+        }
       }),
 
       boundHooks: collection<BoundHookRecord>()({
@@ -1707,9 +1717,12 @@ class OverseerImpl implements AgentHooks {
       // blocked event (including the alarm handler) is delivered. On failure there is nothing
       // to do -- blockConcurrencyWhile has already aborted the DO -- but the rejection must be
       // consumed so it doesn't also surface as an unhandled rejection.
-      this.ctx.blockConcurrencyWhile(() => this.#migrateToGitStorage())
-          .then(() => this.#resumeInterruptedAgents(), () => {});
+      this.ctx.blockConcurrencyWhile(async () => {
+        await this.#migrateToGitStorage();
+        this.#migrateToPendingActionIndex();
+      }).then(() => this.#resumeInterruptedAgents(), () => {});
     } else {
+      this.#migrateToPendingActionIndex();
       this.#resumeInterruptedAgents();
     }
   }
@@ -1767,6 +1780,25 @@ class OverseerImpl implements AgentHooks {
     this.logger.info("migrated workspace code to git storage", {
       event: "storage.migration.git.completed",
       durationMs: Date.now() - startedAt, commitCount: commits,
+    });
+  }
+
+  // Version 2 -> 3: backfill the actions `pendingByGatekeeper` index. Indexes are only maintained
+  // at write time, so over records that predate the index's declaration it starts empty -- and
+  // resolving a pre-existing pending action would then throw on the index update. Runs
+  // synchronously in the constructor (chained after the git-storage migration when that one is
+  // still pending), so nothing can observe pre-migration state; transactionSync makes
+  // rebuild-plus-stamp atomic, so a crash mid-rebuild retries whole. The `!== 2` guard keeps
+  // never-initialized DOs write-free (they stamp the current version at first initialization).
+  #migrateToPendingActionIndex(): void {
+    if (this.storage.version.get() !== 2) return;
+    let startedAt = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.storage.actions.pendingByGatekeeper.rebuild();
+      this.storage.version.put(3);
+    });
+    this.logger.info("backfilled the pending-action index", {
+      event: "storage.migration.pending-index.completed", durationMs: Date.now() - startedAt,
     });
   }
 
@@ -8158,7 +8190,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(2);
+    this.impl.storage.version.put(3);
   }
 
   /**

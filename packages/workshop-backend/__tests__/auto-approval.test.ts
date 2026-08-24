@@ -1,22 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { createTypedStorage, collection } from "@gadgets/typed-storage";
-import { AutoApprovalDrainer, AutoApprovalStorage, ApplyPendingActionFn, DRAIN_PAGE_SIZE }
+import { AutoApprovalDrainer, AutoApprovalStorage, ApplyPendingActionFn }
     from "../src/auto-approval.js";
-import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
+import type { ActionRecord } from "../src/overseer.js";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage.js";
+import { makeActionStorage, makePreIndexActionStorage, putAction } from "./fixtures.js";
 
-function makeStorage(): AutoApprovalStorage {
-  return createTypedStorage(makeMockStorage(), {
-    singletons: { nextActionId: 0 },
-    collections: {
-      actions: collection<ActionRecord>()({ primaryKey: "id" }),
-      autoApproveTags: collection<AutoApproveTagRecord>()({
-        primaryKey: (r: AutoApproveTagRecord) => `${r.gatekeeperId}:${r.actionKind.tag}`,
-      }),
-    },
-  });
-}
+const makeStorage = makeActionStorage;
 
 const GK = 1;
 const ENABLER: AiChatAuthorInfo = { type: "user", id: "enabler@example.com", name: "Enabler" };
@@ -24,30 +14,6 @@ const ENABLER: AiChatAuthorInfo = { type: "user", id: "enabler@example.com", nam
 function enableRule(storage: AutoApprovalStorage, actionTag = "edit", gatekeeperId = GK) {
   storage.autoApproveTags.put({
     gatekeeperId, actionKind: { tag: actionTag, label: "Edits" }, enabledBy: ENABLER });
-}
-
-function putAction(
-    storage: AutoApprovalStorage, id: number,
-    opts: { gatekeeperId?: number; actionTag?: string; autoApprovable?: boolean;
-            state?: ActionRecord["state"] } = {}) {
-  storage.actions.put({
-    id,
-    gatekeeperId: opts.gatekeeperId ?? GK,
-    caller: { from: "agent", chatId: 1 },
-    createdAt: new Date(),
-    state: opts.state ?? "pending",
-    type: "action",
-    action: id,
-    description: {
-      title: `Action ${id}`,
-      description: `Action ${id} description`,
-      implementsRevert: true,
-      actionKind: { tag: opts.actionTag ?? "edit", label: "Edits" },
-      autoApprovable: opts.autoApprovable ?? true,
-    },
-  });
-  // Keep nextActionId ahead of every stored id, as the real allocator does.
-  if (id >= storage.nextActionId.get()) storage.nextActionId.put(id + 1);
 }
 
 function getAction(storage: AutoApprovalStorage, id: number): ActionRecord & {type: "action"} {
@@ -216,11 +182,11 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 2).state).toBe("approved");
   });
 
-  it("pages through a large log, applying eligible actions in ascending order", async () => {
+  it("drains a large log, applying eligible actions in ascending order", async () => {
     let storage = makeStorage();
     enableRule(storage);
     let eligible: number[] = [];
-    for (let id = 0; id < DRAIN_PAGE_SIZE * 2 + 30; id++) {
+    for (let id = 0; id < 230; id++) {
       if (id % 5 === 0) {
         putAction(storage, id, { gatekeeperId: GK + 1 });   // other gatekeeper: skipped, not a gate
       } else if (id % 5 === 1) {
@@ -237,11 +203,11 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(calls).toEqual(eligible);
   });
 
-  it("halts at a manual gate encountered in a later page", async () => {
+  it("halts at a manual gate deep in the log", async () => {
     let storage = makeStorage();
     enableRule(storage);
-    let gateId = DRAIN_PAGE_SIZE + 5;
-    for (let id = 0; id < DRAIN_PAGE_SIZE + 20; id++) {
+    let gateId = 105;
+    for (let id = 0; id < 120; id++) {
       putAction(storage, id, { autoApprovable: id !== gateId });
     }
 
@@ -251,6 +217,27 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(calls).toEqual(Array.from({ length: gateId }, (_, i) => i));
     expect(getAction(storage, gateId).state).toBe("pending");
     expect(getAction(storage, gateId + 1).state).toBe("pending");
+  });
+
+  it("drains pendings written before the index existed once a rebuild backfills it", async () => {
+    // Mirrors the version-3 migration: the records predate the pendingByGatekeeper declaration.
+    let mock = makeMockStorage();
+    let legacy = makePreIndexActionStorage(mock);
+    putAction(legacy, 1);
+    putAction(legacy, 2, { state: "approved" });
+    putAction(legacy, 3);
+
+    let storage = makeStorage(mock);
+    storage.actions.pendingByGatekeeper.rebuild();
+    enableRule(storage);
+
+    // The apply persists a resolved state, which must not throw on the backfilled index.
+    let { applyFn, calls } = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, applyFn).drain(GK);
+
+    expect(calls).toEqual([1, 3]);
+    expect(getAction(storage, 1).state).toBe("approved");
+    expect(getAction(storage, 3).state).toBe("approved");
   });
 
   it("halts when an apply fails, leaving it and everything after pending", async () => {
