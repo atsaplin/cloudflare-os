@@ -55,13 +55,13 @@ reducer.
 A task contains one or more prompts and a verifier. Later turns share the same workspace and chat.
 They must re-check earlier requirements when a new feature could break them.
 
-Checks observe outcomes through stable interfaces. Examples include:
+Checks call the finished Gadget the way a user or client would. The initial tasks check that:
 
-- arithmetic and validation through Gadget RPC
-- no overselling under concurrent RPC calls
-- stored state surviving a later turn's code changes
-- a later turn preserving behavior from an earlier turn
-- creation of a real standard Doc rather than a custom imitation
+- money splits never lose a cent and invalid inputs return the promised errors
+- ten simultaneous booking attempts never exceed the slot's capacity
+- expenses entered before the agent adds budgets are still present afterward
+- adding budgets does not break the original ledger operations
+- asking for a Doc creates the platform's standard Doc output
 
 A check must not require one implementation technique when several correct techniques exist.
 
