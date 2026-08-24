@@ -6,6 +6,10 @@ through the Gadget's real RPC.
 The package uses the workerd and Cap'n Web helpers from `@gadgets/integration-tests`. `vitest-evals`
 owns transcript normalization, scoring, reports, traces, and CI result reduction.
 
+Live cases stay under `evals/**/*.eval.ts`. The package's cached `test` task includes only
+`src/**/*.test.ts`, so `pnpm test` never runs a model. The root `pnpm evals` script builds first, then
+invokes the live package script directly; model credentials do not pass through a cached Vite+ task.
+
 ## Run locally
 
 Use an existing AI Gateway configuration:
