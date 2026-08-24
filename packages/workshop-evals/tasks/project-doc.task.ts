@@ -30,17 +30,12 @@ function text(document: Document): string {
 }
 
 /**
- * The "make me a doc" path, which is a first-class platform feature rather than something the agent
- * should build from scratch: the deployment ships a Docs format blueprint, the system prompt names
- * it on every turn, and instantiating it is what gives the user a real Doc — grouped on the outputs
- * page, exportable, and editable by the shipped collaborative editor.
+ * Docs are a standard platform output. The system prompt advertises the shipped blueprint, and a
+ * real Doc appears on the outputs page and supports the collaborative Docs RPC. A custom notes
+ * Gadget lacks both properties.
  *
- * The outcome under test is therefore "asked for a doc, received a Doc", checked two ways that ignore
- * how the agent got there: the workpiece carries a `document` output, and it answers the Docs RPC
- * contract. A bespoke notes gadget fails both, because a user cannot use it as a Doc.
- *
- * Not yet measured against a live model, so it starts as frontier; promote once a baseline
- * shows it passing.
+ * No current-main baseline shows this task passing every check, so it remains frontier. Promote it
+ * only after a repeated baseline establishes that result.
  */
 export default defineEvalTask({
   id: "project-doc",

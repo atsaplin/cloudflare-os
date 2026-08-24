@@ -102,19 +102,29 @@ function configureGateway(config: WorkerConfig, access: Extract<LocalModelAccess
 export async function openWorkshopTarget(
     target: WorkshopTarget, model: string, timeoutMs: number): Promise<OpenedWorkshop> {
   if (target.kind === "preview") {
-    const session = await AgentSession.create(target.url, {
-      accessToken: target.accessToken,
-      modelId: model,
-      timeoutMs,
-    });
-    await session.waitForOutputFormats();
-    return {
-      session,
-      close: () => {
-        session[Symbol.dispose]();
-        return Promise.resolve();
-      },
-    };
+    let session: AgentSession | undefined;
+    try {
+      session = await AgentSession.create(target.url, {
+        accessToken: target.accessToken,
+        modelId: model,
+        timeoutMs,
+      });
+      await session.waitForOutputFormats();
+      const openedSession = session;
+      return {
+        session: openedSession,
+        close: async () => {
+          try {
+            await openedSession.deleteWorkspace();
+          } finally {
+            openedSession[Symbol.dispose]();
+          }
+        },
+      };
+    } catch (error) {
+      session?.[Symbol.dispose]();
+      throw error;
+    }
   }
 
   const modelAccess = target.modelAccess;

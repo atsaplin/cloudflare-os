@@ -6,6 +6,11 @@ export type EvalMatrix = {
 
 const DEFAULT_MODELS = ["@cf/zai-org/glm-5.2", "@cf/moonshotai/kimi-k2.7-code"];
 
+/** Budget shared by all agent turns and verification inside one trial. */
+export const EVAL_RUN_BUDGET_MS = 30 * 60_000;
+/** Outer Vitest deadline; cleanup gets two minutes after the run budget expires. */
+export const EVAL_TEST_TIMEOUT_MS = EVAL_RUN_BUDGET_MS + 2 * 60_000;
+
 /** Parse non-secret eval controls. Model credentials belong to the selected target. */
 export function evalMatrix(environment: NodeJS.ProcessEnv = process.env): EvalMatrix {
   const models = (environment.WORKSHOP_EVAL_MODELS ?? "")

@@ -33,17 +33,13 @@ function tally(results: readonly z.infer<typeof OkSchema>[]) {
 }
 
 /**
- * Overselling under concurrent booking.
+ * Durable Object RPC calls can interleave at each `await`. A count check followed by an awaited
+ * insert can therefore oversell. Both shipped format blueprints guard this race, so the task probes
+ * a platform-relevant capability rather than prompt recall.
  *
- * Durable Object RPC calls interleave at every `await`, so the obvious "read the count, check it,
- * write the booking" shape oversells a slot the moment two requests arrive together. Nothing in the
- * agent's instructions mentions this, yet both format blueprints the platform ships defend against
- * it with a mutation queue — so it is a real capability question rather than prompt recall.
- *
- * The prompt states the requirement — never exceed capacity, people book at the same moment — and not
- * a technique. GLM 5.2 satisfied it by making the check and the insert one synchronous SQL sequence,
- * plus a BEFORE INSERT trigger that aborts at capacity. A check for a mutation queue would reject
- * that.
+ * The prompt states the capacity invariant without prescribing synchronization. In a measured GLM
+ * 5.2 run, synchronous SQL plus a BEFORE INSERT trigger passed. Requiring a mutation queue would
+ * have rejected that correct implementation.
  */
 export default defineEvalTask({
   id: "appointment-desk",

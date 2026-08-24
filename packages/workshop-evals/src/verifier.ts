@@ -30,10 +30,8 @@ function connectTyped(session: VerifierSession, id: WorkpieceId) {
 }
 
 /**
- * Resolves the one Gadget carrying this exact title.
- *
- * Tasks name the Gadget in their prompt, so an unresolvable title usually means the agent named it
- * something else. The error lists what was actually built, which is the first thing an author asks.
+ * Task prompts require an exact Gadget title. A mismatch error includes the titles the agent
+ * created, which makes naming failures diagnosable from the report.
  */
 export function resolveGadget(
     workpieces: readonly WorkpieceSummary[], title: string): WorkpieceId {
@@ -49,12 +47,8 @@ export function resolveGadget(
 }
 
 /**
- * What a task uses to observe what the agent built, and where its observations are collected.
- *
- * Every read targets the chat's *provisional* branch, so a task sees the agent's proposed changes
- * exactly as a user would before accepting them. Checks are held in registration order and each is
- * isolated, so a report reads top-to-bottom and one failing expectation neither hides nor reorders
- * the others.
+ * Verifies the agent's provisional branch before a user accepts it. Checks retain registration
+ * order, and one failed observation does not hide later evidence from the same trial.
  */
 export class EvalVerifier {
   /** Chat whose provisional branch is under verification. */
@@ -72,11 +66,8 @@ export class EvalVerifier {
   }
 
   /**
-   * Records one named observation.
-   *
-   * A throw inside `body` — a failed RPC, a schema mismatch, a Gadget that was never created — is
-   * recorded as a failed check rather than aborting the run, so one broken expectation does not
-   * discard everything else the trial would have told you.
+   * Isolates RPC and schema failures to one observation. An expensive trial still reports every
+   * independent check it can run.
    */
   async check(id: string, body: () => Promise<EvalCheckOutcome>): Promise<void> {
     if (this.#checks.some(check => check.id === id)) {
@@ -119,11 +110,8 @@ export class EvalVerifier {
 
 
   /**
-   * Runs the task's verifier and returns its observations in registration order.
-   *
-   * A throw that escapes the verifier body — a duplicate check ID, an unguarded helper, a task bug —
-   * becomes one more failed check. Letting it propagate instead would discard every observation the
-   * trial had already paid for.
+   * Preserves checks recorded before an error escapes the verifier body. The escaped error becomes
+   * a final failed check instead of erasing the trial's earlier evidence.
    */
   async collect(verify: (verifier: EvalVerifier) => Promise<void>): Promise<EvalCheck[]> {
     try {

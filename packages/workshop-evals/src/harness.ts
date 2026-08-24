@@ -1,13 +1,13 @@
 import type { AgentTurnResult } from "@gadgets/integration-tests/agent-session";
 import type { AiChatMessage, WorkpieceSummary } from "@gadgets/workshop-shared/api";
 import { createHarness } from "vitest-evals";
+import { EVAL_RUN_BUDGET_MS } from "./config.js";
 import type { EvalRunInput, EvalRunOutput, EvalTask, EvalTurnResult } from "./task.js";
 import { measureHistory, toTranscriptEvents } from "./transcript.js";
 import { openWorkshopTarget } from "./target.js";
 import type { WorkshopTarget } from "./target.js";
 import { EvalVerifier } from "./verifier.js";
 
-const TEST_TIMEOUT_MS = 30 * 60_000;
 const HARNESS_OVERHEAD_MS = 2 * 60_000;
 
 
@@ -18,7 +18,7 @@ export function createWorkshopHarness(task: EvalTask, target: WorkshopTarget) {
     run: async ({ input, signal, setArtifact }) => {
       const startedAt = Date.now();
       const turnTimeoutMs = Math.floor(
-        (TEST_TIMEOUT_MS - HARNESS_OVERHEAD_MS) / task.turns.length,
+        (EVAL_RUN_BUDGET_MS - HARNESS_OVERHEAD_MS) / task.turns.length,
       );
       setArtifact("scenario", {
         id: task.id,

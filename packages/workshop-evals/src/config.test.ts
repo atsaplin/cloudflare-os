@@ -1,5 +1,9 @@
 import { expect, it } from "vitest";
-import { evalMatrix } from "./config.js";
+import { EVAL_RUN_BUDGET_MS, EVAL_TEST_TIMEOUT_MS, evalMatrix } from "./config.js";
+
+it("reserves cleanup time outside the agent run budget", () => {
+  expect(EVAL_TEST_TIMEOUT_MS).toBeGreaterThan(EVAL_RUN_BUDGET_MS);
+});
 
 it("uses both Workers AI models and one trial by default", () => {
   expect(evalMatrix({})).toEqual({
