@@ -185,6 +185,22 @@ let EVE: User = {
   groups: []
 };
 
+// Schemas shared by the non-unique-index suites: users indexed by level, and the same collection
+// with no index declared (for simulating writes from before the index existed).
+const INDEXED_SCHEMA = {
+  collections: {
+    users: collection<User>()({
+      primaryKey: "name",
+      nonUniqueIndexes: {
+        byLevel: (user: User) => user.level == 0 ? null : user.level
+      }
+    })
+  }
+};
+const PLAIN_SCHEMA = {
+  collections: { users: collection<User>()({ primaryKey: "name" }) }
+};
+
 describe("basic collections with string primary key", () => {
   let mockStorage = makeMockStorage();
   let storage = createTypedStorage(mockStorage, {
@@ -509,16 +525,7 @@ describe("unique index by array", () => {
 
 describe("non-unique index by number", () => {
   let mockStorage = makeMockStorage();
-  let storage = createTypedStorage(mockStorage, {
-    collections: {
-      users: collection<User>()({
-        primaryKey: "name",
-        nonUniqueIndexes: {
-          byLevel: (user: User) => user.level == 0 ? null : user.level
-        }
-      })
-    }
-  });
+  let storage = createTypedStorage(mockStorage, INDEXED_SCHEMA);
 
   expect([...storage.users.byLevel.list()]).toStrictEqual([]);
 
@@ -613,22 +620,9 @@ describe("non-unique index by array", () => {
 });
 
 describe("non-unique index rebuild", () => {
-  const INDEXED_SCHEMA = {
-    collections: {
-      users: collection<User>()({
-        primaryKey: "name",
-        nonUniqueIndexes: {
-          byLevel: (user: User) => user.level == 0 ? null : user.level
-        }
-      })
-    }
-  };
-
   it("backfills an index declared after records were written", () => {
     let mockStorage = makeMockStorage();
-    let legacy = createTypedStorage(mockStorage, {
-      collections: { users: collection<User>()({ primaryKey: "name" }) }
-    });
+    let legacy = createTypedStorage(mockStorage, PLAIN_SCHEMA);
     legacy.users.put(BOB);
     legacy.users.put(ALICE);
     legacy.users.put(CAROL);
@@ -657,9 +651,7 @@ describe("non-unique index rebuild", () => {
     storage.users.put(DAVE);
 
     // Mutate through a view without the index, leaving it stale: DAVE gone, BOB unindexed.
-    let legacy = createTypedStorage(mockStorage, {
-      collections: { users: collection<User>()({ primaryKey: "name" }) }
-    });
+    let legacy = createTypedStorage(mockStorage, PLAIN_SCHEMA);
     legacy.users.delete("dave");
     legacy.users.put(BOB);
 

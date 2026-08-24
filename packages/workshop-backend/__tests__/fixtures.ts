@@ -1,37 +1,22 @@
-// Shared fixtures for the action-log test suites: a typed storage mirroring the production
-// actions schema (pendingByGatekeeper index included), a putAction record factory, and a fake
-// overseer client forged over OverseerDurableObject.prototype.open.
+// Shared fixtures for the action-log test suites: the production overseer storage over a mock,
+// a putAction record factory, and a fake overseer client forged over
+// OverseerDurableObject.prototype.open.
 
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
+import type { Collection, Singleton } from "@gadgets/typed-storage";
 import type { Overseer } from "@gadgets/workshop-shared/api";
-import { OverseerDurableObject } from "../src/overseer.js";
-import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
+import { OverseerDurableObject, makeOverseerStorage } from "../src/overseer.js";
+import type { ActionRecord } from "../src/overseer.js";
 import { makeMockStorage } from "./mock-storage.js";
 
 /**
- * The actions schema must match makeOverseerStorage's: the auto-approval drain and the pending
- * history query read the pendingByGatekeeper index.
+ * The production schema over mock storage, so the action suites (auto-approval drain, pending
+ * history query) exercise the shipped actions collection and pendingByGatekeeper index rather
+ * than a copy.
  */
-export const ACTION_TEST_SCHEMA = {
-  singletons: { nextActionId: 0 },
-  collections: {
-    actions: collection<ActionRecord>()({
-      primaryKey: "id",
-      nonUniqueIndexes: {
-        pendingByGatekeeper(record: ActionRecord) {
-          return record.state === "pending" ? record.gatekeeperId : null;
-        }
-      }
-    }),
-    autoApproveTags: collection<AutoApproveTagRecord>()({
-      primaryKey: (r: AutoApproveTagRecord) => `${r.gatekeeperId}:${r.actionKind.tag}`,
-    }),
-  },
-} as const;
-
 export function makeActionStorage(mockStorage = makeMockStorage()) {
-  return createTypedStorage(mockStorage, ACTION_TEST_SCHEMA);
+  return makeOverseerStorage(mockStorage);
 }
 
 export type ActionTestStorage = ReturnType<typeof makeActionStorage>;
@@ -49,7 +34,8 @@ export function makePreIndexActionStorage(mockStorage: DurableObjectStorage) {
 
 /** Puts a record and keeps nextActionId ahead of it, as the real allocator does. */
 export function putAction(
-    storage: Pick<ActionTestStorage, "actions" | "nextActionId">, id: number,
+    storage: { actions: Collection<ActionRecord, number>, nextActionId: Singleton<number> },
+    id: number,
     opts: { state?: ActionRecord["state"], type?: ActionRecord["type"], gatekeeperId?: number,
             actionTag?: string, autoApprovable?: boolean } = {}) {
   let base = {

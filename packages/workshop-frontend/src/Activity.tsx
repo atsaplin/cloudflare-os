@@ -33,6 +33,11 @@ interface ActivityProps {
   autoApproveReloadTrigger?: number
 }
 
+/** Pending-status copy while the pending set is still being gathered (also in the popover). */
+export const PENDING_CHECKING_COPY = 'Checking for requests…'
+/** Pending-status copy when gathering the pending set failed (also in the popover). */
+export const PENDING_ERROR_COPY = 'Could not check for requests — reload the page to try again.'
+
 const HISTORY_FILTERS: { value: ActionHistoryFilter; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'action', label: 'Actions' },
@@ -104,15 +109,43 @@ function TypeIcon({ record, className }: { record: ActionLogEntry; className?: s
   return <ShieldCheck {...props} />
 }
 
-function LoadOlderButton({ history, className }: {
+function LoadOlderButton({ history, className, label = 'Load older' }: {
   history: { loadMore: () => void; isLoadingMore: boolean }
   className?: string
+  label?: string
 }) {
   return (
     <WorkshopButton className={className} onClick={history.loadMore}
         disabled={history.isLoadingMore}>
-      {history.isLoadingMore ? 'Loading…' : 'Load older'}
+      {history.isLoadingMore ? 'Loading…' : label}
     </WorkshopButton>
+  )
+}
+
+/** Centered full-pane notice: an empty, error, or call-to-action state. */
+function ActivityNotice({ icon, title, description, children }: {
+  icon?: ReactNode
+  title: string
+  description?: string
+  children?: ReactNode
+}) {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+      {icon && (
+        <span className="mb-3 grid h-9 w-9 place-items-center rounded-full bg-kumo-tint text-kumo-subtle">
+          {icon}
+        </span>
+      )}
+      <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
+        {title}
+      </p>
+      {description && (
+        <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
+          {description}
+        </p>
+      )}
+      {children}
+    </div>
   )
 }
 
@@ -237,40 +270,31 @@ export default function Activity({
 
     if (pendingStatus === 'checking') {
       return (
-        <div className="flex h-full items-center justify-center text-[13px] text-kumo-subtle">
-          Checking for requests…
+        <div className="flex flex-1 items-center justify-center text-[13px] text-kumo-subtle">
+          {PENDING_CHECKING_COPY}
         </div>
       )
     }
 
     if (pendingStatus === 'error') {
       return (
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-            Could not check for requests
-          </p>
-          <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-            Reload the page to try again.
-          </p>
-        </div>
+        <ActivityNotice
+          title="Could not check for requests"
+          description="Reload the page to try again."
+        />
       )
     }
 
     return (
-      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-        <span className="grid h-9 w-9 place-items-center rounded-full bg-kumo-tint text-kumo-subtle">
-          <Check size={17} weight="bold" />
-        </span>
-        <p className="mt-3 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-          Nothing to review
-        </p>
-        <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-          Requests that need your approval show up here and in the workspace header.
-        </p>
+      <ActivityNotice
+        icon={<Check size={17} weight="bold" />}
+        title="Nothing to review"
+        description="Requests that need your approval show up here and in the workspace header."
+      >
         <WorkshopButton className="mt-4" onClick={() => onViewChange('history')}>
           View history
         </WorkshopButton>
-      </div>
+      </ActivityNotice>
     )
   }
 
@@ -308,7 +332,7 @@ export default function Activity({
               <span className="text-[12px] leading-4 text-kumo-inactive">
                 Couldn't load older activity
               </span>
-              <WorkshopButton onClick={history.loadMore}>Retry</WorkshopButton>
+              <LoadOlderButton history={history} label="Retry" />
             </div>
           ) : history.hasMore && (
             <div className="flex justify-center py-3">
@@ -321,14 +345,9 @@ export default function Activity({
 
     if (history.status === 'error') {
       return (
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-            Could not load activity
-          </p>
-          <WorkshopButton className="mt-4" onClick={history.loadMore}>
-            Retry
-          </WorkshopButton>
-        </div>
+        <ActivityNotice title="Could not load activity">
+          <LoadOlderButton className="mt-4" history={history} label="Retry" />
+        </ActivityNotice>
       )
     }
 
@@ -342,31 +361,23 @@ export default function Activity({
 
     if (history.hasMore) {
       return (
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-            Nothing in the most recent activity
-          </p>
+        <ActivityNotice title="Nothing in the most recent activity">
           <LoadOlderButton className="mt-4" history={history} />
-        </div>
+        </ActivityNotice>
       )
     }
 
     if (historyFilter === 'all') {
       return (
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-            No activity yet
-          </p>
-          <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-            Every resource an agent reads or changes is recorded here.
-          </p>
-        </div>
+        <ActivityNotice
+          title="No activity yet"
+          description="Every resource an agent reads or changes is recorded here."
+        />
       )
     }
 
     return (
-      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-        <p className="m-0 text-[13px] font-medium text-kumo-default">No matching events</p>
+      <ActivityNotice title="No matching events">
         <button
           type="button"
           onClick={() => setHistoryFilter('all')}
@@ -374,7 +385,7 @@ export default function Activity({
         >
           Show all activity
         </button>
-      </div>
+      </ActivityNotice>
     )
   }
 

@@ -5,7 +5,12 @@ import type { RpcStub } from 'capnweb'
 import type { Overseer } from '@gadgets/workshop-shared/api'
 import { CountBadge } from './components/CountBadge'
 import { ResolveButton } from './components/ResolveButton'
-import { formatRelativeTime, type ActivityView } from './Activity'
+import {
+  formatRelativeTime,
+  PENDING_CHECKING_COPY,
+  PENDING_ERROR_COPY,
+  type ActivityView,
+} from './Activity'
 import { useActions } from './useActions'
 import { useResolveAction } from './useResolveAction'
 
@@ -65,9 +70,8 @@ export default function ActivityNotifications({
 
         {pending.length === 0 ? (
           <p className="m-0 px-3.5 pb-3 pt-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-            {status === 'error'
-              ? 'Could not check for requests — reload the page to try again.'
-              : status === 'checking' ? 'Checking for pending requests…'
+            {status === 'error' ? PENDING_ERROR_COPY
+              : status === 'checking' ? PENDING_CHECKING_COPY
               : 'Nothing is waiting on you.'}
           </p>
         ) : (

@@ -6,12 +6,10 @@ import { useActionEntries } from './useActions'
 
 export type ActionHistoryStatus = 'loading' | 'ready' | 'error'
 
-type View = {
+type HistoryState = {
   byId: ReadonlyMap<number, ActionLogEntry>
-  status: ActionHistoryStatus
-  hasMore: boolean
-  isLoadingMore: boolean
-  loadMoreFailed: boolean
+  // 'initial' = the first page failed (surfaces as status 'error'); 'more' = a loadMore failed.
+  error: 'initial' | 'more' | null
 }
 
 type HistorySession = {
@@ -24,11 +22,7 @@ function createHistorySession(): HistorySession {
   return { frontier: undefined, inFlight: false, hasLoadedPage: false }
 }
 
-// 'loading' from the start: nothing is fetched until `active`, but the panel isn't visible (and
-// the status unread) until then either, and the first fetch follows immediately.
-const INITIAL: View = {
-  byId: new Map(), status: 'loading', hasMore: false, isLoadingMore: false, loadMoreFailed: false,
-}
+const INITIAL: HistoryState = { byId: new Map(), error: null }
 
 /**
  * Demand-loads resolved action history, one page at a time, newest first by id (creation order).
@@ -46,14 +40,16 @@ export function useActionHistory(
   filter: ActionHistoryFilter,
   active: boolean,
 ) {
-  const [view, setView] = useState<View>(INITIAL)
-  // `frontier` is undefined before the first page and after the terminal page;
-  // `hasLoadedPage` distinguishes those states.
+  const [state, setState] = useState<HistoryState>(INITIAL)
+  // The request-identity token, mutated in place. `frontier` is undefined before the first page
+  // and after the terminal page; `hasLoadedPage` distinguishes those states. The returned
+  // status/hasMore/isLoadingMore are derived from it at the return site, which is safe because
+  // every mutation of it is paired with a setState (so a render always follows).
   const sessionRef = useRef(createHistorySession())
 
   useEffect(() => {
     sessionRef.current = createHistorySession()
-    setView(INITIAL)
+    setState(INITIAL)
   }, [overseer, filter])
 
   const loadMore = useCallback(() => {
@@ -62,36 +58,23 @@ export function useActionHistory(
         (session.hasLoadedPage && session.frontier === undefined)) return
     const first = !session.hasLoadedPage
     session.inFlight = true
-    setView(prev => first
-      ? { ...prev, status: 'loading' }
-      : { ...prev, isLoadingMore: true, loadMoreFailed: false })
+    setState(prev => ({ ...prev, error: null }))
 
     overseer.listActions({ beforeId: session.frontier, filter }).then(page => {
       if (sessionRef.current !== session) return
       session.inFlight = false
       session.hasLoadedPage = true
       session.frontier = page.nextBeforeId
-      setView(prev => {
+      setState(prev => {
         const byId = new Map(prev.byId)
         for (const record of page.entries) byId.set(record.id, record)
-        return {
-          byId,
-          status: 'ready',
-          hasMore: page.nextBeforeId !== undefined,
-          isLoadingMore: false,
-          loadMoreFailed: false,
-        }
+        return { byId, error: null }
       })
     }, (err: unknown) => {
       if (sessionRef.current !== session) return
       session.inFlight = false
       console.error('Failed to load action history:', err)
-      setView(prev => ({
-        ...prev,
-        status: first ? 'error' : prev.status,
-        isLoadingMore: false,
-        loadMoreFailed: !first,
-      }))
+      setState(prev => ({ ...prev, error: first ? 'initial' : 'more' }))
     })
   }, [overseer, filter])
 
@@ -104,7 +87,7 @@ export function useActionHistory(
     if (!session.hasLoadedPage) return
     if (!matchesActionHistoryFilter(record, filter)) return
     if (session.frontier !== undefined && record.id < session.frontier) return
-    setView(prev => {
+    setState(prev => {
       const byId = new Map(prev.byId)
       byId.set(record.id, record)
       return { ...prev, byId }
@@ -112,15 +95,19 @@ export function useActionHistory(
   })
 
   const entries = useMemo(
-    () => Array.from(view.byId.values()).sort((a, b) => b.id - a.id),
-    [view.byId])
+    () => Array.from(state.byId.values()).sort((a, b) => b.id - a.id),
+    [state.byId])
 
+  const session = sessionRef.current
   return {
     entries,
-    status: view.status,
-    hasMore: view.hasMore,
-    isLoadingMore: view.isLoadingMore,
-    loadMoreFailed: view.loadMoreFailed,
+    // 'loading' from the start: nothing is fetched until `active`, but the panel isn't visible
+    // (and the status unread) until then either, and the first fetch follows immediately.
+    status: (state.error === 'initial' ? 'error'
+        : session.hasLoadedPage ? 'ready' : 'loading') satisfies ActionHistoryStatus,
+    hasMore: session.frontier !== undefined,
+    isLoadingMore: session.inFlight && session.hasLoadedPage,
+    loadMoreFailed: state.error === 'more',
     loadMore,
   }
 }

@@ -3,7 +3,7 @@
 // concurrent drains (the DO's input gate is open across the apply await) can't double-apply the
 // same action. The apply is injected, keeping this constructible over a mock storage in tests.
 
-import type { Collection, NonUniqueIndex, Singleton } from "@gadgets/typed-storage";
+import type { Collection, NonUniqueIndex } from "@gadgets/typed-storage";
 import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import { createWorkshopLogger } from "./observability";
 import type { ActionRecord, AutoApproveTagRecord } from "./overseer.js";
@@ -14,7 +14,6 @@ export interface AutoApprovalStorage {
   actions: Collection<ActionRecord, number>
       & { pendingByGatekeeper: NonUniqueIndex<ActionRecord, number> };
   autoApproveTags: Collection<AutoApproveTagRecord>;
-  nextActionId: Singleton<number>;
 }
 
 /**
@@ -60,14 +59,10 @@ export class AutoApprovalDrainer {
   // Eligibility requires BOTH signals: the author's `autoApprovable` verdict on the action AND a
   // user-enabled rule for the action's type on this gatekeeper.
   async #drainOnce(gatekeeperId: number): Promise<void> {
-    // Actions created past this bound trigger their own drain(), which drain()'s rerun flag folds
-    // into this run if it's still in flight.
-    let throughId = this.storage.nextActionId.get();
-
     // Materialize before applying: the index yields lazily in ascending id order, and applying
-    // mutates it mid-iteration.
-    let pending = [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)]
-        .filter(record => record.id < throughId);
+    // mutates it mid-iteration. Actions created after this snapshot trigger their own drain(),
+    // which drain()'s rerun flag folds into this run if it's still in flight.
+    let pending = [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)];
 
     for (let record of pending) {
       if (record.type !== "action") continue;

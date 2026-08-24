@@ -5748,16 +5748,16 @@ function ChatInterface({
     for (const locations of cacheRef.current.actionMessages.values()) {
       const location = locations.values().next().value;
       if (!location) continue;
-      const msg = cacheRef.current.messages.get(location.chatId)?.[location.sequence];
-      if (msg?.type !== "action") continue;
+      const msg = getCachedActionMessage(location)?.msg;
+      if (!msg) continue;
       if (msg.actionLog && msg.actionLog.state !== "pending") continue;
 
       overseer.getChatMessage(location.chatId, location.sequence).then((fetched) => {
         if (cancelled || fetched?.type !== "action" || !fetched.actionLog) return;
         // Resolution is monotonic: never regress a card another channel already resolved.
-        const current = cacheRef.current.messages.get(location.chatId)?.[location.sequence];
-        if (fetched.actionLog.state === "pending" && current?.type === "action" &&
-            current.actionLog && current.actionLog.state !== "pending") return;
+        const current = getCachedActionMessage(location)?.msg;
+        if (fetched.actionLog.state === "pending" &&
+            current?.actionLog && current.actionLog.state !== "pending") return;
         if (applyActionLogUpdateToCachedMessages(fetched.actionLog)) scheduleUpdate();
       }, (err) => console.error("Failed to refresh action card:", err));
     }
@@ -6142,21 +6142,29 @@ function ChatInterface({
     }
   };
 
+  // Resolves an actionMessages location to the cached action message it points at (with its
+  // containing message array, for copy-on-write patches). Undefined if the cache no longer holds
+  // an action message there.
+  const getCachedActionMessage = (location: { chatId: number; sequence: number }) => {
+    const messages = cacheRef.current.messages.get(location.chatId);
+    const msg = messages?.[location.sequence];
+    return msg?.type === "action" ? { messages: messages!, msg } : undefined;
+  };
+
   const applyActionLogUpdateToCachedMessages = (record: ActionLogEntry): boolean => {
     let changed = false;
     const locations = cacheRef.current.actionMessages.get(record.id);
     if (!locations) return false;
 
     for (const [key, location] of locations) {
-      const messages = cacheRef.current.messages.get(location.chatId);
-      const msg = messages?.[location.sequence];
-      if (msg?.type !== "action" || msg.actionId !== record.id) {
+      const cached = getCachedActionMessage(location);
+      if (!cached || cached.msg.actionId !== record.id) {
         locations.delete(key);
         continue;
       }
 
-      const nextMessages = [...messages!];
-      nextMessages[location.sequence] = { ...msg, actionLog: record };
+      const nextMessages = [...cached.messages];
+      nextMessages[location.sequence] = { ...cached.msg, actionLog: record };
       cacheRef.current.messages.set(location.chatId, nextMessages);
       changed = true;
     }
@@ -6171,17 +6179,16 @@ function ChatInterface({
     if (!locations) return false;
 
     for (const [key, location] of locations) {
-      const messages = cacheRef.current.messages.get(location.chatId);
-      const msg = messages?.[location.sequence];
-      if (msg?.type !== "action" || msg.actionId !== actionId || !msg.actionLog) {
+      const cached = getCachedActionMessage(location);
+      if (!cached || cached.msg.actionId !== actionId || !cached.msg.actionLog) {
         locations.delete(key);
         continue;
       }
 
-      const nextMessages = [...messages!];
+      const nextMessages = [...cached.messages];
       nextMessages[location.sequence] = {
-        ...msg,
-        actionLog: { ...msg.actionLog, state, appliedAt: new Date() },
+        ...cached.msg,
+        actionLog: { ...cached.msg.actionLog, state, appliedAt: new Date() },
       };
       cacheRef.current.messages.set(location.chatId, nextMessages);
       changed = true;
@@ -6197,17 +6204,16 @@ function ChatInterface({
     if (!locations) return false;
 
     for (const [key, location] of locations) {
-      const messages = cacheRef.current.messages.get(location.chatId);
-      const msg = messages?.[location.sequence];
-      if (msg?.type !== "action" || msg.actionId !== actionId || msg.actionLog?.type !== "bindHook") {
+      const cached = getCachedActionMessage(location);
+      if (!cached || cached.msg.actionId !== actionId || cached.msg.actionLog?.type !== "bindHook") {
         locations.delete(key);
         continue;
       }
 
-      const nextMessages = [...messages!];
+      const nextMessages = [...cached.messages];
       nextMessages[location.sequence] = {
-        ...msg,
-        actionLog: { ...msg.actionLog, enabled },
+        ...cached.msg,
+        actionLog: { ...cached.msg.actionLog, enabled },
       };
       cacheRef.current.messages.set(location.chatId, nextMessages);
       changed = true;

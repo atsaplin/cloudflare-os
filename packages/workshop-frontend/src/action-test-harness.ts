@@ -44,6 +44,28 @@ type ListOptions = Parameters<Overseer['listActions']>[0]
 type Parked<T> = { resolve: (value: T) => void, reject: (err: unknown) => void }
 
 /**
+ * A queue of parked listActions calls: park() records the call and returns a promise that stays
+ * unsettled until resolveNext()/rejectNext() settles the oldest one inside act().
+ */
+function parkedQueue() {
+  const calls: ListOptions[] = []
+  const parked: Array<Parked<ActionHistoryPage>> = []
+  return {
+    calls,
+    park(call: ListOptions) {
+      calls.push(call)
+      return new Promise<ActionHistoryPage>((resolve, reject) => parked.push({ resolve, reject }))
+    },
+    async resolveNext(page: ActionHistoryPage) {
+      await act(async () => { parked.shift()!.resolve(page) })
+    },
+    async rejectNext(err: unknown) {
+      await act(async () => { parked.shift()!.reject(err) })
+    },
+  }
+}
+
+/**
  * Mocks the server side of the action APIs. subscribeToActions: live records are pushed through
  * the captured subscriber's entry() via emit(); the call itself parks until
  * resolveSubscription()/rejectSubscription(). listActions: each call parks — the shared store's
@@ -55,10 +77,8 @@ export function makeOverseer() {
   const ops: Array<'subscribe' | 'list' | 'listPending'> = []
   const subscribeCalls: unknown[][] = []
   const pendingSubscribes: Array<Parked<RpcStub<{}>>> = []
-  const listCalls: ListOptions[] = []
-  const pendingPages: Array<Parked<ActionHistoryPage>> = []
-  const pendingQueryCalls: ListOptions[] = []
-  const pendingQueryPages: Array<Parked<ActionHistoryPage>> = []
+  const historyQueue = parkedQueue()
+  const pendingQueue = parkedQueue()
   const subscriptionDispose = vi.fn<() => void>()
   let subscriber: ActionsSubscriber | undefined
   const overseer = {
@@ -72,14 +92,10 @@ export function makeOverseer() {
     listActions: (options?: ListOptions) => {
       if (options?.filter === 'pending') {
         ops.push('listPending')
-        pendingQueryCalls.push(options)
-        return new Promise<ActionHistoryPage>((resolve, reject) =>
-          pendingQueryPages.push({ resolve, reject }))
+        return pendingQueue.park(options)
       }
       ops.push('list')
-      listCalls.push(options)
-      return new Promise<ActionHistoryPage>((resolve, reject) =>
-        pendingPages.push({ resolve, reject }))
+      return historyQueue.park(options)
     },
     [Symbol.dispose]: () => {},
   } as unknown as RpcStub<Overseer>
@@ -87,8 +103,8 @@ export function makeOverseer() {
     overseer,
     ops,
     subscribeCalls,
-    listCalls,
-    pendingQueryCalls,
+    listCalls: historyQueue.calls,
+    pendingQueryCalls: pendingQueue.calls,
     subscriptionDispose,
     async resolveSubscription() {
       await act(async () => {
@@ -99,18 +115,10 @@ export function makeOverseer() {
     async rejectSubscription(err: unknown) {
       await act(async () => { pendingSubscribes.shift()!.reject(err) })
     },
-    async resolvePage(page: ActionHistoryPage) {
-      await act(async () => { pendingPages.shift()!.resolve(page) })
-    },
-    async rejectPage(err: unknown) {
-      await act(async () => { pendingPages.shift()!.reject(err) })
-    },
-    async resolvePendingQuery(page: ActionHistoryPage) {
-      await act(async () => { pendingQueryPages.shift()!.resolve(page) })
-    },
-    async rejectPendingQuery(err: unknown) {
-      await act(async () => { pendingQueryPages.shift()!.reject(err) })
-    },
+    resolvePage: historyQueue.resolveNext,
+    rejectPage: historyQueue.rejectNext,
+    resolvePendingQuery: pendingQueue.resolveNext,
+    rejectPendingQuery: pendingQueue.rejectNext,
     async emit(record: ActionLogEntry) {
       await act(async () => { subscriber!.entry(record) })
     },

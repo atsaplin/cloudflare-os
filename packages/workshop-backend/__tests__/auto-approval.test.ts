@@ -259,17 +259,17 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 3).state).toBe("pending");
   });
 
-  // An action created after a drain captured its bound is out of that drain's scope; the creation
-  // path is responsible for its own drain() call (which the rerun flag folds in -- see the
-  // parked-mid-apply test above).
-  it("leaves actions created past the drain's bound for their own drain call", async () => {
+  // An action created after a drain snapshotted the pending index is out of that drain's scope;
+  // the creation path is responsible for its own drain() call (which the rerun flag folds in --
+  // see the parked-mid-apply test above).
+  it("leaves actions created after the drain's snapshot for their own drain call", async () => {
     let storage = makeStorage();
     enableRule(storage);
     putAction(storage, 1);
 
     let apply = makeControlledApply(storage);
     let drainer = new AutoApprovalDrainer(storage, apply.applyFn);
-    let first = drainer.drain(GK);   // captures throughId = 2
+    let first = drainer.drain(GK);   // snapshots pending = [1]
 
     putAction(storage, 2);           // arrives mid-drain, with no accompanying drain() call
     apply.releaseNext();

@@ -28,10 +28,6 @@ type Store = {
   // Records delivered on the live subscription (only — paged records are not entries), retained
   // for useActionEntries' mount-time replay.
   stagedEntries: Map<number, ActionLogEntry>
-  // Every id the live subscription has delivered, in any state. A page's copy of one of these
-  // ids is stale by definition: the fold skips it, so a record resolved live is never re-marked
-  // pending by a page that predates the resolution.
-  liveSeenIds: Set<number>
   refCount: number
   listeners: Set<() => void>
   entryListeners: Set<(record: ActionLogEntry) => void>
@@ -54,7 +50,6 @@ function getStore(overseer: RpcStub<Overseer>): Store {
       snapshot: EMPTY_STATE,
       stagedPending: new Map(),
       stagedEntries: new Map(),
-      liveSeenIds: new Set(),
       refCount: 0,
       listeners: new Set(),
       entryListeners: new Set(),
@@ -70,7 +65,7 @@ function getStore(overseer: RpcStub<Overseer>): Store {
 function commit(store: Store, status: ActionsState['status'] = store.snapshot.status): void {
   // Entries arrive in ascending id order, so this sort is near-free at pending-count scale.
   const pending = [...store.stagedPending.values()].toSorted((a, b) =>
-    new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime() || a.id - b.id)
+    a.createdAt.getTime() - b.createdAt.getTime() || a.id - b.id)
   store.snapshot = { status, pending }
   for (const listener of store.listeners) listener()
 }
@@ -87,21 +82,32 @@ function scheduleNotify(store: Store) {
   })
 }
 
-function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
-  const generation = ++store.generation
+// Bumps the generation (orphaning any in-flight callbacks) and clears the staged session state.
+function resetSession(store: Store): number {
+  store.generation++
   store.stagedPending = new Map()
   store.stagedEntries = new Map()
-  store.liveSeenIds = new Set()
   store.snapshot = EMPTY_STATE
+  return store.generation
+}
+
+function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
+  const generation = resetSession(store)
 
   class ActionsSubscriberImpl extends RpcTarget implements ActionsSubscriber {
     entry(record: ActionLogEntry): void {
       if (store.generation !== generation) return
-      store.liveSeenIds.add(record.id)
       store.stagedEntries.set(record.id, record)
-      if (record.state === 'pending') store.stagedPending.set(record.id, record)
-      else store.stagedPending.delete(record.id)
-      scheduleNotify(store)
+      let pendingChanged: boolean
+      if (record.state === 'pending') {
+        store.stagedPending.set(record.id, record)
+        pendingChanged = true
+      } else {
+        pendingChanged = store.stagedPending.delete(record.id)
+      }
+      // Entries that never touch the pending set (observations, hook events) don't need a
+      // re-sorted snapshot or a consumer re-render.
+      if (pendingChanged) scheduleNotify(store)
       for (const listener of store.entryListeners) {
         try {
           listener(record)
@@ -138,14 +144,16 @@ function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
 
   // One page in flight at a time. Records created mid-paging are live-only (their ids are above
   // page 1's snapshot bound), so the fold only has to resolve one conflict class: a page's stale
-  // copy of a record the subscription already delivered, which liveSeenIds skips.
+  // copy of a record the subscription already delivered — the subscription's copy (in any state)
+  // is newer by definition, so a record resolved live is never re-marked pending by a page that
+  // predates the resolution.
   ;(async () => {
     let beforeId: number | undefined
     do {
       const page = await overseer.listActions({ filter: 'pending', beforeId })
       if (store.generation !== generation) return
       for (const record of page.entries) {
-        if (!store.liveSeenIds.has(record.id)) store.stagedPending.set(record.id, record)
+        if (!store.stagedEntries.has(record.id)) store.stagedPending.set(record.id, record)
       }
       beforeId = page.nextBeforeId
       scheduleNotify(store)
@@ -156,13 +164,9 @@ function openSubscription(overseer: RpcStub<Overseer>, store: Store) {
 }
 
 function closeSubscription(store: Store) {
-  store.generation++
+  resetSession(store)
   store.subscription?.[Symbol.dispose]()
   store.subscription = null
-  store.stagedPending = new Map()
-  store.stagedEntries = new Map()
-  store.liveSeenIds = new Set()
-  store.snapshot = EMPTY_STATE
 }
 
 function acquire(overseer: RpcStub<Overseer>): Store {
