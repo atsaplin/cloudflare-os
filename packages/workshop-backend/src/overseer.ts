@@ -183,6 +183,15 @@ interface RestoreForgerEntrypoint extends WorkerEntrypoint {
   forge(params: unknown): Promise<unknown>;
 }
 
+export async function loadCodeModeWorker<T>(
+    restoreGadgetId: WorkpieceId | undefined,
+    loadDirect: () => T,
+    loadRestored: (gadgetId: WorkpieceId) => Promise<T>,
+): Promise<T> {
+  if (restoreGadgetId === undefined) return loadDirect();
+  return loadRestored(restoreGadgetId);
+}
+
 // The capability handed to CODE_MODE_HARNESS's run() that lets executed code invoke
 // `env.<name>[restore](params)`. Only executeCode receives this capability -- gadget workers
 // never do -- and it's passed as a transient stub argument to run(), so it lives exactly as
@@ -7196,7 +7205,26 @@ class OverseerImpl implements AgentHooks {
         globalOutbound: null,
       };
 
-      let entrypoint = this.env.LOADER.load(workerDef).getEntrypoint<CodeModeEntrypoint>();
+      let entrypoint = await loadCodeModeWorker(
+          this.executeCodeRestoreTarget(),
+          () => this.env.LOADER.load(workerDef).getEntrypoint<CodeModeEntrypoint>(),
+          async (restoreGadgetId) => {
+            // Load the code-mode worker through ctx.restore() to avoid adding another production
+            // Worker hop to an already deep binding call. The code ID exists only long enough for
+            // restore() to resolve this dynamic worker. Persistent stubs are still forged by the
+            // per-binding restore forger passed to run() below.
+            let codeId = crypto.randomUUID();
+            try {
+              this.#codeIdMap.set(codeId, workerDef);
+              return await this.ctx.restore({
+                type: "gadget",
+                gadgetId: restoreGadgetId,
+                codeId,
+              });
+            } finally {
+              this.#codeIdMap.delete(codeId);
+            }
+          });
 
       // First check the code actually starts up. Treat startup errors as total failures.
       await entrypoint.verify();
