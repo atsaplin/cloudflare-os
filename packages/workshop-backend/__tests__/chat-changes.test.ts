@@ -9,7 +9,7 @@ import { diffFiles, type CodeContent, type CodeChange }
 import { keyString } from "@gadgets/typed-storage";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { GitStore } from "../src/git-store";
-import type { WorkspaceActor } from "../src/workspace-repository";
+import type { WorkspaceActor } from "../src/workspace-files";
 import type {
   WorkspaceArtifactAcceptResult,
   WorkspaceArtifactCanonical,

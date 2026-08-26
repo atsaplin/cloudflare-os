@@ -16,7 +16,6 @@ import {
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
-import { WorkspaceRepository } from "../src/workspace-repository";
 
 type CodedError = Error & { code?: unknown };
 
@@ -192,7 +191,7 @@ describe("user-DO reset flags", () => {
 });
 
 describe("workspace filesystem initialization", () => {
-  it("initializes an existing workspace when it is opened after deployment", async () => {
+  it("retains the Artifacts workspace repository across a worker restart", async () => {
     using publicApi = await connect();
     const account = await createAccount(publicApi, "workspacefiles");
     using authenticated = await publicApi.authenticate(account.token);
@@ -200,15 +199,6 @@ describe("workspace filesystem initialization", () => {
       using created = await authenticated.newGadget();
       return created.getMetadata();
     })();
-    const workspaceId = exports.OverseerDurableObject.idFromString(metadata.id);
-
-    await runInDurableObject(
-      exports.OverseerDurableObject.get(workspaceId),
-      (_instance, state) => {
-        state.storage.sql.exec("DELETE FROM cf_workspace_workspace_files");
-        state.storage.sql.exec("DELETE FROM workspace_file_operations");
-      },
-    );
     await abortAllDurableObjects();
 
     using reconnectedPublicApi = await connect();
@@ -216,14 +206,7 @@ describe("workspace filesystem initialization", () => {
     using reopened = reauthenticated.openGadget(metadata.id);
     expect((await reopened.getMetadata()).id).toBe(metadata.id);
 
-    const history = await runInDurableObject(
-      exports.OverseerDurableObject.get(workspaceId),
-      (_instance, state) => new WorkspaceRepository({
-        state,
-        bucket: env.WORKSPACE_FILES,
-        workspaceId: metadata.id,
-      }).getHistory(10),
-    );
+    const history = await reopened.getWorkspaceHistory(10);
     expect(history).toEqual([
       expect.objectContaining({ message: "Initialize workspace\n" }),
     ]);
@@ -447,11 +430,12 @@ describe("workspace session across a user-DO-only reset", () => {
 
     // Every operation below crosses into the user DO through the SAME retained workspace
     // capability. Each minting a fresh stub is what restarts the object and recovers.
-    expect(await workspace.newChat("after the reset", null)).toEqual(expect.any(Number));
+    const chatId = await workspace.newChat("after the reset", null);
+    expect(chatId).toEqual(expect.any(Number));
     expect(await workspace.listModels()).toBeInstanceOf(Array);
     // createGadget resolves the binding name via getChatContext, and hands back a nested
     // GadgetClient capability that must also be born with the fresh-stub design.
-    using gadget = await workspace.createGadget("post-reset gadget");
+    using gadget = await workspace.createGadget("post-reset gadget", chatId);
     expect(await gadget.getTitle()).toBe("post-reset gadget");
   });
 });

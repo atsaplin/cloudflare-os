@@ -12,7 +12,7 @@ import {
   serializeWorkspaceIndex,
 } from "./workspace-manifest";
 import type { CommitInfo } from "@gadgets/workshop-shared/api";
-import type { WorkspaceActor } from "./workspace-repository";
+import type { WorkspaceActor } from "./workspace-files";
 
 const gitOidPattern = /^[0-9a-f]{40}$/;
 const maximumEpoch = 1_000_000_000;
@@ -1506,11 +1506,17 @@ export interface WorkspaceCodeRepository {
   discardChatFork(chatId: string, epoch: number): Promise<void>;
 }
 
-export function createArtifactsWorkspaceRepository(
+export interface WorkspaceArtifactServices {
+  lifecycle: WorkspaceArtifactLifecycle;
+  reader: WorkspaceArtifactReader;
+  codeRepository: ArtifactsWorkspaceRepository;
+}
+
+export function createWorkspaceArtifactServices(
   state: DurableObjectState,
   env: Cloudflare.Env,
   workspaceId: string,
-): ArtifactsWorkspaceRepository {
+): WorkspaceArtifactServices {
   const reader = new CloudflareWorkspaceArtifactReader({
     artifacts: env.ARTIFACTS,
     accountId: env.ARTIFACTS_ACCOUNT_ID,
@@ -1526,7 +1532,11 @@ export function createArtifactsWorkspaceRepository(
       sandboxId => getSandbox<Sandbox>(env.Sandbox, sandboxId),
     ),
   });
-  return new ArtifactsWorkspaceRepository({ lifecycle, reader });
+  return {
+    lifecycle,
+    reader,
+    codeRepository: new ArtifactsWorkspaceRepository({ lifecycle, reader }),
+  };
 }
 
 /** Maps workspace-level Artifacts revisions to the gadget source subtrees they contain. */

@@ -15,8 +15,8 @@ const maximumPendingUploads = 1_000;
 const operationTrailerLabel = "Workspace-Operation:";
 const digestTrailerLabel = "Workspace-Request-Digest:";
 
-export function isWorkspaceUuid(value: string): boolean {
-  return operationIdPattern.test(value);
+export function isWorkspaceUuid(value: unknown): value is string {
+  return typeof value === "string" && operationIdPattern.test(value);
 }
 
 /** An expected caller-visible workspace rejection with a stable public category. */
@@ -342,8 +342,6 @@ export async function digestRequest(request: WorkspaceMutationRequest): Promise<
     operationId: request.operationId,
     expectedHead: request.expectedHead,
     actorId: request.actor.id,
-    actorName: request.actor.name,
-    timestamp: request.timestamp,
     message: request.message,
     changes,
   });
@@ -394,8 +392,6 @@ export async function digestStagedRequest(
     operationId: request.operationId,
     expectedHead: request.expectedHead,
     actorId: request.actor.id,
-    actorName: request.actor.name,
-    timestamp: request.timestamp,
     message: request.message,
     changes,
   })));

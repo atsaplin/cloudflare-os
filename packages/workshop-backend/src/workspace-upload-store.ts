@@ -326,6 +326,27 @@ export class WorkspaceUploadStore {
     });
   }
 
+  deleteAllUploads(): Promise<void> {
+    return this.#withLock(async () => {
+      const prefix = `workspaces/${this.#workspaceId}/`;
+      let cursor: string | undefined;
+      do {
+        const page = await this.#bucket.list({
+          prefix,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        for (let offset = 0; offset < page.objects.length; offset += maximumPendingUploads) {
+          await this.#bucket.delete(
+            page.objects.slice(offset, offset + maximumPendingUploads).map(object => object.key),
+          );
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor !== undefined);
+      this.#ensureTable();
+      this.#state.storage.sql.exec("DELETE FROM workspace_file_uploads");
+    });
+  }
+
   consumeUpload(
     uploadId: string,
     ownerId: string,

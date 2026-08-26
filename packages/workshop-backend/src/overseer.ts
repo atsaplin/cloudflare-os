@@ -62,15 +62,18 @@ import {
   readCustomExportFormats,
 } from "./gadget-export";
 import {
-  WorkspaceRepository,
   WorkspaceRepositoryConflictError,
   WorkspaceRepositoryExpectedError,
   type WorkspaceActor,
-} from "./workspace-repository";
+} from "./workspace-files";
 import {
-  createArtifactsWorkspaceRepository,
+  createWorkspaceArtifactServices,
   type WorkspaceCodeRepository,
 } from "./workspace-artifacts";
+import {
+  createArtifactsWorkspaceFiles,
+  type WorkspaceFileRepository,
+} from "./artifacts-workspace-files";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -1432,9 +1435,7 @@ class OverseerImpl implements AgentHooks {
 
   workspaceCodeRepository: WorkspaceCodeRepository;
 
-  // Durable, versioned files owned by this workspace. The repository facade is the only code that
-  // can touch the underlying Shell worktree, Git index, or large-file R2 binding.
-  readonly workspaceRepository: WorkspaceRepository;
+  readonly workspaceRepository: WorkspaceFileRepository;
 
   // Per-chat in-memory state for running agents and pending agent callbacks.
   #liveChats = new Map<number, LiveChatContext>();
@@ -1722,15 +1723,18 @@ class OverseerImpl implements AgentHooks {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
-    this.workspaceCodeRepository = createArtifactsWorkspaceRepository(
+    const workspaceArtifacts = createWorkspaceArtifactServices(
       ctx,
       env,
       ctx.id.toString(),
     );
-    this.workspaceRepository = new WorkspaceRepository({
+    this.workspaceCodeRepository = workspaceArtifacts.codeRepository;
+    this.workspaceRepository = createArtifactsWorkspaceFiles({
       state: ctx,
       bucket: env.WORKSPACE_FILES,
       workspaceId: ctx.id.toString(),
+      lifecycle: workspaceArtifacts.lifecycle,
+      reader: workspaceArtifacts.reader,
     });
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
@@ -8492,7 +8496,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     await this.impl.workspaceRepository.initialize({ id: profileId, name: profileId });
-    await this.impl.workspaceCodeRepository.ensureCanonical({ id: profileId, name: profileId });
 
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
@@ -8565,10 +8568,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     await this.impl.workspaceRepository.initialize({
       id: callerProfile.id,
       name: callerProfile.id,
-    });
-    await this.impl.workspaceCodeRepository.ensureCanonical({
-      id: callerProfile.id,
-      name: callerProfile.name,
     });
 
     // Complete pending registration in the owner's UserDO.
@@ -9267,16 +9266,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async getWorkspaceHistory(depth = 50): Promise<CommitInfo[]> {
-    return (await this.impl.workspaceRepository.getHistory(depth)).map(commit => ({
-      oid: commit.oid,
-      parents: commit.parent,
-      message: commit.message,
-      author: {
-        name: commit.author.name,
-        email: commit.author.email,
-      },
-      timestamp: new Date(commit.author.timestamp * 1_000),
-    }));
+    return this.impl.workspaceRepository.getHistory(depth);
   }
 
   async stageWorkspaceFileUpload(

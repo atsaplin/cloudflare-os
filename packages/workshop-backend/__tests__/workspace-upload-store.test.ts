@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
-import type { WorkspaceUpload } from "../src/workspace-repository";
+import type { WorkspaceUpload } from "../src/workspace-files";
 import { WorkspaceUploadStore } from "../src/workspace-upload-store";
 
 declare module "cloudflare:test" {
@@ -163,6 +163,28 @@ describe("WorkspaceUploadStore", () => {
     expect(result.before.objects).toHaveLength(1);
     expect(result.after.objects).toHaveLength(0);
     expect(result.cleaned).toBe(1);
+    expect(result.nextExpiry).toBeUndefined();
+  });
+
+  it("deletes every staged upload owned by the workspace", async () => {
+    const result = await withStore("delete-all", async (store, workspaceId) => {
+      await store.stageUpload("user:aleksey", {
+        content: stream(bytes("one")),
+        size: 3,
+      });
+      await store.stageUpload("user:aleksey", {
+        content: stream(bytes("two")),
+        size: 3,
+      });
+      const prefix = `workspaces/${workspaceId}/`;
+      const before = await env.WORKSPACE_FILES.list({ prefix });
+      await store.deleteAllUploads();
+      const after = await env.WORKSPACE_FILES.list({ prefix });
+      return { before, after, nextExpiry: store.getNextUploadExpiry() };
+    });
+
+    expect(result.before.objects).toHaveLength(2);
+    expect(result.after.objects).toHaveLength(0);
     expect(result.nextExpiry).toBeUndefined();
   });
 

@@ -17,10 +17,17 @@ export default defineConfig({
   plugins: [
     capnwebValidate(),
     cloudflareTest({
-      main: "./src/server.ts",
+      main: "./__integration__/server.ts",
       remoteBindings: false,
       wrangler: {
         configPath: "./wrangler.jsonc",
+      },
+      miniflare: {
+        bindings: {
+          ARTIFACTS_ACCOUNT_ID: "test-account",
+          ARTIFACTS_NAMESPACE: "test-namespace",
+          ARTIFACTS_API_TOKEN: "test-token",
+        },
       },
     }),
   ],
