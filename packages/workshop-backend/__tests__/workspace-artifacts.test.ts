@@ -187,6 +187,7 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
   readonly mutations: WorkspaceArtifactMutation[] = [];
   readonly mutationExpectedHeads: string[] = [];
   promotionError: Error | undefined;
+  destroyError: Error | undefined;
   beforePromotion: (() => void) | undefined;
 
   constructor(readonly reader: FakeReader) {}
@@ -230,6 +231,7 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
 
   async destroy(sandboxId: string): Promise<void> {
     this.destroyed.push(sandboxId);
+    if (this.destroyError) throw this.destroyError;
   }
 
   prepareChat(request: { sandboxId: string }): Promise<void> {
@@ -649,16 +651,70 @@ describe("ArtifactsWorkspaceRepository", () => {
     await withLifecycle("repository-commit", async (lifecycle, fixtures) => {
       const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
 
-      await expect(repository.commitGadgetFiles("blueprint-7", {
+      const acceptedHead = await repository.commitGadgetFiles("blueprint-7", {
         id: "user:aleksey",
         name: "Aleksey",
       }, "Instantiate blueprint", 7, new Map([
         ["client.js", "client\n"],
-      ]))).resolves.toBe(CHECKPOINT_HEAD);
+      ]));
 
+      expect(acceptedHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.promotions).toHaveLength(1);
+      expect(fixtures.runtime.destroyed).toHaveLength(0);
+      expect(fixtures.artifacts.deleted).toHaveLength(0);
+
+      await repository.completeGadgetFiles("blueprint-7", acceptedHead);
+
       expect(fixtures.runtime.destroyed).toHaveLength(1);
       expect(fixtures.artifacts.deleted).toHaveLength(1);
+    });
+  });
+
+  it("recovers a trusted gadget commit whose fork creation was interrupted", async () => {
+    await withLifecycle("repository-commit-creating", async (lifecycle, fixtures, state) => {
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork(
+        "trusted-gadget-operation:blueprint-0",
+        0,
+      );
+      state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks SET state = 'creating'
+        WHERE chat_id = ? AND epoch = ?
+      `, fork.chatId, fork.epoch);
+
+      await expect(repository.commitGadgetFiles("blueprint-0", {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Instantiate blueprint", 0, new Map([
+        ["client.js", "client\n"],
+      ]))).resolves.toBe(CHECKPOINT_HEAD);
+
+      expect(fixtures.runtime.stagedMutations).toEqual([fork.sandboxId]);
+      expect(fixtures.runtime.promotions).toHaveLength(1);
+    });
+  });
+
+  it("restarts a trusted gadget commit after interrupted fork cleanup", async () => {
+    await withLifecycle("repository-commit-discarding", async (lifecycle, fixtures) => {
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      await lifecycle.ensureChatFork("trusted-gadget-operation:blueprint-0", 0);
+      fixtures.runtime.destroyError = new Error("Sandbox cleanup failed");
+
+      await expect(lifecycle.discardChatFork(
+        "trusted-gadget-operation:blueprint-0",
+        0,
+      )).rejects.toThrow("Sandbox cleanup failed");
+      fixtures.runtime.destroyError = undefined;
+
+      await expect(repository.commitGadgetFiles("blueprint-0", {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Instantiate blueprint", 0, new Map([
+        ["client.js", "client\n"],
+      ]))).resolves.toBe(CHECKPOINT_HEAD);
+      expect(fixtures.runtime.promotions).toHaveLength(1);
     });
   });
 

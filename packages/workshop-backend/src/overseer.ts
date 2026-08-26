@@ -77,6 +77,7 @@ import {
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
+const CURRENT_WORKSPACE_STORAGE_VERSION = 3;
 
 function throwWorkspaceFileError(error: unknown): never {
   if (error instanceof WorkspaceRepositoryConflictError) {
@@ -568,6 +569,11 @@ type ChatAttachmentContentRecord = {
       };
 };
 
+type BlueprintInitializationRecord = {
+  id: "default";
+  gadgetId: WorkpieceId;
+};
+
 // Sentinel gatekeeperId used on ActionRecords that originated from built-in agent tools
 // (e.g. webFetch) rather than from a real gatekeeper. Real gatekeeper IDs are assigned
 // starting at 1, so -1 is a safe out-of-band marker. Only "observation" records ever carry
@@ -1022,6 +1028,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       and every live chat was converted to the commit-pinned change stream (a
       //       `conversionBoundary` changes message plus a `codeBase`). The `code`/`snapshots`
       //       collections are dead stored data from this version on.
+      //   3 = accepted workspace and gadget files live in one Cloudflare Artifacts repository.
+      //       Earlier initialized workspaces are intentionally unsupported and are reprovisioned.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1281,6 +1289,13 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
       blueprints: collection<BlueprintGadgetRecord>()({
         primaryKey: "id"
+      }),
+
+      // Reserved before blueprint source is committed to Artifacts. Keeping the allocation
+      // separate from the gadget registry prevents a failed external commit from publishing a
+      // permanent gadget with no usable source revision. A retry reuses the same subtree ID.
+      blueprintInitializations: collection<BlueprintInitializationRecord>()({
+        primaryKey: "id",
       }),
 
       // Attachment bytes. Before an attachment is committed to a chat message, this also carries
@@ -1738,6 +1753,13 @@ class OverseerImpl implements AgentHooks {
     });
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
+
+    if (this.ownerId !== undefined &&
+        this.storage.version.get() < CURRENT_WORKSPACE_STORAGE_VERSION) {
+      throw new Error(
+        "This workspace predates Artifacts storage and must be reprovisioned.",
+      );
+    }
 
     // Run any pending storage migration before anything else can touch storage. This must happen
     // in the constructor (not just open()) because the DO also wakes via constructor-driven
@@ -2209,15 +2231,13 @@ class OverseerImpl implements AgentHooks {
 
   // Auto-create the workspace's single gadget and record it as the default gadget. New workspaces
   // normally start with zero gadgets and the agent creates gadgets explicitly (never assigning
-  // `defaultGadgetId`); the exceptions are blueprint instantiation, which still creates a fresh
-  // workspace containing one gadget, and the git-storage migration, which recovers the implicit
-  // gadget of a legacy workspace whose only code was chat-proposed (see migrateCodeLogToGit).
+  // `defaultGadgetId`); the remaining exception is the git-storage migration, which recovers the
+  // implicit gadget of a legacy workspace whose only code was chat-proposed (see
+  // migrateCodeLogToGit).
   // `commitId` is the gadget's initial commit, written by the caller beforehand: every permanent
   // gadget is born with a head (see GadgetRecord.commitId). Only the migration may omit it -- it
   // synthesizes and assigns the head itself before its blockConcurrencyWhile critical section
   // ends, so nothing can observe the momentarily head-less record.
-  // TODO(multi-gadget): Remove the blueprint-instantiation use once blueprint instantiation is
-  // reworked (plan phase 5).
   ensureDefaultGadget(commitId: string | undefined): WorkpieceId {
     if (this.defaultGadgetId !== undefined) return this.defaultGadgetId;
     let id = this.allocateWorkpieceId();
@@ -2234,6 +2254,48 @@ class OverseerImpl implements AgentHooks {
       ...(commitId !== undefined ? { commitId } : {}),
     });
     return id;
+  }
+
+  reserveBlueprintGadgetId(): WorkpieceId {
+    if (this.defaultGadgetId !== undefined) return this.defaultGadgetId;
+    let initialization = this.storage.blueprintInitializations.get("default");
+    if (initialization) return initialization.gadgetId;
+    const gadgetId = this.allocateWorkpieceId();
+    this.storage.blueprintInitializations.put({ id: "default", gadgetId });
+    return gadgetId;
+  }
+
+  finalizeBlueprintGadget(
+      gadgetId: WorkpieceId, commitId: string, output?: BlueprintOutput): void {
+    if (this.defaultGadgetId !== undefined) {
+      if (this.defaultGadgetId !== gadgetId) {
+        throw new Error("Blueprint initialization reserved a different default gadget.");
+      }
+      return;
+    }
+    if (this.storage.blueprintInitializations.get("default")?.gadgetId !== gadgetId) {
+      throw new Error("Blueprint initialization has no matching gadget reservation.");
+    }
+
+    try {
+      this.ctx.storage.transactionSync(() => {
+        this.storage.defaultGadgetId.put(gadgetId);
+        this.defaultGadgetId = gadgetId;
+        this.storage.gadgets.put({
+          id: gadgetId,
+          title: this.storage.title.get(),
+          created: new Date(),
+          bindingName: "GADGET",
+          bindings: {},
+          commitId,
+          ...(output ? { output } : {}),
+        });
+        this.storage.blueprintInitializations.delete("default");
+      });
+    } catch (error) {
+      this.defaultGadgetId = this.storage.defaultGadgetId.get();
+      throw error;
+    }
   }
 
   // Fallback bookkeeping target for hooks bound from executeCode when we can't tell which gadget
@@ -8398,7 +8460,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(2);
+    this.impl.storage.version.put(CURRENT_WORKSPACE_STORAGE_VERSION);
   }
 
   /**
@@ -8693,9 +8755,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async initializeFromBlueprint(code: Uint8Array, title: string, output?: BlueprintOutput)
       : Promise<void> {
-    // Set the title. The default gadget (created below) inherits it.
-    this.impl.storage.title.put(title);
-
     // Decode the archive into the default gadget's Artifacts subtree. An empty archive is refused
     // because blueprint creation never emits one, so it can only be corrupted or hand-crafted.
     let archiveDoc = new Y.Doc();
@@ -8716,27 +8775,34 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let owner = () => wrapDoStubForTelemetry(
         this.impl.users.get(this.impl.users.idFromString(ownerId)), this.impl.logger);
     let ownerProfile = await retryOnDoReset(() => owner().whoami(), this.impl.logger);
+    if (this.impl.defaultGadgetId !== undefined) {
+      const existing = this.impl.getGadgetRecord(this.impl.defaultGadgetId);
+      if (existing.commitId === undefined) {
+        throw new Error("The initialized blueprint gadget has no source revision.");
+      }
+      await this.impl.workspaceCodeRepository.completeGadgetFiles(
+        `initialize-blueprint-${existing.id}`,
+        existing.commitId,
+      );
+      await owner().setGadgetLastActive(this.ctx.id.toString(), new Date(), undefined);
+      return;
+    }
+
+    // Set the title only while creating the workspace. A retry after successful initialization
+    // must not overwrite it with a different request.
+    this.impl.storage.title.put(title);
     const actor = { id: ownerProfile.id, name: ownerProfile.name };
-    const canonical = await this.impl.workspaceCodeRepository.ensureCanonical(actor);
-    const gadgetId = this.impl.ensureDefaultGadget(canonical.head);
+    const gadgetId = this.impl.reserveBlueprintGadgetId();
+    const operationId = `initialize-blueprint-${gadgetId}`;
     const commitId = await this.impl.workspaceCodeRepository.commitGadgetFiles(
-      `initialize-blueprint-${gadgetId}`,
+      operationId,
       actor,
       `Instantiate blueprint: ${title}`,
       gadgetId,
       files,
     );
-    const gadget = this.impl.getGadgetRecord(gadgetId);
-    gadget.commitId = commitId;
-    this.impl.storage.gadgets.put(gadget);
-
-    // The gadget inherits the blueprint's declared format, so it is named and drawn as a Document
-    // (or whatever it produces) rather than a generic app.
-    if (output) {
-      let record = this.impl.getGadgetRecord(this.impl.resolveGadgetId(undefined));
-      record.output = output;
-      this.impl.storage.gadgets.put(record);
-    }
+    this.impl.finalizeBlueprintGadget(gadgetId, commitId, output);
+    await this.impl.workspaceCodeRepository.completeGadgetFiles(operationId, commitId);
 
     // Mark gadget as non-provisional (it has code, so it should appear in the gadget list).
     // (A write, so deliberately not retried -- a reset can't distinguish "never applied" from

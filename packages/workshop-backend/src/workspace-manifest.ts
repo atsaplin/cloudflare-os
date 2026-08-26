@@ -4,7 +4,7 @@ import { z } from "zod";
 export const WORKSPACE_INDEX_PATH = ".workspace/index.json";
 
 const workspaceGadgetRoot = ".workspace/gadgets";
-const positiveGadgetIdPattern = /^[1-9][0-9]*$/;
+const gadgetIdPattern = /^(?:0|[1-9][0-9]*)$/;
 
 /** Metadata for one versioned workspace file or folder identity. */
 export interface WorkspaceIndexNode {
@@ -449,7 +449,7 @@ function isInternalGadgetPath(path: string, kind: WorkspaceTreeEntryKind): boole
 
   const segments = path.split("/");
   const gadgetId = segments[2];
-  if (gadgetId === undefined || !positiveGadgetIdPattern.test(gadgetId) ||
+  if (gadgetId === undefined || !gadgetIdPattern.test(gadgetId) ||
       !Number.isSafeInteger(Number(gadgetId))) {
     return false;
   }

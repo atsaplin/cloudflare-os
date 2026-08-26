@@ -64,6 +64,19 @@ async function seedLegacyWorkspace(
 }
 
 describe("git-storage migration via the Overseer constructor", () => {
+  it("fails closed for an initialized workspace that predates Artifacts storage", async () => {
+    const name = "legacy-artifacts-cutover";
+    await inOverseer(name, async impl => {
+      impl.storage.ownerId.put("legacy-owner");
+      impl.storage.version.put(2);
+    });
+
+    await abortAllDurableObjects();
+
+    await expect(inOverseer(name, async () => {}))
+      .rejects.toThrow(/predates Artifacts storage/);
+  });
+
   it("migrates a single-gadget workspace, preserving content across the batching gap",
       async () => {
     let ws = await seedLegacyWorkspace("git-migration-single", (ws, impl) => {

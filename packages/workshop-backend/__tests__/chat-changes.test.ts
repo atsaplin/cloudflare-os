@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
+import * as Y from "yjs";
 import type {
   AiChatAuthorInfo, AiChatMessage, CodeChangeSubmission,
 } from "@gadgets/workshop-shared/api";
@@ -142,11 +143,16 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
       operationId: string, actor: WorkspaceActor, message: string, gadgetId: number,
       files: ReadonlyMap<string, string>): Promise<string> {
     const chatId = `trusted:${operationId}`;
-    await this.stageGadgetFiles(chatId, 0, actor, message, new Map([[gadgetId, files]]));
+    if (!this.#forkHeads.has(`${chatId}:0`)) {
+      await this.stageGadgetFiles(chatId, 0, actor, message, new Map([[gadgetId, files]]));
+    }
     const accepted = await this.acceptChatFork(chatId, 0);
     if (accepted.status === "stale") throw new Error("Test trusted commit became stale.");
-    await this.completeAcceptedChatFork(chatId, 0, accepted.head);
     return accepted.head;
+  }
+
+  completeGadgetFiles(operationId: string, acceptedHead: string): Promise<void> {
+    return this.completeAcceptedChatFork(`trusted:${operationId}`, 0, acceptedHead);
   }
 
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
@@ -187,6 +193,28 @@ async function withImpl(fn: (impl: any) => Promise<void>): Promise<void> {
     );
     await fn(impl);
   });
+}
+
+async function withOverseer(
+    fn: (instance: OverseerDurableObject, impl: any) => Promise<void>): Promise<void> {
+  let stub = env.TEST_OVERSEER.getByName(`chat-changes-${++doCounter}`);
+  await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+    const impl = (instance as unknown as { impl: any }).impl;
+    impl.workspaceCodeRepository = new TestWorkspaceCodeRepository(
+      impl.gitStore,
+      (gadgetId: number) => impl.storage.gadgets.get(gadgetId)?.commitId,
+    );
+    await fn(instance, impl);
+  });
+}
+
+function blueprintArchive(files: Record<string, string>): Uint8Array {
+  const document = new Y.Doc();
+  const root = document.getMap<Y.Text>();
+  for (const [path, content] of Object.entries(files)) {
+    root.set(path, new Y.Text(content));
+  }
+  return Y.encodeStateAsUpdateV2(document);
 }
 
 function addGadget(
@@ -775,6 +803,101 @@ describe("mergeChanges", () => {
 });
 
 describe("blueprint snapshots", () => {
+  it("does not publish a default gadget until its Artifacts snapshot is durable",
+      () => withOverseer(async (instance, impl) => {
+    impl.ownerId = USER_DO_ID;
+    impl.storage.ownerId.put(USER_DO_ID);
+    impl.users = {
+      idFromString: () => USER_DO_ID,
+      get: () => ({
+        whoami: () => Promise.resolve(USER),
+        setGadgetLastActive: () => Promise.resolve(),
+      }),
+    };
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    repository.failNextStage = true;
+    const archive = blueprintArchive({ "client.js": "export default 'ready';\n" });
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .rejects.toThrow("checkpoint failed");
+    expect(impl.defaultGadgetId).toBeUndefined();
+    expect([...impl.storage.gadgets.list()]).toEqual([]);
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .resolves.toBeUndefined();
+    expect(impl.defaultGadgetId).toBe(0);
+    expect(impl.storage.gadgets.get(0)).toMatchObject({
+      id: 0,
+      title: "Blueprint App",
+      bindingName: "GADGET",
+    });
+    expect(impl.storage.gadgets.get(0)?.commitId).toMatch(/^[0-9a-f]{40}$/);
+    expect(repository.staged.map(entry => entry.gadgetIds)).toEqual([[0], [0]]);
+  }));
+
+  it("does not commit a second blueprint snapshot when owner indexing is retried",
+      () => withOverseer(async (instance, impl) => {
+    impl.ownerId = USER_DO_ID;
+    impl.storage.ownerId.put(USER_DO_ID);
+    let failOwnerIndex = true;
+    impl.users = {
+      idFromString: () => USER_DO_ID,
+      get: () => ({
+        whoami: () => Promise.resolve(USER),
+        setGadgetLastActive: () => {
+          if (failOwnerIndex) {
+            failOwnerIndex = false;
+            return Promise.reject(new Error("owner index unavailable"));
+          }
+          return Promise.resolve();
+        },
+      }),
+    };
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    const archive = blueprintArchive({ "client.js": "export default 'ready';\n" });
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .rejects.toThrow("owner index unavailable");
+    expect(impl.storage.gadgets.get(0)?.commitId).toMatch(/^[0-9a-f]{40}$/);
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .resolves.toBeUndefined();
+    expect(repository.staged.map(entry => entry.gadgetIds)).toEqual([[0]]);
+  }));
+
+  it("reuses the accepted blueprint snapshot when registry finalization is retried",
+      () => withOverseer(async (instance, impl) => {
+    impl.ownerId = USER_DO_ID;
+    impl.storage.ownerId.put(USER_DO_ID);
+    impl.users = {
+      idFromString: () => USER_DO_ID,
+      get: () => ({
+        whoami: () => Promise.resolve(USER),
+        setGadgetLastActive: () => Promise.resolve(),
+      }),
+    };
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    const finalize = impl.finalizeBlueprintGadget.bind(impl);
+    let failFinalization = true;
+    impl.finalizeBlueprintGadget = (...args: unknown[]) => {
+      if (failFinalization) {
+        failFinalization = false;
+        throw new Error("registry unavailable");
+      }
+      return finalize(...args);
+    };
+    const archive = blueprintArchive({ "client.js": "export default 'ready';\n" });
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .rejects.toThrow("registry unavailable");
+    expect([...impl.storage.gadgets.list()]).toEqual([]);
+
+    await expect(instance.initializeFromBlueprint(archive, "Blueprint App"))
+      .resolves.toBeUndefined();
+    expect(repository.staged.map(entry => entry.gadgetIds)).toEqual([[0]]);
+    expect(repository.completed).toHaveLength(1);
+  }));
+
   it("creates an empty permanent gadget at the canonical workspace revision",
       () => withImpl(async impl => {
     const record = await impl.createPermanentGadget("App", "APP", USER);

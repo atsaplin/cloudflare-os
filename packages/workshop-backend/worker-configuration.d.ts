@@ -9,7 +9,7 @@ interface __BaseEnv_Env {
 	ARTIFACTS: Artifacts;
 	LOADER: WorkerLoader;
 	BROWSER: BrowserRun;
-	Sandbox: DurableObjectNamespace<import("./.wrangler/validate/src/server").Sandbox>;
+	Sandbox: DurableObjectNamespace<import("./src/server").Sandbox>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {

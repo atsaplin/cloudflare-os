@@ -278,6 +278,8 @@ describe("workspace manifest", () => {
       [".workspace", "folder"],
       [".workspace/index.json", "file"],
       [".workspace/gadgets", "folder"],
+      [".workspace/gadgets/0", "folder"],
+      [".workspace/gadgets/0/client.js", "file"],
       [".workspace/gadgets/7", "folder"],
       [".workspace/gadgets/7/client.js", "file"],
       [".workspace/gadgets/7/nested", "folder"],
@@ -295,7 +297,6 @@ describe("workspace manifest", () => {
     const index = createEmptyWorkspaceIndex(context());
     const invalidPaths: [string, WorkspaceTreeEntryKind][] = [
       [".workspace/gadgets", "file"],
-      [".workspace/gadgets/0", "folder"],
       [".workspace/gadgets/01", "folder"],
       [".workspace/gadgets/not-a-gadget", "folder"],
       [".workspace/gadgets/7", "file"],

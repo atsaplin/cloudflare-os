@@ -3,7 +3,7 @@
  * Regenerate worker-configuration.d.ts for every package that has wrangler.jsonc.
  *
  * Post-processing (so we don't hand-edit the giant generated file):
- * 1. Point mainModule at ./src/* instead of gitignored .wrangler/validate/*
+ * 1. Point project module types at ./src/* instead of gitignored .wrangler/validate/*
  * 2. If src/env.d.ts owns GlobalProps, drop the generated project header
  *    (runtime types only) so the two don't fight.
  * 3. workshop-backend: keep the manual `restore` export until wrangler emits it.
@@ -62,10 +62,10 @@ async function ownsGlobalProps(pkgDir: string): Promise<boolean> {
   }
 }
 
-function rewriteMainModule(text: string): string {
+function rewriteProjectModules(text: string): string {
   return text.replace(
-    /mainModule:\s*typeof import\("\.\/\.wrangler\/validate\/src\/([^"]+)"\)/g,
-    'mainModule: typeof import("./src/$1")',
+    /import\("\.\/\.wrangler\/validate\/src\/([^"]+)"\)/g,
+    'import("./src/$1")',
   );
 }
 
@@ -102,7 +102,7 @@ function normalizeBanner(text: string): string {
 
 async function postprocess(pkgDir: string, text: string): Promise<string> {
   let next = normalizeBanner(text);
-  next = rewriteMainModule(next);
+  next = rewriteProjectModules(next);
   if (await ownsGlobalProps(pkgDir)) {
     next = stripProjectHeader(next);
   }

@@ -1508,6 +1508,7 @@ export interface WorkspaceCodeRepository {
     gadgetId: number,
     files: ReadonlyMap<string, string>,
   ): Promise<string>;
+  completeGadgetFiles(operationId: string, acceptedHead: string): Promise<void>;
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult>;
   completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void>;
   discardChatFork(chatId: string, epoch: number): Promise<void>;
@@ -1575,7 +1576,7 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
   }
 
   async readGadgetFiles(gadgetId: number, ref: string): Promise<Map<string, string>> {
-    if (!Number.isSafeInteger(gadgetId) || gadgetId < 1) {
+    if (!Number.isSafeInteger(gadgetId) || gadgetId < 0) {
       throw new Error("Workspace gadget ID is invalid.");
     }
     const canonical = await this.#canonical();
@@ -1624,7 +1625,7 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
   ): Promise<WorkspaceArtifactChatFork> {
     const operations: WorkspaceArtifactMutationOperation[] = [];
     for (const [gadgetId, files] of [...gadgets].toSorted((left, right) => left[0] - right[0])) {
-      if (!Number.isSafeInteger(gadgetId) || gadgetId < 1) {
+      if (!Number.isSafeInteger(gadgetId) || gadgetId < 0) {
         throw new Error("Workspace gadget ID is invalid.");
       }
       const root = `${workspaceGadgetRoot}/${gadgetId}`;
@@ -1651,8 +1652,12 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
     const chatId = `trusted-gadget-operation:${operationId}`;
     const epoch = 0;
     await this.ensureCanonical(actor);
-    const existing = await this.#lifecycle.getForkStatus(chatId, epoch);
-    if (!existing || existing.state === "open") {
+    let existing = await this.#lifecycle.getForkStatus(chatId, epoch);
+    if (existing?.state === "discarding") {
+      await this.#lifecycle.discardChatFork(chatId, epoch);
+      existing = undefined;
+    }
+    if (!existing || existing.state === "creating" || existing.state === "open") {
       await this.stageGadgetFiles(
         chatId,
         epoch,
@@ -1666,8 +1671,15 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
       await this.#lifecycle.discardChatFork(chatId, epoch);
       throw new Error("Workspace changed while committing trusted gadget files.");
     }
-    await this.#lifecycle.completeAcceptedChatFork(chatId, epoch, accepted.head);
     return accepted.head;
+  }
+
+  completeGadgetFiles(operationId: string, acceptedHead: string): Promise<void> {
+    return this.#lifecycle.completeAcceptedChatFork(
+      `trusted-gadget-operation:${operationId}`,
+      0,
+      acceptedHead,
+    );
   }
 
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
