@@ -779,9 +779,6 @@ importers:
       '@cloudflare/sandbox':
         specifier: 0.13.0-next.751.1
         version: 0.13.0-next.751.1
-      '@cloudflare/shell':
-        specifier: 0.4.3
-        version: 0.4.3(zod@4.4.3)
       '@earendil-works/pi-agent-core':
         specifier: 0.83.0
         version: 0.83.0(supports-color@10.2.2)(ws@8.21.3)(zod@4.4.3)
@@ -1240,23 +1237,6 @@ packages:
   '@blazediff/core@1.9.1':
     resolution: {integrity: sha512-ehg3jIkYKulZh+8om/O25vkvSsXXwC+skXmyA87FFx6A/45eqOkZsBltMw/TVteb0mloiGT8oGRTcjRAz66zaA==}
 
-  '@cloudflare/codemode@0.5.1':
-    resolution: {integrity: sha512-PcX5+qAvupi8p1bMLKhqvPHziZpDubbrxDIvVH+iuuNUaFyOxxWNS9HplfFqIULqUzDPdFf1w7IiSCKHp7GDgg==}
-    peerDependencies:
-      '@modelcontextprotocol/sdk': ^1.25.0
-      '@tanstack/ai': '>=0.8.0 <1.0.0'
-      ai: ^6.0.0 || ^7.0.0
-      zod: ^4.0.0
-    peerDependenciesMeta:
-      '@modelcontextprotocol/sdk':
-        optional: true
-      '@tanstack/ai':
-        optional: true
-      ai:
-        optional: true
-      zod:
-        optional: true
-
   '@cloudflare/containers@0.3.7':
     resolution: {integrity: sha512-DM9dm3FnIBSyiSJ1FLavKwl/lk3oAmTaynCzZQ9pZR0ncRPquSxkxd8Nu2MFILxmDDsPkxKsSNEh9mHHMty4Fw==}
 
@@ -1296,9 +1276,6 @@ packages:
         optional: true
       '@xterm/xterm':
         optional: true
-
-  '@cloudflare/shell@0.4.3':
-    resolution: {integrity: sha512-6ZMKQZqdZeommh8LGFK5C2rep4byJfCuyjR4NBdMqn2wW9tbeDJORfDhP/No75MLx8nJeWdgeXvq3D2Ijpa0XA==}
 
   '@cloudflare/unenv-preset@2.16.1':
     resolution: {integrity: sha512-ECxObrMfyTl5bhQf/lZCXwo5G6xX9IAUo+nDMKK4SZ8m4Jvvxp52vilxyySSWh2YTZz8+HQ07qGH/2rEom1vDw==}
@@ -2663,9 +2640,6 @@ packages:
 
   '@types/hast@3.0.5':
     resolution: {integrity: sha512-rp/ezSWaD1m44dPKICGhiskI13nVr7qTloFwDa/IYkhhf5nzwP+zIQcIJh3WIFSBOy/H1PzB40jPjMDksN4F+g==}
-
-  '@types/json-schema@7.0.15':
-    resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
   '@types/mdast@4.0.4':
     resolution: {integrity: sha512-kGaNbPh1k7AFzgpud/gMdvIm5xuECykRR+JnWKQno9TAXVa6WIVCGTPvYGekIDL4uwCZQSYbUxNBSb1aUo79oA==}
@@ -5501,13 +5475,6 @@ snapshots:
 
   '@blazediff/core@1.9.1': {}
 
-  '@cloudflare/codemode@0.5.1(zod@4.4.3)':
-    dependencies:
-      '@types/json-schema': 7.0.15
-      acorn: 8.18.0
-    optionalDependencies:
-      zod: 4.4.3
-
   '@cloudflare/containers@0.3.7': {}
 
   '@cloudflare/kumo@2.9.2(@date-fns/tz@1.5.0)(@phosphor-icons/react@2.1.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(date-fns@4.4.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.4.3)':
@@ -5554,16 +5521,6 @@ snapshots:
       aws4fetch: 1.0.20
       capnweb: 0.8.0
       hono: 4.13.4
-
-  '@cloudflare/shell@0.4.3(zod@4.4.3)':
-    dependencies:
-      '@cloudflare/codemode': 0.5.1(zod@4.4.3)
-      isomorphic-git: 1.40.5
-    transitivePeerDependencies:
-      - '@modelcontextprotocol/sdk'
-      - '@tanstack/ai'
-      - ai
-      - zod
 
   '@cloudflare/unenv-preset@2.16.1(unenv@2.0.0-rc.24)(workerd@1.20260801.1)':
     dependencies:
@@ -6769,8 +6726,6 @@ snapshots:
   '@types/hast@3.0.5':
     dependencies:
       '@types/unist': 3.0.3
-
-  '@types/json-schema@7.0.15': {}
 
   '@types/mdast@4.0.4':
     dependencies:
