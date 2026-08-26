@@ -30,9 +30,6 @@ const maximumRepositoryTreeEntries = 100_000;
 
 /** The Artifacts repo surface used by the workspace lifecycle. */
 export interface WorkspaceArtifactRepo {
-  readonly name: string;
-  readonly remote: string;
-  readonly defaultBranch: string;
   createToken(scope: "read" | "write", ttl?: number): Promise<{
     id: string;
     plaintext: string;
@@ -49,6 +46,13 @@ export interface WorkspaceArtifactRepo {
     defaultBranch: string;
     token: string;
   }>;
+}
+
+/** Plain repository metadata returned by Artifacts create, fork, or REST operations. */
+export interface WorkspaceArtifactRepoMetadata {
+  name: string;
+  remote: string;
+  defaultBranch: string;
 }
 
 /** The namespace-level Artifacts operations used by the workspace lifecycle. */
@@ -69,7 +73,8 @@ export interface WorkspaceArtifactControlPlane {
 
 /** Bounded read access to repository refs and files. */
 export interface WorkspaceArtifactReader {
-  getHead(repositoryName: string): Promise<string | undefined>;
+  getRepositoryMetadata(repositoryName: string): Promise<WorkspaceArtifactRepoMetadata>;
+  getHead(repositoryName: string, defaultBranch: string): Promise<string | undefined>;
   listFiles(repositoryName: string, ref: string): Promise<string[]>;
   readFile(
     repositoryName: string,
@@ -221,6 +226,33 @@ function parseTreeEntries(value: unknown): WorkspaceArtifactTreeEntry[] {
   });
 }
 
+function parseRepositoryMetadata(
+  value: unknown,
+  expectedName: string,
+): WorkspaceArtifactRepoMetadata {
+  if (!isRecord(value) || value.name !== expectedName || typeof value.remote !== "string" ||
+      typeof value.defaultBranch !== "string") {
+    throw new Error("Artifacts repository metadata is invalid.");
+  }
+  artifactRemoteHost(value.remote);
+  requireBranch(value.defaultBranch);
+  return { name: expectedName, remote: value.remote, defaultBranch: value.defaultBranch };
+}
+
+function parseRepositoryMetadataEnvelope(
+  value: unknown,
+  expectedName: string,
+): WorkspaceArtifactRepoMetadata {
+  if (!isRecord(value) || value.success !== true || !isRecord(value.result)) {
+    throw new Error("Artifacts repository response is invalid.");
+  }
+  return parseRepositoryMetadata({
+    name: value.result.name,
+    remote: value.result.remote,
+    defaultBranch: value.result.default_branch,
+  }, expectedName);
+}
+
 /** Reads bounded repository content without starting a Sandbox. */
 export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReader {
   readonly #artifacts: WorkspaceArtifactControlPlane;
@@ -237,12 +269,32 @@ export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReade
     this.#fetch = options.fetch ?? (request => fetch(request));
   }
 
-  async getHead(repositoryName: string): Promise<string | undefined> {
+  async getRepositoryMetadata(
+    repositoryName: string,
+  ): Promise<WorkspaceArtifactRepoMetadata> {
+    const url = new URL(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}` +
+      `/artifacts/namespaces/${encodeURIComponent(this.#namespace)}` +
+      `/repos/${encodeURIComponent(repositoryName)}`,
+    );
+    const response = await this.#fetch(new Request(url, {
+      headers: { Authorization: `Bearer ${this.#apiToken}` },
+    }));
+    if (!response.ok) {
+      throw new Error(`Artifacts repository read failed with status ${response.status}.`);
+    }
+    return parseRepositoryMetadataEnvelope(await response.json(), repositoryName);
+  }
+
+  async getHead(repositoryName: string, defaultBranch: string): Promise<string | undefined> {
     const repo = await this.#artifacts.get(repositoryName);
     if (!hasRepositoryLog(repo)) {
       throw new Error("The Artifacts binding does not expose repository history.");
     }
-    const commits = parseCommitLog(await repo.log({ ref: repo.defaultBranch, limit: 1 }), 1);
+    const commits = parseCommitLog(
+      await repo.log({ ref: requireBranch(defaultBranch), limit: 1 }),
+      1,
+    );
     return commits[0]?.oid;
   }
 
@@ -399,7 +451,7 @@ export interface WorkspaceArtifactMutation {
 /** Minimal Sandbox client used by trusted repository Git operations. */
 export interface WorkspaceArtifactSandbox {
   registerGitAuthInterceptor(params: {
-    hosts: Record<string, { token: string; type: "bearer" }>;
+    hosts: Record<string, { token: string; username: string; type: "basic" }>;
   }): Promise<void>;
   exists(path: string): Promise<{ exists: boolean }>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
@@ -592,6 +644,13 @@ function byteStream(content: Uint8Array): ReadableStream<Uint8Array> {
 
 function noop(): void {}
 
+async function workspaceSandboxId(
+  purpose: "chat" | "initialize" | "promote",
+  identity: string,
+): Promise<string> {
+  return `workspace-${purpose}-${(await sha256Hex(identity)).slice(0, 40)}`;
+}
+
 /** Trusted Sandbox implementation of repository initialization and fast-forward promotion. */
 export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitRuntime {
   readonly #sandbox: WorkspaceArtifactSandboxFactory;
@@ -606,7 +665,11 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     if (output.timedOut) throw new Error("Workspace Git operation timed out.");
     if (output.truncated) throw new Error("Workspace Git operation output exceeded its bound.");
     if (output.exitCode !== 0) {
-      throw new Error(`Workspace Git operation exited with code ${output.exitCode}.`);
+      const detail = `${output.stderr}\n${output.stdout}`.trim().slice(0, 4_096);
+      throw new Error(
+        `Workspace Git operation exited with code ${output.exitCode}` +
+        `${detail ? `: ${detail}` : "."}`,
+      );
     }
     return output.stdout;
   }
@@ -619,11 +682,17 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     defaultBranch: string;
     index: Uint8Array;
   }): Promise<string> {
-    const sandbox = this.#sandbox(`workspace-initialize-${request.repositoryName}`);
+    const sandbox = this.#sandbox(
+      await workspaceSandboxId("initialize", request.repositoryName),
+    );
     const directory = "/workspace/repo";
     try {
       await sandbox.registerGitAuthInterceptor({
-        hosts: { [artifactRemoteHost(request.remote)]: { token: request.token, type: "bearer" } },
+        hosts: { [artifactRemoteHost(request.remote)]: {
+          token: request.token,
+          username: "x-access-token",
+          type: "basic",
+        } },
       });
       await this.#run(sandbox, ["git", "clone", request.remote, directory]);
       await this.#run(sandbox, ["mkdir", "-p", `${directory}/.workspace`]);
@@ -662,14 +731,18 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     canonicalDefaultBranch: string;
   }): Promise<string> {
     const sandbox = this.#sandbox(
-      `workspace-promote-${request.canonicalRepositoryName}-${request.forkRepositoryName}`,
+      await workspaceSandboxId(
+        "promote",
+        `${request.canonicalRepositoryName}:${request.forkRepositoryName}`,
+      ),
     );
     const directory = "/workspace/repo";
     try {
       await sandbox.registerGitAuthInterceptor({
         hosts: { [artifactRemoteHost(request.forkRemote)]: {
           token: request.forkToken,
-          type: "bearer",
+          username: "x-access-token",
+          type: "basic",
         } },
       });
       await this.#run(sandbox, ["git", "clone", request.forkRemote, directory]);
@@ -683,7 +756,8 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
       await sandbox.registerGitAuthInterceptor({
         hosts: { [artifactRemoteHost(request.canonicalRemote)]: {
           token: request.canonicalToken,
-          type: "bearer",
+          username: "x-access-token",
+          type: "basic",
         } },
       });
       await this.#run(sandbox, [
@@ -714,7 +788,8 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
       await sandbox.registerGitAuthInterceptor({
         hosts: { [artifactRemoteHost(request.remote)]: {
           token: request.token,
-          type: "bearer",
+          username: "x-access-token",
+          type: "basic",
         } },
       });
       await this.#run(sandbox, ["git", "clone", request.remote, directory]);
@@ -766,7 +841,8 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     await sandbox.registerGitAuthInterceptor({
       hosts: { [artifactRemoteHost(request.remote)]: {
         token: request.token,
-        type: "bearer",
+        username: "x-access-token",
+        type: "basic",
       } },
     });
     await this.#run(sandbox, [
@@ -954,7 +1030,7 @@ export class WorkspaceArtifactLifecycle {
   }
 
   async #reconcileOpenForkHead(row: ForkRow): Promise<ForkRow> {
-    const liveHead = await this.#reader.getHead(row.repository_name);
+    const liveHead = await this.#reader.getHead(row.repository_name, row.default_branch);
     if (liveHead === undefined) throw new Error("Chat fork has no head.");
     requireOid(liveHead, "Chat fork head");
     if (liveHead === row.latest_head) return row;
@@ -1014,6 +1090,7 @@ export class WorkspaceArtifactLifecycle {
 
       const repositoryName = await this.#canonicalRepositoryName();
       let initialToken: string | undefined;
+      let metadata: WorkspaceArtifactRepoMetadata;
       try {
         const created = await this.#artifacts.create(repositoryName, {
           description: `Workspace ${this.#workspaceId}`,
@@ -1021,12 +1098,14 @@ export class WorkspaceArtifactLifecycle {
           setDefaultBranch: "main",
         });
         initialToken = created.token;
+        metadata = parseRepositoryMetadata(created, repositoryName);
       } catch (error) {
         if (!isArtifactsError(error, "ALREADY_EXISTS")) throw error;
+        metadata = await this.#reader.getRepositoryMetadata(repositoryName);
       }
 
       const repo = await this.#getReadyRepository(repositoryName);
-      let head = await this.#reader.getHead(repositoryName);
+      let head = await this.#reader.getHead(repositoryName, metadata.defaultBranch);
       let rootId: string;
       if (head === undefined) {
         const index = createEmptyWorkspaceIndex({
@@ -1039,9 +1118,9 @@ export class WorkspaceArtifactLifecycle {
         try {
           head = requireOid(await this.#gitRuntime.initialize({
             repositoryName,
-            remote: repo.remote,
+            remote: metadata.remote,
             token,
-            defaultBranch: repo.defaultBranch,
+            defaultBranch: metadata.defaultBranch,
             index: serializeWorkspaceIndex(index),
           }), "Initialized workspace head");
         } finally {
@@ -1061,8 +1140,14 @@ export class WorkspaceArtifactLifecycle {
         INSERT INTO workspace_artifact_repository (
           singleton, repository_name, remote, default_branch, head, root_id
         ) VALUES (1, ?, ?, ?, ?, ?)
-      `, repositoryName, repo.remote, repo.defaultBranch, head, rootId);
-      return { repositoryName, remote: repo.remote, defaultBranch: repo.defaultBranch, head, rootId };
+      `, repositoryName, metadata.remote, metadata.defaultBranch, head, rootId);
+      return {
+        repositoryName,
+        remote: metadata.remote,
+        defaultBranch: metadata.defaultBranch,
+        head,
+        rootId,
+      };
     });
   }
 
@@ -1074,6 +1159,18 @@ export class WorkspaceArtifactLifecycle {
     });
   }
 
+  async #readRepositoryCommitLog(
+    repositoryName: string,
+    ref: string,
+    limit: number,
+  ): Promise<CommitInfo[]> {
+    const repo = await this.#getReadyRepository(repositoryName);
+    if (!hasRepositoryLog(repo)) {
+      throw new Error("The Artifacts binding does not expose repository history.");
+    }
+    return parseCommitLog(await repo.log({ ref, limit }), limit);
+  }
+
   /** Returns bounded commit metadata from the canonical Artifacts repository. */
   readCommitLog(oid: string, options: { depth?: number } = {}): Promise<CommitInfo[]> {
     const ref = requireOid(oid, "Workspace commit");
@@ -1081,11 +1178,26 @@ export class WorkspaceArtifactLifecycle {
     return this.#withLock(async () => {
       const row = this.#canonicalRow();
       if (!row) throw new Error("Canonical workspace repository is not initialized.");
-      const repo = await this.#getReadyRepository(row.repository_name);
-      if (!hasRepositoryLog(repo)) {
-        throw new Error("The Artifacts binding does not expose repository history.");
-      }
-      return parseCommitLog(await repo.log({ ref, limit }), limit);
+      return this.#readRepositoryCommitLog(row.repository_name, ref, limit);
+    });
+  }
+
+  /** Returns bounded commit metadata from one existing chat fork. */
+  readChatCommitLog(
+    chatId: string,
+    epoch: number,
+    oid: string,
+    options: { depth?: number } = {},
+  ): Promise<CommitInfo[]> {
+    if (!chatId || !Number.isInteger(epoch) || epoch < 0 || epoch > maximumEpoch) {
+      throw new Error("Chat fork identity is invalid.");
+    }
+    const ref = requireOid(oid, "Chat fork commit");
+    const limit = requireCommitHistoryDepth(options.depth, maximumCommitHistoryDepth);
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      if (!row) throw new Error("Chat fork does not exist.");
+      return this.#readRepositoryCommitLog(row.repository_name, ref, limit);
     });
   }
 
@@ -1100,7 +1212,7 @@ export class WorkspaceArtifactLifecycle {
         throw new Error("The Artifacts binding does not expose repository history.");
       }
       return parseCommitLog(
-        await repo.log({ ref: repo.defaultBranch, limit: depth }),
+        await repo.log({ ref: row.default_branch, limit: depth }),
         depth,
       );
     });
@@ -1139,13 +1251,16 @@ export class WorkspaceArtifactLifecycle {
 
       const canonicalRow = this.#canonicalRow();
       if (!canonicalRow) throw new Error("Canonical workspace repository is not initialized.");
-      const liveHead = await this.#reader.getHead(canonicalRow.repository_name);
+      const liveHead = await this.#reader.getHead(
+        canonicalRow.repository_name,
+        canonicalRow.default_branch,
+      );
       if (liveHead === undefined) throw new Error("Canonical workspace repository has no head.");
       requireOid(liveHead, "Canonical workspace head");
       const baselineHead = existing?.baseline_head ?? liveHead;
       const repositoryName = existing?.repository_name ??
         await this.#forkRepositoryName(chatId, epoch);
-      const sandboxId = existing?.sandbox_id ?? `workspace-chat-${await sha256Hex(repositoryName)}`;
+      const sandboxId = existing?.sandbox_id ?? await workspaceSandboxId("chat", repositoryName);
 
       if (!existing) {
         this.#state.storage.sql.exec(`
@@ -1157,6 +1272,7 @@ export class WorkspaceArtifactLifecycle {
       }
 
       let initialToken: string | undefined;
+      let metadata: WorkspaceArtifactRepoMetadata;
       try {
         const canonical = await this.#getReadyRepository(canonicalRow.repository_name);
         const forked = await canonical.fork(repositoryName, {
@@ -1165,13 +1281,15 @@ export class WorkspaceArtifactLifecycle {
           defaultBranchOnly: true,
         });
         initialToken = forked.token;
+        metadata = parseRepositoryMetadata(forked, repositoryName);
       } catch (error) {
         if (!isArtifactsError(error, "ALREADY_EXISTS")) throw error;
+        metadata = await this.#reader.getRepositoryMetadata(repositoryName);
       }
 
       const repo = await this.#getReadyRepository(repositoryName);
       if (initialToken !== undefined) await this.#revokeToken(repo, initialToken);
-      const forkHead = await this.#reader.getHead(repositoryName);
+      const forkHead = await this.#reader.getHead(repositoryName, metadata.defaultBranch);
       if (forkHead === undefined) throw new Error("Chat fork has no head.");
       requireOid(forkHead, "Chat fork head");
       if (forkHead !== baselineHead) {
@@ -1182,7 +1300,7 @@ export class WorkspaceArtifactLifecycle {
         UPDATE workspace_artifact_forks
         SET remote = ?, default_branch = ?, baseline_head = ?, latest_head = ?, state = 'open'
         WHERE chat_id = ? AND epoch = ? AND state = 'creating'
-      `, repo.remote, repo.defaultBranch, baselineHead, forkHead, chatId, epoch);
+      `, metadata.remote, metadata.defaultBranch, baselineHead, forkHead, chatId, epoch);
       const ready = this.#forkRow(chatId, epoch);
       if (!ready || ready.state !== "open") throw new Error("Chat fork did not become ready.");
       return forkFromRow(ready);
@@ -1204,7 +1322,7 @@ export class WorkspaceArtifactLifecycle {
       try {
         await this.#gitRuntime.prepareChat({
           sandboxId: row.sandbox_id,
-          remote: repo.remote,
+          remote: row.remote,
           token: token.plaintext,
           expectedHead: row.latest_head,
         });
@@ -1232,9 +1350,9 @@ export class WorkspaceArtifactLifecycle {
       try {
         head = requireOid(await this.#gitRuntime.checkpointChat({
           sandboxId: row.sandbox_id,
-          remote: repo.remote,
+          remote: row.remote,
           token: token.plaintext,
-          defaultBranch: repo.defaultBranch,
+          defaultBranch: row.default_branch,
           expectedHead: row.latest_head,
           actor,
           message,
@@ -1273,9 +1391,9 @@ export class WorkspaceArtifactLifecycle {
       try {
         head = requireOid(await this.#gitRuntime.stageChatMutation({
           sandboxId: row.sandbox_id,
-          remote: repo.remote,
+          remote: row.remote,
           token: token.plaintext,
-          defaultBranch: repo.defaultBranch,
+          defaultBranch: row.default_branch,
           expectedHead: row.latest_head,
           actor,
           message,
@@ -1303,7 +1421,10 @@ export class WorkspaceArtifactLifecycle {
       if (!canonicalRow) throw new Error("Canonical workspace repository is not initialized.");
       const row = this.#forkRow(chatId, epoch);
       if (!row) {
-        const head = await this.#reader.getHead(canonicalRow.repository_name);
+        const head = await this.#reader.getHead(
+          canonicalRow.repository_name,
+          canonicalRow.default_branch,
+        );
         if (head === undefined) throw new Error("Canonical workspace repository has no head.");
         return { status: "merged", head: requireOid(head, "Canonical workspace head") };
       }
@@ -1312,7 +1433,10 @@ export class WorkspaceArtifactLifecycle {
         throw new Error(`Chat fork ${chatId}/${epoch} is ${row.state}.`);
       }
 
-      const currentHead = await this.#reader.getHead(canonicalRow.repository_name);
+      const currentHead = await this.#reader.getHead(
+        canonicalRow.repository_name,
+        canonicalRow.default_branch,
+      );
       if (currentHead === undefined) throw new Error("Canonical workspace repository has no head.");
       requireOid(currentHead, "Canonical workspace head");
       if (row.state === "accepting" && currentHead === row.latest_head) {
@@ -1339,7 +1463,7 @@ export class WorkspaceArtifactLifecycle {
         }
         return { status: "stale", expectedHead: row.baseline_head, currentHead };
       }
-      const forkHead = await this.#reader.getHead(row.repository_name);
+      const forkHead = await this.#reader.getHead(row.repository_name, row.default_branch);
       if (forkHead === undefined) throw new Error("Chat fork has no head.");
       requireOid(forkHead, "Chat fork head");
       await this.#reader.listFiles(row.repository_name, forkHead);
@@ -1362,17 +1486,20 @@ export class WorkspaceArtifactLifecycle {
       try {
         try {
           acceptedHead = requireOid(await this.#gitRuntime.promote({
-            canonicalRepositoryName: canonical.name,
-            canonicalRemote: canonical.remote,
+            canonicalRepositoryName: canonicalRow.repository_name,
+            canonicalRemote: canonicalRow.remote,
             canonicalToken: canonicalToken.plaintext,
-            forkRepositoryName: fork.name,
-            forkRemote: fork.remote,
+            forkRepositoryName: row.repository_name,
+            forkRemote: row.remote,
             forkToken: forkToken.plaintext,
             expectedCanonicalHead: row.baseline_head,
-            canonicalDefaultBranch: canonical.defaultBranch,
+            canonicalDefaultBranch: canonicalRow.default_branch,
           }), "Accepted workspace head");
         } catch (error) {
-          const recoveredHead = await this.#reader.getHead(canonicalRow.repository_name);
+          const recoveredHead = await this.#reader.getHead(
+            canonicalRow.repository_name,
+            canonicalRow.default_branch,
+          );
           if (recoveredHead === forkHead) {
             acceptedHead = forkHead;
           } else if (recoveredHead !== undefined && recoveredHead !== row.baseline_head) {
@@ -1479,8 +1606,27 @@ export class WorkspaceArtifactLifecycle {
 const workspaceGadgetRoot = ".workspace/gadgets";
 const maximumGadgetSnapshotBytes = 16 * 1024 * 1024;
 
+/** Artifacts lifecycle operations required by gadget code storage. */
+export interface WorkspaceArtifactCodeLifecycle {
+  ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical>;
+  getCanonical(): Promise<WorkspaceArtifactCanonical | undefined>;
+  readCommitLog(oid: string, options?: { depth?: number }): Promise<CommitInfo[]>;
+  getHistory(limit?: number): Promise<CommitInfo[]>;
+  getForkStatus(chatId: string, epoch: number): Promise<WorkspaceArtifactForkStatus | undefined>;
+  stageChatMutation(
+    chatId: string,
+    epoch: number,
+    actor: WorkspaceActor,
+    message: string,
+    mutation: WorkspaceArtifactMutation,
+  ): Promise<WorkspaceArtifactChatFork>;
+  acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult>;
+  completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void>;
+  discardChatFork(chatId: string, epoch: number): Promise<void>;
+}
+
 export interface ArtifactsWorkspaceRepositoryOptions {
-  lifecycle: WorkspaceArtifactLifecycle;
+  lifecycle: WorkspaceArtifactCodeLifecycle;
   reader: WorkspaceArtifactReader;
 }
 
@@ -1549,7 +1695,7 @@ export function createWorkspaceArtifactServices(
 
 /** Maps workspace-level Artifacts revisions to the gadget source subtrees they contain. */
 export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
-  readonly #lifecycle: WorkspaceArtifactLifecycle;
+  readonly #lifecycle: WorkspaceArtifactCodeLifecycle;
   readonly #reader: WorkspaceArtifactReader;
 
   constructor(options: ArtifactsWorkspaceRepositoryOptions) {

@@ -45,6 +45,7 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
   readonly completed: Array<{chatId: string; epoch: number; head: string}> = [];
   readonly discarded: Array<{chatId: string; epoch: number}> = [];
   failNextAcceptAfterPromotion = false;
+  staleNextAccept = false;
   failNextCompletion = false;
   failNextStage = false;
   readonly #gitStore: GitStore;
@@ -159,6 +160,14 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
     this.accepted.push({ chatId, epoch });
     const head = this.#forkHeads.get(`${chatId}:${epoch}`);
     if (head === undefined) throw new Error("Test chat fork is missing.");
+    if (this.staleNextAccept) {
+      this.staleNextAccept = false;
+      return Promise.resolve({
+        status: "stale",
+        expectedHead: "0".repeat(40),
+        currentHead: "f".repeat(40),
+      });
+    }
     if (this.failNextAcceptAfterPromotion) {
       this.failNextAcceptAfterPromotion = false;
       throw new Error("accept response lost");
@@ -604,6 +613,113 @@ describe("submitCodeChange dedupe", () => {
     expect(liveRows(impl, 1)).toHaveLength(1);
     expect(await gadgetContent(impl, 1, 1)).toEqual({ "a.txt": "one\nedited\n" });
   }));
+});
+
+describe("chat workspace files", () => {
+  it("marks a successful agent workspace mutation as pending", () => withImpl(async impl => {
+    addChat(impl, 1);
+    impl.workspaceRepository.runChatOperation = () => Promise.resolve({
+      kind: "mkdir",
+      head: "a".repeat(40),
+      path: "notes",
+      changed: true,
+      nodeId: "00000000-0000-4000-8000-000000000401",
+    });
+
+    await impl.runWorkspaceFileOperation(
+      1,
+      "tool-workspace",
+      AGENT,
+      { kind: "mkdir", path: "notes" },
+    );
+
+    expect(impl.storage.chatMeta.get(1)).toMatchObject({
+      hasWorkspaceFileChanges: true,
+      hasProposedChanges: true,
+    });
+  }));
+
+  it("accepts a workspace-only fork and clears the pending projection", () =>
+    withImpl(async impl => {
+      addChat(impl, 1);
+      impl.storage.chats.put({
+        chatId: 1,
+        sequence: impl.nextChatSequence(1),
+        timestamp: impl.getChatTimestamp(),
+        author: AGENT,
+        type: "message",
+        message: "Updated workspace files.",
+      });
+      const meta = impl.storage.chatMeta.get(1)!;
+      meta.hasWorkspaceFileChanges = true;
+      meta.hasProposedChanges = true;
+      impl.storage.chatMeta.put(meta);
+      impl.workspaceRepository.hasChatFileChanges = () => Promise.resolve(true);
+
+      expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
+          .toEqual({ outcome: "merged" });
+
+      const messages = chatMessages(impl, 1);
+      expect(messages.at(-1)).toMatchObject({ type: "merge", commits: [] });
+      expect(impl.storage.chatMeta.get(1).hasWorkspaceFileChanges).toBeUndefined();
+      expect(impl.storage.chatMeta.get(1).hasProposedChanges).toBeUndefined();
+    }));
+
+  it("keeps a stale workspace-only fork for explicit discard or retry", () =>
+    withImpl(async impl => {
+      addChat(impl, 1);
+      impl.storage.chats.put({
+        chatId: 1,
+        sequence: impl.nextChatSequence(1),
+        timestamp: impl.getChatTimestamp(),
+        author: AGENT,
+        type: "message",
+        message: "Updated workspace files.",
+      });
+      const meta = impl.storage.chatMeta.get(1)!;
+      meta.hasWorkspaceFileChanges = true;
+      meta.hasProposedChanges = true;
+      impl.storage.chatMeta.put(meta);
+      impl.workspaceRepository.hasChatFileChanges = () => Promise.resolve(true);
+      const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+      repository.staleNextAccept = true;
+
+      expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
+          .toEqual({ outcome: "stale" });
+
+      expect(repository.discarded).toEqual([]);
+      expect(impl.storage.chatMeta.get(1)).toMatchObject({
+        hasWorkspaceFileChanges: true,
+        hasProposedChanges: true,
+      });
+    }));
+
+  it("rejects partial discard and allows discard-all for workspace files", () =>
+    withImpl(async impl => {
+      addChat(impl, 1);
+      impl.storage.chats.put({
+        chatId: 1,
+        sequence: impl.nextChatSequence(1),
+        timestamp: impl.getChatTimestamp(),
+        author: AGENT,
+        type: "message",
+        message: "Updated workspace files.",
+      });
+      const meta = impl.storage.chatMeta.get(1)!;
+      meta.hasWorkspaceFileChanges = true;
+      meta.hasProposedChanges = true;
+      impl.storage.chatMeta.put(meta);
+      impl.workspaceRepository.hasChatFileChanges = () => Promise.resolve(true);
+
+      await expect(impl.revertChanges(1, 1, USER))
+          .rejects.toThrow(/only be discarded together/);
+      await impl.revertChanges(1, 0, USER);
+
+      const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+      expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+      expect(impl.storage.chatMeta.get(1).hasWorkspaceFileChanges).toBeUndefined();
+      expect(impl.storage.chatMeta.get(1).hasProposedChanges).toBeUndefined();
+    }));
 });
 
 describe("mergeChanges", () => {

@@ -20,10 +20,14 @@ import {
 import {
   digestRequest,
   digestStagedRequest,
+  digestBytes,
   expectedError,
   isWorkspaceUuid,
+  recoveryTrailers,
+  requireActor,
   requireRequest,
   requireStagedRequest,
+  requireTimestamp,
   type StagedWorkspaceMutationRequest,
   type WorkspaceActor,
   type WorkspaceMutation,
@@ -65,6 +69,18 @@ interface OperationRow {
   operation_timestamp: string;
 }
 
+interface WorkspaceReadRevision {
+  repositoryName: string;
+  head: string;
+  baselineHead: string;
+  index: WorkspaceIndexV1;
+}
+
+interface PlannedChatMutation {
+  result: Extract<ChatWorkspaceOperationResult, { changed: boolean }>;
+  mutation?: WorkspaceArtifactMutation;
+}
+
 /** The lifecycle methods required by the Artifacts-backed file facade. */
 export type ArtifactsWorkspaceFileLifecycle = Pick<WorkspaceArtifactLifecycle,
   | "ensureCanonical"
@@ -76,6 +92,7 @@ export type ArtifactsWorkspaceFileLifecycle = Pick<WorkspaceArtifactLifecycle,
   | "discardChatFork"
   | "readCommitLog"
   | "getHistory"
+  | "readChatCommitLog"
   | "deleteWorkspaceRepositories"
 >;
 
@@ -114,7 +131,49 @@ export interface WorkspaceFileRepository {
   cleanupExpiredUploads(now?: number): Promise<number>;
   deleteAllWorkspaceFiles(): Promise<void>;
   applyStaged(request: StagedWorkspaceMutationRequest): Promise<WorkspaceMutationResult>;
+  hasChatFileChanges(chatId: string, epoch: number): Promise<boolean>;
+  runChatOperation(request: ChatWorkspaceOperationRequest): Promise<ChatWorkspaceOperationResult>;
 }
+
+export type ChatWorkspaceOperation =
+  | { kind: "list"; path: string }
+  | { kind: "read"; path: string }
+  | { kind: "write"; path: string; content: string; mediaType?: string }
+  | { kind: "mkdir"; path: string }
+  | { kind: "move"; path: string; destination: string }
+  | { kind: "delete"; path: string; recursive?: boolean };
+
+export interface ChatWorkspaceOperationRequest {
+  chatId: string;
+  epoch: number;
+  operationId: string;
+  actor: WorkspaceActor;
+  timestamp: string;
+  operation: ChatWorkspaceOperation;
+}
+
+export type ChatWorkspaceOperationResult =
+  | {
+      kind: "list";
+      head: string;
+      path: string;
+      entries: WorkspaceRepositoryNode[];
+    }
+  | {
+      kind: "read";
+      head: string;
+      path: string;
+      node: WorkspaceRepositoryNode;
+      content: string;
+    }
+  | {
+      kind: "write" | "mkdir" | "move" | "delete";
+      head: string;
+      path: string;
+      changed: boolean;
+      nodeId?: string;
+      node?: WorkspaceRepositoryNode;
+    };
 
 export type ArtifactsWorkspaceFilesFactory = (
   options: CreateArtifactsWorkspaceFilesOptions,
@@ -257,6 +316,112 @@ function createIds(request: WorkspaceMutationRequest | StagedWorkspaceMutationRe
   return created;
 }
 
+function requireChatOperationIdentity(request: ChatWorkspaceOperationRequest): void {
+  if (!request.chatId || new TextEncoder().encode(request.chatId).byteLength > 256 ||
+      !Number.isSafeInteger(request.epoch) || request.epoch < 0 || request.epoch > 1_000_000_000) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Chat workspace identity is invalid.");
+  }
+  if (!request.operationId ||
+      new TextEncoder().encode(request.operationId).byteLength > 256 ||
+      /\p{Cc}/u.test(request.operationId)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Chat workspace operation IDs must contain 1 to 256 printable UTF-8 bytes.",
+    );
+  }
+  requireActor(request.actor);
+  requireTimestamp(request.timestamp);
+}
+
+function normalizeChatPath(value: string): string {
+  if (typeof value !== "string" || value !== value.normalize("NFC") || /\p{Cc}/u.test(value)) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace paths are invalid.");
+  }
+  if (value === "" || value === "/") return "";
+  const path = value.startsWith("/") ? value.slice(1) : value;
+  if (!path || path.endsWith("/") || path.includes("\\")) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace paths are invalid.");
+  }
+  const segments = path.split("/");
+  if (segments.some(segment => !segment || segment === "." || segment === "..")) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace paths are invalid.");
+  }
+  return path;
+}
+
+function nodeAtPath(index: WorkspaceIndexV1, path: string): WorkspaceRepositoryNode | undefined {
+  if (path === "") return getWorkspaceNode(index, index.rootId);
+  for (const nodeId of Object.keys(index.nodes)) {
+    const node = getWorkspaceNode(index, nodeId);
+    if (node?.path === path) return node;
+  }
+  return undefined;
+}
+
+function requireNodeAtPath(index: WorkspaceIndexV1, path: string): WorkspaceRepositoryNode {
+  const node = nodeAtPath(index, path);
+  if (!node) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      `Workspace path ${JSON.stringify(path || "/")} does not exist.`,
+    );
+  }
+  return node;
+}
+
+function splitWorkspacePath(path: string): { parentPath: string; name: string } {
+  if (!path) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "The workspace root cannot be changed.");
+  }
+  const separator = path.lastIndexOf("/");
+  return separator === -1
+    ? { parentPath: "", name: path }
+    : { parentPath: path.slice(0, separator), name: path.slice(separator + 1) };
+}
+
+async function digestChatOperation(request: ChatWorkspaceOperationRequest): Promise<string> {
+  const operation = request.operation.kind === "write"
+    ? {
+        ...request.operation,
+        content: undefined,
+        contentSha256: await digestBytes(new TextEncoder().encode(request.operation.content)),
+      }
+    : request.operation;
+  return digestBytes(new TextEncoder().encode(JSON.stringify({
+    chatId: request.chatId,
+    epoch: request.epoch,
+    operationId: request.operationId,
+    actorId: request.actor.id,
+    operation,
+  })));
+}
+
+function commitHasRecoveryTrailers(
+  commit: CommitInfo,
+  operationId: string,
+  requestDigest: string,
+): boolean {
+  return commit.message.includes(recoveryTrailers(operationId, requestDigest));
+}
+
+function commitHasOperationId(commit: CommitInfo, operationId: string): boolean {
+  return commit.message.split("\n").includes(`Workspace-Operation: ${operationId}`);
+}
+
+function workspaceUuidFromDigest(digest: string): string {
+  const value = digest.slice(0, 32).split("");
+  value[12] = "4";
+  value[16] = ((Number.parseInt(value[16] ?? "0", 16) & 0x3) | 0x8).toString(16);
+  const hex = value.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-` +
+    `${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function commitsAfterBaseline(commits: CommitInfo[], baselineHead: string): CommitInfo[] {
+  const baselineIndex = commits.findIndex(commit => commit.oid === baselineHead);
+  return baselineIndex === -1 ? commits : commits.slice(0, baselineIndex);
+}
+
 export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   readonly #state: DurableObjectState;
   readonly #lifecycle: ArtifactsWorkspaceFileLifecycle;
@@ -367,6 +532,175 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       canonical.head,
       WORKSPACE_INDEX_PATH,
     ));
+  }
+
+  async #readChatRevision(chatId: string, epoch: number): Promise<WorkspaceReadRevision> {
+    const fork = await this.#lifecycle.getForkStatus(chatId, epoch);
+    if (fork !== undefined) {
+      if (fork.state !== "open") {
+        throw new Error(`Chat workspace fork ${chatId}/${epoch} is ${fork.state}.`);
+      }
+      return {
+        repositoryName: fork.repositoryName,
+        head: fork.latestHead,
+        baselineHead: fork.baselineHead,
+        index: parseWorkspaceIndex(await this.#reader.readFile(
+          fork.repositoryName,
+          fork.latestHead,
+          WORKSPACE_INDEX_PATH,
+        )),
+      };
+    }
+    const canonical = await this.#canonical();
+    return {
+      repositoryName: canonical.repositoryName,
+      head: canonical.head,
+      baselineHead: canonical.head,
+      index: await this.#readIndex(canonical),
+    };
+  }
+
+  async #planChatMutation(
+    request: ChatWorkspaceOperationRequest,
+    revision: WorkspaceReadRevision,
+    createdNodeId: string,
+  ): Promise<PlannedChatMutation> {
+    const operation = request.operation;
+    if (operation.kind === "list" || operation.kind === "read") {
+      throw new Error("Read-only workspace operations cannot be planned as mutations.");
+    }
+    const path = normalizeChatPath(operation.kind === "move"
+      ? operation.destination
+      : operation.path);
+    const sourcePath = normalizeChatPath(operation.path);
+    const existing = nodeAtPath(revision.index, sourcePath);
+    let changes: WorkspaceMutation[];
+    let nodeId: string | undefined;
+
+    if (operation.kind === "mkdir") {
+      if (existing !== undefined) {
+        if (existing.kind !== "folder") {
+          expectedError(
+            WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+            `Workspace path ${JSON.stringify(sourcePath)} is not a folder.`,
+          );
+        }
+        return {
+          result: {
+            kind: "mkdir",
+            head: revision.head,
+            path: sourcePath,
+            changed: false,
+            nodeId: existing.id,
+          },
+        };
+      }
+      const target = splitWorkspacePath(sourcePath);
+      const parent = requireNodeAtPath(revision.index, target.parentPath);
+      if (parent.kind !== "folder") {
+        expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace parent is not a folder.");
+      }
+      nodeId = createdNodeId;
+      changes = [{
+        kind: "createFolder",
+        clientId: "target",
+        parent: { nodeId: parent.id },
+        name: target.name,
+      }];
+    } else if (operation.kind === "write") {
+      const content = new TextEncoder().encode(operation.content);
+      if (existing !== undefined) {
+        if (existing.kind !== "file") {
+          expectedError(
+            WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+            `Workspace path ${JSON.stringify(sourcePath)} is not a file.`,
+          );
+        }
+        const mediaType = operation.mediaType ?? existing.mediaType;
+        const current = await this.#reader.readFile(
+          revision.repositoryName,
+          revision.head,
+          existing.path,
+        );
+        if (current.byteLength === content.byteLength &&
+            current.every((byte, index) => byte === content[index]) &&
+            mediaType === existing.mediaType) {
+          return {
+            result: {
+              kind: "write",
+              head: revision.head,
+              path: sourcePath,
+              changed: false,
+              nodeId: existing.id,
+            },
+          };
+        }
+        nodeId = existing.id;
+        changes = [{ kind: "replaceFile", nodeId: existing.id, content, mediaType }];
+      } else {
+        const target = splitWorkspacePath(sourcePath);
+        const parent = requireNodeAtPath(revision.index, target.parentPath);
+        if (parent.kind !== "folder") {
+          expectedError(
+            WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+            "Workspace parent is not a folder.",
+          );
+        }
+        nodeId = createdNodeId;
+        changes = [{
+          kind: "createFile",
+          clientId: "target",
+          parent: { nodeId: parent.id },
+          name: target.name,
+          content,
+          ...(operation.mediaType === undefined ? {} : { mediaType: operation.mediaType }),
+        }];
+      }
+    } else if (operation.kind === "move") {
+      const node = requireNodeAtPath(revision.index, sourcePath);
+      if (sourcePath === path) {
+        return {
+          result: {
+            kind: "move",
+            head: revision.head,
+            path,
+            changed: false,
+            nodeId: node.id,
+          },
+        };
+      }
+      const target = splitWorkspacePath(path);
+      const parent = requireNodeAtPath(revision.index, target.parentPath);
+      if (parent.kind !== "folder") {
+        expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace parent is not a folder.");
+      }
+      nodeId = node.id;
+      changes = [{ kind: "move", nodeId: node.id, parent: { nodeId: parent.id }, name: target.name }];
+    } else {
+      const node = requireNodeAtPath(revision.index, sourcePath);
+      nodeId = node.id;
+      changes = [{ kind: "delete", nodeId: node.id, recursive: operation.recursive ?? false }];
+    }
+
+    if (!nodeId) throw new Error("Chat workspace mutation has no stable node ID.");
+    const plan = await this.#plan({
+      operationId: request.operationId,
+      expectedHead: revision.head,
+      actor: request.actor,
+      timestamp: request.timestamp,
+      message: `Workspace ${operation.kind}: ${sourcePath}`,
+      changes,
+    }, revision.index, { target: nodeId });
+    return {
+      result: {
+        kind: operation.kind,
+        head: revision.head,
+        path,
+        changed: true,
+        nodeId,
+      },
+      mutation: plan.mutation,
+    };
   }
 
   async #resolveStagedChanges(
@@ -687,6 +1021,103 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
 
   async readFileStream(nodeId: string): Promise<ReadableStream<Uint8Array>> {
     return byteStream(await this.readFile(nodeId));
+  }
+
+  hasChatFileChanges(chatId: string, epoch: number): Promise<boolean> {
+    return this.#withLock(async () => {
+      const fork = await this.#lifecycle.getForkStatus(chatId, epoch);
+      if (fork?.state !== "open" || fork.latestHead === fork.baselineHead) return false;
+      const commits = commitsAfterBaseline(await this.#lifecycle.readChatCommitLog(
+        chatId,
+        epoch,
+        fork.latestHead,
+        { depth: maximumHistoryDepth },
+      ), fork.baselineHead);
+      return commits.some(commit => commit.message.split("\n")
+        .some(line => line.startsWith("Workspace-Operation: ")));
+    });
+  }
+
+  runChatOperation(request: ChatWorkspaceOperationRequest): Promise<ChatWorkspaceOperationResult> {
+    requireChatOperationIdentity(request);
+    return this.#withLock(async () => {
+      const path = normalizeChatPath(request.operation.path);
+      if (request.operation.kind === "list") {
+        const revision = await this.#readChatRevision(request.chatId, request.epoch);
+        const folder = requireNodeAtPath(revision.index, path);
+        if (folder.kind !== "folder") {
+          expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace path is not a folder.");
+        }
+        return {
+          kind: "list",
+          head: revision.head,
+          path,
+          entries: listWorkspaceChildren(revision.index, folder.id),
+        };
+      }
+      if (request.operation.kind === "read") {
+        const revision = await this.#readChatRevision(request.chatId, request.epoch);
+        const node = requireNodeAtPath(revision.index, path);
+        if (node.kind !== "file") {
+          expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, "Workspace path is not a file.");
+        }
+        const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+          await this.#reader.readFile(revision.repositoryName, revision.head, node.path),
+        );
+        return { kind: "read", head: revision.head, path, node, content };
+      }
+
+      const digest = await digestChatOperation(request);
+      const revision = await this.#readChatRevision(request.chatId, request.epoch);
+      if (revision.head !== revision.baselineHead) {
+        const commits = commitsAfterBaseline(await this.#lifecycle.readChatCommitLog(
+          request.chatId,
+          request.epoch,
+          revision.head,
+          { depth: maximumHistoryDepth },
+        ), revision.baselineHead);
+        const prior = commits.find(commit => commitHasOperationId(commit, request.operationId));
+        if (prior !== undefined) {
+          if (!commitHasRecoveryTrailers(prior, request.operationId, digest)) {
+            expectedError(
+              WORKSPACE_FILE_ERROR_CODES.operationReused,
+              `Chat workspace operation ${request.operationId} was reused with different input.`,
+            );
+          }
+          const resultPath = normalizeChatPath(request.operation.kind === "move"
+            ? request.operation.destination
+            : request.operation.path);
+          const node = request.operation.kind === "delete"
+            ? undefined
+            : nodeAtPath(revision.index, resultPath);
+          return {
+            kind: request.operation.kind,
+            head: prior.oid,
+            path: resultPath,
+            changed: true,
+            ...(node === undefined ? {} : { nodeId: node.id }),
+          };
+        }
+      }
+
+      const plan = await this.#planChatMutation(
+        request,
+        revision,
+        workspaceUuidFromDigest(digest),
+      );
+      if (plan.mutation === undefined) return plan.result;
+
+      const message = `Workspace ${request.operation.kind}: ${path}\n\n` +
+        recoveryTrailers(request.operationId, digest);
+      const staged = await this.#lifecycle.stageChatMutation(
+        request.chatId,
+        request.epoch,
+        request.actor,
+        message,
+        plan.mutation,
+      );
+      return { ...plan.result, head: staged.latestHead };
+    });
   }
 
   getHistory(limit = 50): Promise<CommitInfo[]> {

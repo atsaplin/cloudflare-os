@@ -43,6 +43,7 @@ import {
   WarningCircle,
   Code,
   File as FileIcon,
+  FolderOpen,
   PencilSimple,
   Brain,
   ShieldCheck,
@@ -714,6 +715,7 @@ function formatGadgetBindingTarget(
 // re-derived from the blueprint, so any blueprint declaring a format counts, not just promoted
 // ones. Undefined for a plain gadget, a still-streaming call, or a log predating formats.
 type ToolOutputResolver = (tc: AiToolCall) => BlueprintOutput | undefined;
+type WorkspaceFilesToolCall = Extract<AiToolCall, { toolName: "workspaceFiles" }>;
 
 export function resolveToolCallOutput(
   tc: AiToolCall,
@@ -724,11 +726,29 @@ export function resolveToolCallOutput(
   return typeof gadgetId === "number" ? outputOfWorkpiece(gadgetId) : undefined;
 }
 
-function getToolCallSummary(
+export function getToolCallSummary(
   tc: AiToolCall,
   outputOf?: ToolOutputResolver,
 ): { verb: string; target?: string } {
   switch (tc.toolName) {
+    case "workspaceFiles":
+      switch (tc.input.action) {
+        case "list":
+          return { verb: "Listed", target: tc.input.path ?? "/" };
+        case "read":
+          return { verb: "Read", target: tc.input.path };
+        case "write":
+          return { verb: "Wrote", target: tc.input.path };
+        case "mkdir":
+          return { verb: "Created folder", target: tc.input.path };
+        case "move":
+          return {
+            verb: "Moved",
+            target: `${tc.input.path} → ${tc.input.destination}`,
+          };
+        case "delete":
+          return { verb: "Deleted", target: tc.input.path };
+      }
     case "readFile":
       return { verb: "Read", target: tc.input.filename };
     case "writeFile":
@@ -839,8 +859,49 @@ function describeObservationCount(count: number): string {
   return count === 1 ? "Read 1 resource" : `${count} resource reads`;
 }
 
+function describeWorkspaceFileActionCount(
+  action: WorkspaceFilesToolCall["input"]["action"],
+  count: number,
+): string {
+  switch (action) {
+    case "list":
+      return `Listed ${pluralize(count, "workspace folder")}`;
+    case "read":
+      return `Read ${pluralize(count, "workspace file")}`;
+    case "write":
+      return `Wrote ${pluralize(count, "workspace file")}`;
+    case "mkdir":
+      return `Created ${pluralize(count, "workspace folder")}`;
+    case "move":
+      return `Moved ${pluralize(count, "workspace item")}`;
+    case "delete":
+      return `Deleted ${pluralize(count, "workspace item")}`;
+  }
+}
+
+function isWorkspaceFilesToolCall(tc: AiToolCall): tc is WorkspaceFilesToolCall {
+  return tc.toolName === "workspaceFiles";
+}
+
+function describeWorkspaceFileCallCount(calls: AiToolCall[]): string {
+  const workspaceCalls = calls.filter(isWorkspaceFilesToolCall);
+  const actions: WorkspaceFilesToolCall["input"]["action"][] = [
+    "list", "read", "write", "mkdir", "move", "delete",
+  ];
+  return actions
+    .map((action) => {
+      const count = workspaceCalls.filter((call) => call.input.action === action).length;
+      return count === 0 ? undefined : describeWorkspaceFileActionCount(action, count);
+    })
+    .filter((part): part is string => part !== undefined)
+    .map((part, index) => index === 0 ? part : lowerFirst(part))
+    .join(", ");
+}
+
 function describeToolCallCount(toolName: AiToolCall["toolName"], count: number): string {
   switch (toolName) {
+    case "workspaceFiles":
+      return `Worked with ${pluralize(count, "workspace operation")}`;
     case "readFile":
       return `Read ${pluralize(count, "file")}`;
     case "writeFile":
@@ -876,8 +937,8 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
   return _exhaustive;
 }
 
-// `output` names a format when the call is known to be producing one, so the row can use its icon.
-function getToolIcon(
+/** Returns the transcript icon for a tool call and optional output format. */
+export function getToolIcon(
   toolName: AiToolCall["toolName"] | null | undefined,
   output?: BlueprintOutput,
 ): PhosphorIcon {
@@ -886,6 +947,8 @@ function getToolIcon(
     case "readFile":
     case "writeFile":
       return FileIcon;
+    case "workspaceFiles":
+      return FolderOpen;
     case "editFile":
       return PencilSimple;
     case "executeCode":
@@ -911,8 +974,10 @@ function getToolIcon(
   }
 }
 
-function getProvisionalToolLabel(toolName: AiToolCall["toolName"] | null | undefined) {
+export function getProvisionalToolLabel(toolName: AiToolCall["toolName"] | null | undefined) {
   switch (toolName) {
+    case "workspaceFiles":
+      return "Working with workspace files";
     case "readFile":
       return "Reading file";
     case "writeFile":
@@ -949,6 +1014,7 @@ function getToolTarget(tc: AiToolCall): string | undefined {
 // Present-tense verb for an in-progress tool call.
 function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
   switch (toolName) {
+    case "workspaceFiles": return "Working with";
     case "readFile": return "Reading";
     case "writeFile": return "Writing";
     case "editFile": return "Editing";
@@ -969,10 +1035,11 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
   return _exhaustive;
 }
 
-// Present-tense, count-aware label mirroring describeToolCallCount (e.g. "Writing 5 files").
-function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: number): string {
+/** Returns a count-aware label for in-progress tool calls. */
+export function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: number): string {
   if (count <= 1) return getProvisionalToolLabel(toolName);
   switch (toolName) {
+    case "workspaceFiles": return `Working with ${pluralize(count, "workspace operation")}`;
     case "readFile": return `Reading ${pluralize(count, "file")}`;
     case "writeFile": return `Writing ${pluralize(count, "file")}`;
     case "editFile": return `Making ${count} edits`;
@@ -993,8 +1060,8 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
   return _exhaustive;
 }
 
-// Builds the label + detail lines for the in-progress tool-call row.
-function buildProvisionalToolSummary(
+/** Builds the in-progress tool-call label and detail lines. */
+export function buildProvisionalToolSummary(
   calls: ProvisionalToolCallState[],
 ): { label: string; detailLines: string[] } {
 
@@ -1041,7 +1108,7 @@ function buildProvisionalToolSummary(
   return { label, detailLines };
 }
 
-function buildToolCallGroups(
+export function buildToolCallGroups(
   toolCalls: AiToolCall[],
   observations: ObservationChatMessage[] = [],
   outputOf?: ToolOutputResolver,
@@ -1063,12 +1130,19 @@ function buildToolCallGroups(
     labelParts.push(`${summary.verb}${summary.target ? ` ${summary.target}` : ""}`);
   } else if (toolCalls.length > 1 && distinctToolNames.length === 1) {
     const summary = getToolCallSummary(toolCalls[0], outputOf);
-    labelParts.push(detailLines.length === 1 && summary.target && observations.length === 0
-      ? `${summary.verb} ${summary.target}`
-      : describeToolCallCount(toolCalls[0].toolName, toolCalls.length));
+    if (toolCalls[0].toolName === "workspaceFiles") {
+      labelParts.push(describeWorkspaceFileCallCount(toolCalls));
+    } else {
+      labelParts.push(detailLines.length === 1 && summary.target && observations.length === 0
+        ? `${summary.verb} ${summary.target}`
+        : describeToolCallCount(toolCalls[0].toolName, toolCalls.length));
+    }
   } else if (toolCalls.length > 1 && distinctToolNames.length <= 3) {
     labelParts.push(...distinctToolNames.map((toolName) => {
       const count = toolCalls.filter((tc) => tc.toolName === toolName).length;
+      if (toolName === "workspaceFiles") {
+        return describeWorkspaceFileCallCount(toolCalls);
+      }
       return describeToolCallCount(toolName, count);
     }));
   } else if (toolCalls.length > 0) {

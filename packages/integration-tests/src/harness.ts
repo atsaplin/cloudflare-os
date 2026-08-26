@@ -42,6 +42,7 @@ const WORKER_CONFIG = z.looseObject({
     service: z.string(),
     entrypoint: z.string().optional(),
   })).optional(),
+  containers: z.array(z.looseObject({ image: z.string() })).optional(),
   vars: z.record(z.string(), z.unknown()).optional(),
   worker_loaders: z.unknown().optional(),
 });
@@ -76,6 +77,10 @@ function readWorkerConfig(dir: string): WorkerConfig {
   const config = parsed.data;
   config.build = { ...config.build, cwd: dir };
   config.main = join(dir, config.main);
+  config.containers = config.containers?.map(container => ({
+    ...container,
+    image: container.image.startsWith(".") ? resolve(dir, container.image) : container.image,
+  }));
   return config;
 }
 
@@ -83,6 +88,11 @@ function workshopConfig(
     gatekeepers: { binding: string; name: string }[],
     patch?: (config: WorkerConfig) => void): WorkerConfig {
   const config = readWorkerConfig(WORKSHOP_DIR);
+  config.build = { command: "pnpm run build:integration-worker", cwd: WORKSHOP_DIR };
+  config.main = resolve(
+    WORKSHOP_DIR,
+    ".wrangler/validate-integration/__integration__/server.ts",
+  );
 
   // The checked-in config declares no services; run-dev-server.ts adds one per gatekeeper. We add
   // only the ones the suite asked for, so buildGatekeeperVendorMap() discovers exactly those vendors
@@ -94,7 +104,13 @@ function workshopConfig(
   }));
 
   // No CF_ACCESS_AUD, so /api takes the unauthenticated path and password signup is available.
-  config.vars = { ...config.vars, ADMINS: [ADMIN_USERNAME] };
+  config.vars = {
+    ...config.vars,
+    ADMINS: [ADMIN_USERNAME],
+    ARTIFACTS_ACCOUNT_ID: "test-account",
+    ARTIFACTS_NAMESPACE: "test-namespace",
+    ARTIFACTS_API_TOKEN: "test-token",
+  };
 
   // Gadget code is never executed here (a gatekeeper is in observer scope purely by having a
   // vendorId), so drop the Worker Loader rather than requiring it to start.
