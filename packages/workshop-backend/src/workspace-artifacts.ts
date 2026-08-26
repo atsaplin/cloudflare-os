@@ -450,9 +450,6 @@ export interface WorkspaceArtifactMutation {
 
 /** Minimal Sandbox client used by trusted repository Git operations. */
 export interface WorkspaceArtifactSandbox {
-  registerGitAuthInterceptor(params: {
-    hosts: Record<string, { token: string; username: string; type: "basic" }>;
-  }): Promise<void>;
   exists(path: string): Promise<{ exists: boolean }>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
   exec(command: SandboxCommand, options?: ExecOptions): Promise<Pick<SandboxProcess, "output">>;
@@ -567,6 +564,19 @@ function artifactRemoteHost(remote: string): string {
   return url.hostname;
 }
 
+function artifactGitAuth(remote: string, token: string): Pick<ExecOptions, "env"> {
+  artifactRemoteHost(remote);
+  return {
+    env: {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.extraHeader",
+      GIT_CONFIG_VALUE_0: `Authorization: Bearer ${
+        requireConfigurationValue(token, "Artifacts Git token")
+      }`,
+    },
+  };
+}
+
 function requireBranch(value: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(value) || value.includes("..") ||
       value.includes("//") || value.includes("@{") || value.endsWith("/") ||
@@ -659,8 +669,12 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     this.#sandbox = sandbox;
   }
 
-  async #run(sandbox: WorkspaceArtifactSandbox, command: SandboxCommand): Promise<string> {
-    const process = await sandbox.exec(command, { timeout: 120_000 });
+  async #run(
+    sandbox: WorkspaceArtifactSandbox,
+    command: SandboxCommand,
+    options: ExecOptions = {},
+  ): Promise<string> {
+    const process = await sandbox.exec(command, { ...options, timeout: 120_000 });
     const output = await process.output({ encoding: "utf8", maxBytes: 256 * 1024 });
     if (output.timedOut) throw new Error("Workspace Git operation timed out.");
     if (output.truncated) throw new Error("Workspace Git operation output exceeded its bound.");
@@ -687,14 +701,8 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     );
     const directory = "/workspace/repo";
     try {
-      await sandbox.registerGitAuthInterceptor({
-        hosts: { [artifactRemoteHost(request.remote)]: {
-          token: request.token,
-          username: "x-access-token",
-          type: "basic",
-        } },
-      });
-      await this.#run(sandbox, ["git", "clone", request.remote, directory]);
+      const auth = artifactGitAuth(request.remote, request.token);
+      await this.#run(sandbox, ["git", "clone", request.remote, directory], auth);
       await this.#run(sandbox, ["mkdir", "-p", `${directory}/.workspace`]);
       await sandbox.writeFile(
         `${directory}/${WORKSPACE_INDEX_PATH}`,
@@ -709,7 +717,7 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
       ]);
       await this.#run(sandbox, [
         "git", "-C", directory, "push", request.remote, `HEAD:${request.defaultBranch}`,
-      ]);
+      ], auth);
       return requireOid(
         (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
         "Initialized workspace head",
@@ -738,14 +746,11 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     );
     const directory = "/workspace/repo";
     try {
-      await sandbox.registerGitAuthInterceptor({
-        hosts: { [artifactRemoteHost(request.forkRemote)]: {
-          token: request.forkToken,
-          username: "x-access-token",
-          type: "basic",
-        } },
-      });
-      await this.#run(sandbox, ["git", "clone", request.forkRemote, directory]);
+      await this.#run(
+        sandbox,
+        ["git", "clone", request.forkRemote, directory],
+        artifactGitAuth(request.forkRemote, request.forkToken),
+      );
       await this.#run(sandbox, [
         "git", "-C", directory, "merge-base", "--is-ancestor",
         requireOid(request.expectedCanonicalHead, "Expected canonical head"), "HEAD",
@@ -753,19 +758,12 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
       await this.#run(sandbox, [
         "git", "-C", directory, "remote", "set-url", "origin", request.canonicalRemote,
       ]);
-      await sandbox.registerGitAuthInterceptor({
-        hosts: { [artifactRemoteHost(request.canonicalRemote)]: {
-          token: request.canonicalToken,
-          username: "x-access-token",
-          type: "basic",
-        } },
-      });
       await this.#run(sandbox, [
         "git", "-C", directory, "push", "origin",
         `--force-with-lease=refs/heads/${request.canonicalDefaultBranch}:` +
           requireOid(request.expectedCanonicalHead, "Expected canonical head"),
         `HEAD:refs/heads/${request.canonicalDefaultBranch}`,
-      ]);
+      ], artifactGitAuth(request.canonicalRemote, request.canonicalToken));
       return requireOid(
         (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
         "Promoted workspace head",
@@ -785,14 +783,11 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     const sandbox = this.#sandbox(request.sandboxId);
     const directory = "/workspace/repo";
     if (!(await sandbox.exists(`${directory}/.git`)).exists) {
-      await sandbox.registerGitAuthInterceptor({
-        hosts: { [artifactRemoteHost(request.remote)]: {
-          token: request.token,
-          username: "x-access-token",
-          type: "basic",
-        } },
-      });
-      await this.#run(sandbox, ["git", "clone", request.remote, directory]);
+      await this.#run(
+        sandbox,
+        ["git", "clone", request.remote, directory],
+        artifactGitAuth(request.remote, request.token),
+      );
     }
     const head = requireOid(
       (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
@@ -838,18 +833,11 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     ]);
     const branch = requireBranch(request.defaultBranch);
     await this.#run(sandbox, ["git", "-C", directory, "remote", "set-url", "origin", request.remote]);
-    await sandbox.registerGitAuthInterceptor({
-      hosts: { [artifactRemoteHost(request.remote)]: {
-        token: request.token,
-        username: "x-access-token",
-        type: "basic",
-      } },
-    });
     await this.#run(sandbox, [
       "git", "-C", directory, "push", "origin",
       `--force-with-lease=refs/heads/${branch}:${expectedHead}`,
       `HEAD:refs/heads/${branch}`,
-    ]);
+    ], artifactGitAuth(request.remote, request.token));
     return requireOid(
       (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
       "Chat checkpoint head",
