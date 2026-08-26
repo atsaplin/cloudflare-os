@@ -318,6 +318,19 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("recovers the existing canonical repository after its Durable Object record is lost", async () => {
+    await withLifecycle("initialize-recovery", async (lifecycle, fixtures, state) => {
+      const first = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      state.storage.sql.exec("DELETE FROM workspace_artifact_repository WHERE singleton = 1");
+
+      const second = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+
+      expect(second).toEqual(first);
+      expect(fixtures.artifacts.repos.size).toBe(1);
+      expect(fixtures.runtime.initialized).toEqual([first.repositoryName]);
+    });
+  });
+
   it("creates one durable fork for a writable chat epoch", async () => {
     await withLifecycle("fork", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });

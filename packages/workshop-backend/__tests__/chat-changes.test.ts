@@ -47,6 +47,7 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
   failNextAcceptAfterPromotion = false;
   staleNextAccept = false;
   failNextCompletion = false;
+  failNextDiscard = false;
   failNextStage = false;
   readonly #gitStore: GitStore;
   readonly #gadgetHead: (gadgetId: number) => string | undefined;
@@ -187,6 +188,10 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
 
   discardChatFork(chatId: string, epoch: number): Promise<void> {
     this.discarded.push({ chatId, epoch });
+    if (this.failNextDiscard) {
+      this.failNextDiscard = false;
+      return Promise.reject(new Error("fork discard failed"));
+    }
     this.#forkHeads.delete(`${chatId}:${epoch}`);
     return Promise.resolve();
   }
@@ -215,6 +220,35 @@ async function withOverseer(
     );
     await fn(instance, impl);
   });
+}
+
+interface ReceiptCleanupCall {
+  chatId: string;
+  epoch: number;
+}
+
+interface ReceiptCleanupSpy {
+  calls: ReceiptCleanupCall[];
+  failNext: boolean;
+}
+
+function spyReceiptCleanup(impl: {
+  workspaceRepository: {
+    deleteChatOperationReceipts(chatId: string, epoch: number): Promise<void>;
+  };
+}): ReceiptCleanupSpy {
+  const spy: ReceiptCleanupSpy = { calls: [], failNext: false };
+  const repository = impl.workspaceRepository;
+  const deleteReceipts = repository.deleteChatOperationReceipts.bind(repository);
+  repository.deleteChatOperationReceipts = async (chatId: string, epoch: number) => {
+    spy.calls.push({ chatId, epoch });
+    if (spy.failNext) {
+      spy.failNext = false;
+      throw new Error("receipt cleanup failed");
+    }
+    await deleteReceipts(chatId, epoch);
+  };
+  return spy;
 }
 
 function blueprintArchive(files: Record<string, string>): Uint8Array {
@@ -641,6 +675,7 @@ describe("chat workspace files", () => {
 
   it("accepts a workspace-only fork and clears the pending projection", () =>
     withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
       addChat(impl, 1);
       impl.storage.chats.put({
         chatId: 1,
@@ -663,10 +698,12 @@ describe("chat workspace files", () => {
       expect(messages.at(-1)).toMatchObject({ type: "merge", commits: [] });
       expect(impl.storage.chatMeta.get(1).hasWorkspaceFileChanges).toBeUndefined();
       expect(impl.storage.chatMeta.get(1).hasProposedChanges).toBeUndefined();
+      expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
     }));
 
   it("keeps a stale workspace-only fork for explicit discard or retry", () =>
     withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
       addChat(impl, 1);
       impl.storage.chats.put({
         chatId: 1,
@@ -692,10 +729,12 @@ describe("chat workspace files", () => {
         hasWorkspaceFileChanges: true,
         hasProposedChanges: true,
       });
+      expect(receipts.calls).toEqual([]);
     }));
 
   it("rejects partial discard and allows discard-all for workspace files", () =>
     withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
       addChat(impl, 1);
       impl.storage.chats.put({
         chatId: 1,
@@ -717,6 +756,7 @@ describe("chat workspace files", () => {
 
       const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
       expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+      expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
       expect(impl.storage.chatMeta.get(1).hasWorkspaceFileChanges).toBeUndefined();
       expect(impl.storage.chatMeta.get(1).hasProposedChanges).toBeUndefined();
     }));
@@ -758,7 +798,36 @@ describe("mergeChanges", () => {
     expect(repository.completed).toEqual([{ chatId: "1", epoch: 0, head }]);
   }));
 
+  it("cleans receipts when a resumed accepted fork is stale and gets discarded", () =>
+    withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
+      const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+      addGadget(impl, 1, "APP", c1);
+      addChat(impl, 1);
+      await submit(impl, 1, {
+        generation: 0,
+        revision: 0,
+        clientId: "cli",
+        seq: 1,
+        pins: [{ gadgetId: 1, baseCommit: c1 }],
+        change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "accepted\n" }),
+      });
+      const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+      repository.failNextAcceptAfterPromotion = true;
+
+      await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+        .rejects.toThrow("accept response lost");
+      repository.staleNextAccept = true;
+
+      await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+        .resolves.toEqual({ outcome: "stale" });
+
+      expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+      expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
+    }));
+
   it("retries fork cleanup without recording a second merge", () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     const c1 = await commitFiles(impl, { "a.txt": "one\n" });
     addGadget(impl, 1, "APP", c1);
     addChat(impl, 1);
@@ -775,6 +844,7 @@ describe("mergeChanges", () => {
 
     await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
       .rejects.toThrow("fork cleanup failed");
+    expect(receipts.calls).toEqual([]);
     const acceptedHead = impl.storage.gadgets.get(1)!.commitId!;
     expect(chatMessages(impl, 1).filter(message => message.type === "merge")).toHaveLength(1);
     expect(impl.storage.chatArtifactAccepts.get(1)).toMatchObject({
@@ -792,6 +862,7 @@ describe("mergeChanges", () => {
 
     await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
       .resolves.toEqual({ outcome: "merged" });
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
     expect(chatMessages(impl, 1).filter(message => message.type === "merge")).toHaveLength(1);
     expect(repository.accepted).toHaveLength(1);
     expect(repository.completionAttempts).toEqual([
@@ -801,8 +872,51 @@ describe("mergeChanges", () => {
     expect(impl.storage.chatArtifactAccepts.get(1)).toBeUndefined();
   }));
 
+  it("retains finalized acceptance when receipt cleanup fails and retries it", () =>
+    withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
+      const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+      addGadget(impl, 1, "APP", c1);
+      addChat(impl, 1);
+      await submit(impl, 1, {
+        generation: 0,
+        revision: 0,
+        clientId: "cli",
+        seq: 1,
+        pins: [{ gadgetId: 1, baseCommit: c1 }],
+        change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "accepted\n" }),
+      });
+      const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+      receipts.failNext = true;
+
+      await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+        .rejects.toThrow("receipt cleanup failed");
+
+      const acceptedHead = impl.storage.gadgets.get(1)!.commitId!;
+      expect(impl.storage.chatArtifactAccepts.get(1)).toMatchObject({
+        state: "finalized",
+        acceptedHead,
+      });
+      expect(repository.accepted).toHaveLength(1);
+      expect(chatMessages(impl, 1).filter(message => message.type === "merge"))
+        .toHaveLength(1);
+
+      await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+        .resolves.toEqual({ outcome: "merged" });
+
+      expect(impl.storage.chatArtifactAccepts.get(1)).toBeUndefined();
+      expect(repository.accepted).toHaveLength(1);
+      expect(chatMessages(impl, 1).filter(message => message.type === "merge"))
+        .toHaveLength(1);
+      expect(receipts.calls).toEqual([
+        { chatId: "1", epoch: 0 },
+        { chatId: "1", epoch: 0 },
+      ]);
+    }));
+
   it("commits, fast-forwards, and closes the epoch content-preservingly",
       () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     addGadget(impl, 1, "APP", c1);
     addChat(impl, 1);
@@ -826,6 +940,7 @@ describe("mergeChanges", () => {
     expect(repository.staged).toEqual([{ chatId: "1", epoch: 0, gadgetIds: [1] }]);
     expect(repository.accepted).toEqual([{ chatId: "1", epoch: 0 }]);
     expect(repository.completed).toEqual([{ chatId: "1", epoch: 0, head }]);
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
 
     let merges = chatMessages(impl, 1).filter(msg => msg.type === "merge");
     expect(merges).toHaveLength(1);
@@ -873,6 +988,30 @@ describe("mergeChanges", () => {
     expect(impl.storage.gadgets.get(1)!.commitId).toBe(c2);
     expect(impl.storage.chatMeta.get(1)!.codeBase!.generation).toBe(0);
   }));
+
+  it("cleans receipts when an accepted fork is stale and gets discarded", () =>
+    withImpl(async impl => {
+      const receipts = spyReceiptCleanup(impl);
+      const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+      addGadget(impl, 1, "APP", c1);
+      addChat(impl, 1);
+      await submit(impl, 1, {
+        generation: 0,
+        revision: 0,
+        clientId: "cli",
+        seq: 1,
+        pins: [{ gadgetId: 1, baseCommit: c1 }],
+        change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "accepted\n" }),
+      });
+      const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+      repository.staleNextAccept = true;
+
+      await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+        .resolves.toEqual({ outcome: "stale" });
+
+      expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+      expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
+    }));
 
   it("gives up when a row lands during the accept's awaits, preserving it",
       () => withImpl(async impl => {
@@ -1251,6 +1390,7 @@ describe("straggler bridge", () => {
 
 describe("revert and draft discard", () => {
   it("discards the current fork before deleting chat state", () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     const c1 = await commitFiles(impl, { "a.txt": "one\n" });
     addGadget(impl, 1, "APP", c1);
     addChat(impl, 1);
@@ -1266,11 +1406,26 @@ describe("revert and draft discard", () => {
     await impl.prepareChatDeletion(1);
 
     expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
     expect(impl.storage.chatMeta.get(1)).toBeDefined();
+  }));
+
+  it("keeps receipts when chat-fork discard fails", () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    addChat(impl, 1);
+    repository.failNextDiscard = true;
+
+    await expect(impl.prepareChatDeletion(1)).rejects.toThrow("fork discard failed");
+    expect(receipts.calls).toEqual([]);
+
+    await impl.prepareChatDeletion(1);
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
   }));
 
   it("rolls back reverted pins, erases rows, and bumps the generation destructively",
       () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     addGadget(impl, 1, "APP", c1);
     addChat(impl, 1);
@@ -1298,10 +1453,12 @@ describe("revert and draft discard", () => {
 
     // The reverted declaration's base no longer applies during reconstruction.
     expect(await gadgetContent(impl, 1, 1)).toEqual({});
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
   }));
 
   it("discardChatDraftChanges drops unlogged pins but keeps declared ones",
       () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let d1 = await commitFiles(impl, { "b.txt": "bee\n" });
     addGadget(impl, 1, "APP", c1);
@@ -1329,6 +1486,7 @@ describe("revert and draft discard", () => {
     expect(codeBase).toMatchObject({ generation: 1, revision: 0 });
     expect(await gadgetContent(impl, 1, 1)).toEqual({ "a.txt": "xone\n" });
     expect(await gadgetContent(impl, 1, 2)).toEqual({});
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
   }));
 
   it("a revert that affects no materialized changes still discards live rows",
@@ -1456,6 +1614,7 @@ describe("revert and draft discard", () => {
 describe("updateChatFromMainline", () => {
   it("merges only pinned-and-behind gadgets as a change row, and its batch cannot be reverted",
       () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let d1 = await commitFiles(impl, { "b.txt": "bee\n" });
     addGadget(impl, 1, "APP", c1);
@@ -1477,6 +1636,7 @@ describe("updateChatFromMainline", () => {
 
     let { conflictPaths } = await impl.updateChatFromMainline(1, USER);
     expect(conflictPaths).toEqual([]);
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
 
     // The pinned gadget merged (delivered as a row and re-recorded in a mainlineMerge
     // message); the unpinned gadget was left alone -- it tracks head live, no pin created.
@@ -1501,6 +1661,7 @@ describe("updateChatFromMainline", () => {
 
   it("discards a staged fork before recording an update from mainline",
       () => withImpl(async impl => {
+    const receipts = spyReceiptCleanup(impl);
     const c1 = await commitFiles(impl, { "a.txt": "one\n" });
     addGadget(impl, 1, "APP", c1);
     addChat(impl, 1);
@@ -1525,6 +1686,7 @@ describe("updateChatFromMainline", () => {
 
     await impl.updateChatFromMainline(1, USER);
     expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+    expect(receipts.calls).toEqual([{ chatId: "1", epoch: 0 }]);
   }));
 
   it("records the advancement even when the chat's content already matched mainline",
