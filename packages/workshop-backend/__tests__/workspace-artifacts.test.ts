@@ -1,8 +1,10 @@
 import { env, runInDurableObject } from "cloudflare:test";
+import type { ExecOptions, SandboxCommand } from "@cloudflare/sandbox";
 import { describe, expect, it } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
 import {
   CloudflareWorkspaceArtifactReader,
+  ArtifactsWorkspaceRepository,
   SandboxWorkspaceArtifactGitRuntime,
   WorkspaceArtifactLifecycle,
   type WorkspaceArtifactControlPlane,
@@ -10,6 +12,7 @@ import {
   type WorkspaceArtifactReader,
   type WorkspaceArtifactRepo,
   type WorkspaceArtifactSandbox,
+  type WorkspaceArtifactMutation,
 } from "../src/workspace-artifacts";
 
 declare module "cloudflare:test" {
@@ -24,6 +27,8 @@ const CHECKPOINT_HEAD = "2".repeat(40);
 class FakeRepo implements WorkspaceArtifactRepo {
   readonly tokens = new Map<string, "read" | "write">();
   readonly revoked: string[] = [];
+  readonly commits = new Map<string, unknown>();
+  readonly trees = new Map<string, unknown>();
 
   constructor(
     readonly name: string,
@@ -66,6 +71,18 @@ class FakeRepo implements WorkspaceArtifactRepo {
 
   async log(): Promise<Array<{ hash: string }>> {
     return [];
+  }
+
+  readCommit(hash: string): Promise<unknown> {
+    const commit = this.commits.get(hash);
+    if (commit === undefined) throw new Error(`Missing commit fixture ${hash}`);
+    return Promise.resolve(commit);
+  }
+
+  readTree(hash: string): Promise<unknown> {
+    const tree = this.trees.get(hash);
+    if (tree === undefined) throw new Error(`Missing tree fixture ${hash}`);
+    return Promise.resolve(tree);
   }
 }
 
@@ -121,9 +138,18 @@ class FakeArtifacts implements WorkspaceArtifactControlPlane {
 class FakeReader implements WorkspaceArtifactReader {
   readonly heads = new Map<string, string>();
   readonly files = new Map<string, Uint8Array>();
+  readonly listErrors = new Map<string, Error>();
+  readonly listed: string[] = [];
 
   getHead(repoName: string): Promise<string | undefined> {
     return Promise.resolve(this.heads.get(repoName));
+  }
+
+  listFiles(repoName: string): Promise<string[]> {
+    this.listed.push(repoName);
+    const error = this.listErrors.get(repoName);
+    if (error) return Promise.reject(error);
+    return Promise.resolve([]);
   }
 
   readFile(repoName: string, ref: string, path: string): Promise<Uint8Array> {
@@ -139,6 +165,8 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
   readonly destroyed: string[] = [];
   readonly prepared: string[] = [];
   readonly checkpoints: string[] = [];
+  readonly stagedMutations: string[] = [];
+  readonly mutations: WorkspaceArtifactMutation[] = [];
   promotionError: Error | undefined;
   beforePromotion: (() => void) | undefined;
 
@@ -192,6 +220,15 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
 
   checkpointChat(request: { sandboxId: string }): Promise<string> {
     this.checkpoints.push(request.sandboxId);
+    return Promise.resolve(CHECKPOINT_HEAD);
+  }
+
+  stageChatMutation(request: {
+    sandboxId: string;
+    mutation: WorkspaceArtifactMutation;
+  }): Promise<string> {
+    this.stagedMutations.push(request.sandboxId);
+    this.mutations.push(request.mutation);
     return Promise.resolve(CHECKPOINT_HEAD);
   }
 }
@@ -274,7 +311,25 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
-  it("fast-forwards the existing chat proposal and deletes its fork", async () => {
+  it("stages a file mutation into the chat fork and records its durable checkpoint", async () => {
+    await withLifecycle("stage-mutation", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+
+      const checkpoint = await lifecycle.stageChatMutation("chat-one", 1, {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Update workspace", {
+        deletePaths: ["old.txt"],
+        writes: [{ path: "new.txt", content: new TextEncoder().encode("new\n") }],
+      });
+
+      expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
+      expect(fixtures.runtime.stagedMutations).toEqual([checkpoint.sandboxId]);
+      expect((await fixtures.artifacts.get(checkpoint.repositoryName)).tokens.size).toBe(0);
+    });
+  });
+
+  it("persists acceptance before deleting the chat fork", async () => {
     await withLifecycle("accept", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
       const fork = await lifecycle.ensureChatFork("chat-one", 1);
@@ -288,9 +343,14 @@ describe("WorkspaceArtifactLifecycle", () => {
         fork: fork.repositoryName,
         expectedHead: INITIAL_HEAD,
       }]);
+      expect(fixtures.artifacts.deleted).not.toContain(fork.repositoryName);
+      expect(fixtures.runtime.destroyed).not.toContain(fork.sandboxId);
+      expect(await lifecycle.getChatFork("chat-one", 1)).toBeUndefined();
+
+      await lifecycle.completeAcceptedChatFork("chat-one", 1, CHECKPOINT_HEAD);
+
       expect(fixtures.artifacts.deleted).toContain(fork.repositoryName);
       expect(fixtures.runtime.destroyed).toContain(fork.sandboxId);
-      expect(await lifecycle.getChatFork("chat-one", 1)).toBeUndefined();
     });
   });
 
@@ -338,6 +398,20 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("rejects an unsafe fork tree before promotion", async () => {
+    await withLifecycle("unsafe-tree", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+      fixtures.reader.listErrors.set(fork.repositoryName, new Error("unsupported symlink"));
+
+      await expect(lifecycle.acceptChatFork("chat-one", 1)).rejects.toThrow(/symlink/i);
+
+      expect(fixtures.reader.listed).toContain(fork.repositoryName);
+      expect(fixtures.runtime.promotions).toEqual([]);
+    });
+  });
+
   it("finishes an accepted promotion after a Durable Object reset", async () => {
     await withLifecycle("accept-recovery", async (lifecycle, fixtures, state) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
@@ -355,6 +429,9 @@ describe("WorkspaceArtifactLifecycle", () => {
         head: CHECKPOINT_HEAD,
       });
       expect(fixtures.runtime.promotions).toEqual([]);
+
+      await lifecycle.completeAcceptedChatFork("chat-one", 1, CHECKPOINT_HEAD);
+
       expect(fixtures.artifacts.deleted).toContain(fork.repositoryName);
     });
   });
@@ -369,6 +446,63 @@ describe("WorkspaceArtifactLifecycle", () => {
 
       expect(fixtures.artifacts.deleted.filter(name => name === fork.repositoryName)).toHaveLength(1);
       expect(fixtures.runtime.destroyed.filter(id => id === fork.sandboxId)).toHaveLength(1);
+    });
+  });
+});
+
+describe("ArtifactsWorkspaceRepository", () => {
+  it("reads one gadget subtree at an explicit workspace revision", async () => {
+    await withLifecycle("repository-read", async (lifecycle, fixtures) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      fixtures.reader.listFiles = () => Promise.resolve([
+        ".workspace/gadgets/7/client.js",
+        ".workspace/gadgets/7/nested/data.json",
+        ".workspace/gadgets/8/server.js",
+      ]);
+      fixtures.reader.files.set(
+        `${canonical.repositoryName}:${canonical.head}:.workspace/gadgets/7/client.js`,
+        new TextEncoder().encode("client\n"),
+      );
+      fixtures.reader.files.set(
+        `${canonical.repositoryName}:${canonical.head}:.workspace/gadgets/7/nested/data.json`,
+        new TextEncoder().encode("{}\n"),
+      );
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      await expect(repository.readGadgetFiles(7, canonical.head)).resolves.toEqual(new Map([
+        ["client.js", "client\n"],
+        ["nested/data.json", "{}\n"],
+      ]));
+    });
+  });
+
+  it("stages changed gadgets as one chat-fork checkpoint", async () => {
+    await withLifecycle("repository-stage", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      const checkpoint = await repository.stageGadgetFiles("chat-one", 1, {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Accept changes", new Map([
+        [7, new Map([["client.js", "client\n"]])],
+        [8, new Map([["server.js", "server\n"]])],
+      ]));
+
+      expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
+      expect(fixtures.runtime.mutations).toEqual([{
+        deletePaths: [".workspace/gadgets/7", ".workspace/gadgets/8"],
+        writes: [
+          {
+            path: ".workspace/gadgets/7/client.js",
+            content: new TextEncoder().encode("client\n"),
+          },
+          {
+            path: ".workspace/gadgets/8/server.js",
+            content: new TextEncoder().encode("server\n"),
+          },
+        ],
+      }]);
     });
   });
 });
@@ -436,11 +570,58 @@ describe("CloudflareWorkspaceArtifactReader", () => {
     await expect(reader.readFile("workspace-one", INITIAL_HEAD, "payload.bin", 3))
       .rejects.toThrow(/exceeds/i);
   });
+
+  it("lists regular files recursively from the Artifacts binding", async () => {
+    const artifacts = new FakeArtifacts(new FakeReader());
+    const created = await artifacts.create("workspace-one");
+    const repo = await artifacts.get(created.name);
+    const rootTree = "3".repeat(40);
+    const nestedTree = "4".repeat(40);
+    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, tree: rootTree });
+    repo.trees.set(rootTree, [
+      { name: ".workspace", hash: nestedTree, mode: "040000", type: "tree" },
+      { name: "README.md", hash: "5".repeat(40), mode: "100644", type: "blob" },
+    ]);
+    repo.trees.set(nestedTree, [
+      { name: "index.json", hash: "6".repeat(40), mode: "100644", type: "blob" },
+    ]);
+    const reader = new CloudflareWorkspaceArtifactReader({
+      artifacts,
+      accountId: "62f4d80db4b47c969f575420fa2aae29",
+      namespace: "workshop-workspaces",
+      apiToken: "rest-secret",
+    });
+
+    await expect(reader.listFiles(created.name, INITIAL_HEAD)).resolves.toEqual([
+      ".workspace/index.json",
+      "README.md",
+    ]);
+  });
+
+  it("rejects symlinks in an Artifacts workspace tree", async () => {
+    const artifacts = new FakeArtifacts(new FakeReader());
+    const created = await artifacts.create("workspace-one");
+    const repo = await artifacts.get(created.name);
+    const rootTree = "3".repeat(40);
+    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, tree: rootTree });
+    repo.trees.set(rootTree, [
+      { name: "escape", hash: "5".repeat(40), mode: "120000", type: "blob" },
+    ]);
+    const reader = new CloudflareWorkspaceArtifactReader({
+      artifacts,
+      accountId: "62f4d80db4b47c969f575420fa2aae29",
+      namespace: "workshop-workspaces",
+      apiToken: "rest-secret",
+    });
+
+    await expect(reader.listFiles(created.name, INITIAL_HEAD)).rejects.toThrow(/unsupported/i);
+  });
 });
 
 class FakeSandbox implements WorkspaceArtifactSandbox {
   readonly commands: string[][] = [];
-  readonly files = new Map<string, string>();
+  readonly files = new Map<string, string | Uint8Array>();
+  readonly directories: string[] = [];
   readonly gitAuth: Array<Record<string, { token: string; type: "bearer" }>> = [];
   destroyed = false;
   repositoryExists = false;
@@ -457,7 +638,11 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     return Promise.resolve({ exists: this.repositoryExists });
   }
 
-  async exec(command: string[]): Promise<{
+  async mkdir(path: string): Promise<void> {
+    this.directories.push(path);
+  }
+
+  async exec(command: SandboxCommand, _options?: ExecOptions): Promise<{
     output(): Promise<{
       stdout: string;
       stderr: string;
@@ -466,7 +651,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
       truncated: boolean;
     }>;
   }> {
-    this.commands.push(command);
+    this.commands.push([...command]);
     if (command.includes("commit")) this.head = CHECKPOINT_HEAD;
     const stdout = command.includes("rev-parse")
       ? `${this.head}\n`
@@ -482,8 +667,12 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     };
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
-    this.files.set(path, content);
+  async writeFile(path: string, content: string | ReadableStream<Uint8Array>): Promise<void> {
+    if (typeof content === "string") {
+      this.files.set(path, content);
+      return;
+    }
+    this.files.set(path, new Uint8Array(await new Response(content).arrayBuffer()));
   }
 
   async destroy(): Promise<void> {
@@ -556,7 +745,7 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     expect(sandbox.destroyed).toBe(true);
   });
 
-  it("lazily clones a chat fork and removes its Git credential", async () => {
+  it("lazily clones a chat fork without exposing its Git credential in argv", async () => {
     const sandbox = new FakeSandbox();
     sandbox.head = CHECKPOINT_HEAD;
     const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
@@ -571,11 +760,13 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     expect(sandbox.commands[0]).toEqual([
       "git", "clone", "https://artifacts.example/fork.git", "/workspace/repo",
     ]);
-    expect(sandbox.gitAuth.at(-1)).toEqual({});
+    expect(sandbox.gitAuth.at(-1)).toEqual({
+      "artifacts.example": { token: "fork-write-secret", type: "bearer" },
+    });
     expect(sandbox.destroyed).toBe(false);
   });
 
-  it("checkpoints chat changes with an expected-head push and removes its credential", async () => {
+  it("checkpoints chat changes with an expected-head push and intercepted credential", async () => {
     const sandbox = new FakeSandbox();
     sandbox.repositoryExists = true;
     sandbox.status = " M notes.txt\n";
@@ -593,7 +784,97 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
 
     expect(sandbox.commands.find(command => command.includes("push")))
       .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
-    expect(sandbox.gitAuth.at(-1)).toEqual({});
+    expect(sandbox.gitAuth.at(-1)).toEqual({
+      "artifacts.example": { token: "fork-write-secret", type: "bearer" },
+    });
     expect(sandbox.destroyed).toBe(false);
+  });
+
+  it("applies one file mutation before checkpointing the chat fork", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    sandbox.status = " D old.txt\n M notes.txt\n";
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Update workspace files",
+      mutation: {
+        deletePaths: ["old.txt"],
+        writes: [
+          { path: "notes.txt", content: new TextEncoder().encode("updated\n") },
+          { path: "nested/data.bin", content: new Uint8Array([0, 255, 1]) },
+        ],
+      },
+    })).resolves.toBe(CHECKPOINT_HEAD);
+
+    expect(sandbox.commands).toContainEqual([
+      "git", "-C", "/workspace/repo", "rm", "-r", "-f", "--ignore-unmatch", "--", "old.txt",
+    ]);
+    expect(sandbox.files.get("/workspace/repo/notes.txt"))
+      .toEqual(new TextEncoder().encode("updated\n"));
+    expect(sandbox.files.get("/workspace/repo/nested/data.bin")).toEqual(new Uint8Array([0, 255, 1]));
+    expect(sandbox.commands.find(command => command.includes("push")))
+      .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
+    expect(sandbox.gitAuth.at(-1)).toEqual({
+      "artifacts.example": { token: "fork-write-secret", type: "bearer" },
+    });
+  });
+
+  it.each([
+    "nested/.git/config",
+    "nested\\file.txt",
+    "e\u0301.txt",
+    `${"x".repeat(256)}.txt`,
+  ])("rejects unsafe repository path %s before changing the working tree", async path => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Unsafe write",
+      mutation: {
+        deletePaths: [],
+        writes: [{ path, content: new Uint8Array() }],
+      },
+    })).rejects.toThrow(/path/i);
+
+    expect(sandbox.commands).toHaveLength(0);
+  });
+
+  it("rejects conflicting file paths before changing the working tree", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Conflicting writes",
+      mutation: {
+        deletePaths: [],
+        writes: [
+          { path: "file", content: new Uint8Array() },
+          { path: "file/nested", content: new Uint8Array() },
+        ],
+      },
+    })).rejects.toThrow(/conflict/i);
+
+    expect(sandbox.commands).toHaveLength(0);
   });
 });
