@@ -167,6 +167,7 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
   readonly checkpoints: string[] = [];
   readonly stagedMutations: string[] = [];
   readonly mutations: WorkspaceArtifactMutation[] = [];
+  readonly mutationExpectedHeads: string[] = [];
   promotionError: Error | undefined;
   beforePromotion: (() => void) | undefined;
 
@@ -225,10 +226,12 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
 
   stageChatMutation(request: {
     sandboxId: string;
+    expectedHead: string;
     mutation: WorkspaceArtifactMutation;
   }): Promise<string> {
     this.stagedMutations.push(request.sandboxId);
     this.mutations.push(request.mutation);
+    this.mutationExpectedHeads.push(request.expectedHead);
     return Promise.resolve(CHECKPOINT_HEAD);
   }
 }
@@ -326,6 +329,22 @@ describe("WorkspaceArtifactLifecycle", () => {
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.stagedMutations).toEqual([checkpoint.sandboxId]);
       expect((await fixtures.artifacts.get(checkpoint.repositoryName)).tokens.size).toBe(0);
+    });
+  });
+
+  it("recovers a fork checkpoint pushed before its metadata persisted", async () => {
+    await withLifecycle("stage-recovery", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+
+      const checkpoint = await lifecycle.stageChatMutation("chat-one", 1, {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Retry workspace update", { deletePaths: [], writes: [] });
+
+      expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
+      expect(fixtures.runtime.mutationExpectedHeads).toEqual([CHECKPOINT_HEAD]);
     });
   });
 

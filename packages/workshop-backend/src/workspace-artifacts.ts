@@ -838,6 +838,22 @@ export class WorkspaceArtifactLifecycle {
     `, chatId, epoch)][0];
   }
 
+  async #reconcileOpenForkHead(row: ForkRow): Promise<ForkRow> {
+    const liveHead = await this.#reader.getHead(row.repository_name);
+    if (liveHead === undefined) throw new Error("Chat fork has no head.");
+    requireOid(liveHead, "Chat fork head");
+    if (liveHead === row.latest_head) return row;
+    this.#state.storage.sql.exec(`
+      UPDATE workspace_artifact_forks SET latest_head = ?
+      WHERE chat_id = ? AND epoch = ? AND state = 'open' AND latest_head = ?
+    `, liveHead, row.chat_id, row.epoch, row.latest_head);
+    const reconciled = this.#forkRow(row.chat_id, row.epoch);
+    if (!reconciled || reconciled.state !== "open" || reconciled.latest_head !== liveHead) {
+      throw new Error("Chat fork checkpoint recovery did not persist.");
+    }
+    return reconciled;
+  }
+
   async #canonicalRepositoryName(): Promise<string> {
     return `workspace-${(await sha256Hex(this.#workspaceId)).slice(0, 40)}`;
   }
@@ -1022,8 +1038,9 @@ export class WorkspaceArtifactLifecycle {
   ): Promise<WorkspaceArtifactChatFork> {
     await this.ensureChatFork(chatId, epoch);
     return this.#withLock(async () => {
-      const row = this.#forkRow(chatId, epoch);
+      let row = this.#forkRow(chatId, epoch);
       if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
+      row = await this.#reconcileOpenForkHead(row);
       const repo = await this.#getReadyRepository(row.repository_name);
       const token = await repo.createToken("write", 900);
       try {
@@ -1048,8 +1065,9 @@ export class WorkspaceArtifactLifecycle {
     message: string,
   ): Promise<WorkspaceArtifactChatFork> {
     return this.#withLock(async () => {
-      const row = this.#forkRow(chatId, epoch);
+      let row = this.#forkRow(chatId, epoch);
       if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
+      row = await this.#reconcileOpenForkHead(row);
       const repo = await this.#getReadyRepository(row.repository_name);
       const token = await repo.createToken("write", 900);
       let head: string;
@@ -1088,8 +1106,9 @@ export class WorkspaceArtifactLifecycle {
   ): Promise<WorkspaceArtifactChatFork> {
     await this.ensureChatFork(chatId, epoch);
     return this.#withLock(async () => {
-      const row = this.#forkRow(chatId, epoch);
+      let row = this.#forkRow(chatId, epoch);
       if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
+      row = await this.#reconcileOpenForkHead(row);
       const repo = await this.#getReadyRepository(row.repository_name);
       const token = await repo.createToken("write", 900);
       let head: string;
