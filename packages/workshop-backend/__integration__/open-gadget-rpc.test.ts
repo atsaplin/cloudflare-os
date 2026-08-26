@@ -1,10 +1,16 @@
-import { abortAllDurableObjects, env, runInDurableObject } from "cloudflare:test";
+import {
+  abortAllDurableObjects,
+  env,
+  runInDurableObject,
+} from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 import {
   createOpenGadgetError,
   getOpenGadgetErrorCode,
+  getWorkspaceFileErrorCode,
   OPEN_GADGET_ERROR_CODES,
+  WORKSPACE_FILE_ERROR_CODES,
   type AuthenticatedApi,
   type OpenGadgetErrorCode,
   type PublicApi,
@@ -221,6 +227,194 @@ describe("workspace filesystem initialization", () => {
     expect(history).toEqual([
       expect.objectContaining({ message: "Initialize workspace\n" }),
     ]);
+  });
+
+  it("exposes accepted workspace files only through the authenticated build capability", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "workspacefileapi");
+    using authenticated = await publicApi.authenticate(account.token);
+    using workspace = await authenticated.newGadget();
+    const metadata = await workspace.getMetadata();
+
+    const initial = await workspace.getWorkspaceRevision();
+    const accepted = await workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000070",
+      expectedHead: initial.head,
+      message: "Create documents folder",
+      changes: [{
+        kind: "createFolder",
+        clientId: "documents",
+        parent: { nodeId: initial.rootId },
+        name: "Documents",
+      }],
+    });
+
+    expect(accepted.head).not.toBe(initial.head);
+    expect(await workspace.listWorkspaceChildren(initial.rootId)).toEqual([
+      expect.objectContaining({
+        id: accepted.created.documents,
+        kind: "folder",
+        name: "Documents",
+        path: "Documents",
+        size: 0,
+        createdBy: account.username,
+      }),
+    ]);
+    expect(await workspace.getWorkspaceHistory(10)).toEqual([
+      expect.objectContaining({ oid: accepted.head, message: expect.stringContaining(
+        "Create documents folder",
+      ) }),
+      expect.objectContaining({ oid: initial.head, message: "Initialize workspace\n" }),
+    ]);
+
+    const content = new Uint8Array(2 * 1024 * 1024 + 3);
+    content.set([0x50, 0x4b, 0x03, 0x04]);
+    content[content.length - 1] = 0xff;
+    const upload = await workspace.stageWorkspaceFileUpload({
+      content: new ReadableStream({
+        start(controller) {
+          controller.enqueue(content);
+          controller.close();
+        },
+      }),
+      size: content.byteLength,
+      mediaType: "application/zip",
+    });
+    const archiveRequest = {
+      operationId: "00000000-0000-4000-8000-000000000071",
+      expectedHead: accepted.head,
+      message: "Add project archive",
+      changes: [{
+        kind: "createFile",
+        clientId: "archive",
+        parent: { nodeId: accepted.created.documents },
+        name: "project.zip",
+        uploadId: upload.uploadId,
+      }],
+    };
+    const withArchive = await workspace.applyWorkspaceMutation(archiveRequest);
+    expect(await workspace.applyWorkspaceMutation(archiveRequest)).toEqual(withArchive);
+    const stored = new Uint8Array(await new Response(
+      await workspace.readWorkspaceFile(withArchive.created.archive),
+    ).arrayBuffer());
+    expect(stored).toEqual(content);
+
+    await workspace.stageWorkspaceFileUpload({
+      content: new Blob(["pending"]).stream(),
+      size: 7,
+    });
+    const workspacePrefix = `workspaces/${metadata.id}/`;
+    expect((await env.WORKSPACE_FILES.list({ prefix: workspacePrefix })).objects.length)
+      .toBeGreaterThanOrEqual(2);
+    await workspace.deleteSelf();
+    expect((await env.WORKSPACE_FILES.list({ prefix: workspacePrefix })).objects).toEqual([]);
+  });
+
+  it("preserves typed workspace file failures across the RPC boundary", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "workspacefileerrors");
+    using authenticated = await publicApi.authenticate(account.token);
+    using workspace = await authenticated.newGadget();
+
+    const initial = await workspace.getWorkspaceRevision();
+    const accepted = await workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000072",
+      expectedHead: initial.head,
+      message: "Create Documents",
+      changes: [{
+        kind: "createFolder",
+        clientId: "documents",
+        parent: { nodeId: initial.rootId },
+        name: "Documents",
+      }],
+    });
+
+    const conflict = await rejection(workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000073",
+      expectedHead: initial.head,
+      message: "Create stale folder",
+      changes: [{
+        kind: "createFolder",
+        clientId: "stale",
+        parent: { nodeId: initial.rootId },
+        name: "Stale",
+      }],
+    }));
+    expect(getWorkspaceFileErrorCode(conflict)).toBe(WORKSPACE_FILE_ERROR_CODES.conflict);
+    expect(conflict).toMatchObject({ currentHead: accepted.head });
+
+    const missingUpload = await rejection(workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000074",
+      expectedHead: accepted.head,
+      message: "Use missing upload",
+      changes: [{
+        kind: "createFile",
+        clientId: "missing",
+        parent: { nodeId: accepted.created.documents },
+        name: "missing.bin",
+        uploadId: "00000000-0000-4000-8000-000000000075",
+      }],
+    }));
+    expect(getWorkspaceFileErrorCode(missingUpload)).toBe(
+      WORKSPACE_FILE_ERROR_CODES.uploadUnavailable,
+    );
+
+    const invalidRequest = await rejection(workspace.applyWorkspaceMutation({
+      operationId: "not-an-operation-id",
+      expectedHead: accepted.head,
+      message: "Invalid operation",
+      changes: [{
+        kind: "createFolder",
+        clientId: "invalid",
+        parent: { nodeId: initial.rootId },
+        name: "Invalid",
+      }],
+    }));
+    expect(getWorkspaceFileErrorCode(invalidRequest)).toBe(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+    );
+
+    const invalidMutation = await rejection(workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000076",
+      expectedHead: accepted.head,
+      message: "Create reserved folder",
+      changes: [{
+        kind: "createFolder",
+        clientId: "reserved",
+        parent: { nodeId: initial.rootId },
+        name: ".git",
+      }],
+    }));
+    expect(getWorkspaceFileErrorCode(invalidMutation)).toBe(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+    );
+  });
+
+  it("cleans expired workspace uploads through the shared Overseer alarm", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "workspacefilealarm");
+    using authenticated = await publicApi.authenticate(account.token);
+    using workspace = await authenticated.newGadget();
+    const metadata = await workspace.getMetadata();
+    const upload = await workspace.stageWorkspaceFileUpload({
+      content: new Blob(["temporary"]).stream(),
+      size: 9,
+    });
+    const prefix = `workspaces/${metadata.id}/uploads/${upload.uploadId}`;
+    expect((await env.WORKSPACE_FILES.list({ prefix })).objects).toHaveLength(1);
+
+    await abortAllDurableObjects();
+    const durableObject = exports.OverseerDurableObject.get(
+      exports.OverseerDurableObject.idFromString(metadata.id),
+    );
+    await runInDurableObject(durableObject, async (instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE workspace_file_uploads SET expires_at = 0 WHERE upload_id = ?",
+        upload.uploadId,
+      );
+      await instance.alarm();
+    });
+    expect((await env.WORKSPACE_FILES.list({ prefix })).objects).toEqual([]);
   });
 });
 

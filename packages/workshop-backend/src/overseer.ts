@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, WorkspaceFileMutationRequest, WorkspaceFileMutationResult, WorkspaceFileNode, WorkspaceFileRevision, WorkspaceFileUpload, WorkspaceFileUploadRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, createWorkspaceFileError, WORKSPACE_FILE_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, composeCodeChange, diffFiles, transformCodeChange,
   validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -61,10 +61,26 @@ import {
   type GadgetExportEntrypoint,
   readCustomExportFormats,
 } from "./gadget-export";
-import { WorkspaceRepository } from "./workspace-repository";
+import {
+  WorkspaceRepository,
+  WorkspaceRepositoryConflictError,
+  WorkspaceRepositoryExpectedError,
+} from "./workspace-repository";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
+
+function throwWorkspaceFileError(error: unknown): never {
+  if (error instanceof WorkspaceRepositoryConflictError) {
+    throw createWorkspaceFileError(WORKSPACE_FILE_ERROR_CODES.conflict, {
+      currentHead: error.currentHead,
+    });
+  }
+  if (error instanceof WorkspaceRepositoryExpectedError) {
+    throw createWorkspaceFileError(error.code);
+  }
+  throw error;
+}
 
 let CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
@@ -1573,7 +1589,7 @@ class OverseerImpl implements AgentHooks {
     if (this.#runningAgents.size === 0) {
       // One -> zero running agents: replace the keep-alive alarm with any response-target retry/sweep
       // alarm that is now due, and wake any `alarm()` waiter.
-      this.#updateExternalMessageResponseDeliveryAlarm();
+      this.updateMaintenanceAlarm();
       for (let waiter of this.#allAgentsIdleWaiters) {
         waiter();
       }
@@ -1581,10 +1597,11 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  #updateExternalMessageResponseDeliveryAlarm(): void {
+  updateMaintenanceAlarm(): void {
     if (this.#runningAgents.size > 0) return;
 
-    // This DO has one alarm shared by agent keep-alive, response-target retry, and delivered-record sweep.
+    // This DO has one alarm shared by agent keep-alive, response delivery, retention sweeps, and
+    // staged workspace-upload cleanup.
     // Recompute from storage whenever the alarm may have been overwritten by another concern.
     this.#sweepDeliveredExternalMessageResponses();
 
@@ -1595,13 +1612,16 @@ class OverseerImpl implements AgentHooks {
       return;
     }
 
+    const candidates: number[] = [];
     let nextDeliveredRecord = [...this.storage.gadgetResponseDeliveries.deliveredByDeliveredAt.list({ limit: 1 })][0];
     if (nextDeliveredRecord?.status === "delivered") {
-      this.ctx.storage.setAlarm(nextDeliveredRecord.deliveredAt + AGENT_RESPONSE_DELIVERED_RETENTION_MS);
-      return;
+      candidates.push(nextDeliveredRecord.deliveredAt + AGENT_RESPONSE_DELIVERED_RETENTION_MS);
     }
+    const nextUploadExpiry = this.workspaceRepository.getNextUploadExpiry();
+    if (nextUploadExpiry !== undefined) candidates.push(nextUploadExpiry);
 
-    this.ctx.storage.deleteAlarm();
+    if (candidates.length === 0) this.ctx.storage.deleteAlarm();
+    else this.ctx.storage.setAlarm(Math.min(...candidates));
   }
 
   #deleteExternalMessageResponseDeliveryRecord(record: ExternalMessageRecord): void {
@@ -5416,9 +5436,9 @@ class OverseerImpl implements AgentHooks {
 
     let readyRecord: ExternalMessageRecord = { ...record, status: "ready", responseText: text };
     this.storage.gadgetResponseDeliveries.put(readyRecord);
-    this.#updateExternalMessageResponseDeliveryAlarm();
+    this.updateMaintenanceAlarm();
     this.ctx.waitUntil(this.#deliverExternalMessageResponseToTarget(readyRecord).finally(() => {
-      this.#updateExternalMessageResponseDeliveryAlarm();
+      this.updateMaintenanceAlarm();
     }));
   }
 
@@ -5457,7 +5477,7 @@ class OverseerImpl implements AgentHooks {
     for (let result of results) {
       if (result.status === "rejected") throw result.reason;
     }
-    this.#updateExternalMessageResponseDeliveryAlarm();
+    this.updateMaintenanceAlarm();
   }
 
   cancelAgent(chatId: number) {
@@ -8173,6 +8193,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    */
   async alarm() {
     await this.impl.waitForAllAgentsToComplete();
+    await this.impl.workspaceRepository.cleanupExpiredUploads();
     await this.impl.deliverReadyExternalMessageResponses();
   }
 
@@ -9084,6 +9105,61 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return result;
   }
 
+  async getWorkspaceRevision(): Promise<WorkspaceFileRevision> {
+    return this.impl.workspaceRepository.getRevision();
+  }
+
+  async listWorkspaceChildren(folderId: string): Promise<WorkspaceFileNode[]> {
+    return (await this.impl.workspaceRepository.list(folderId)).map(node => ({
+      ...node,
+      createdAt: new Date(node.createdAt),
+      updatedAt: new Date(node.updatedAt),
+    }));
+  }
+
+  async readWorkspaceFile(fileId: string): Promise<ReadableStream<Uint8Array>> {
+    return this.impl.workspaceRepository.readFileStream(fileId);
+  }
+
+  async getWorkspaceHistory(depth = 50): Promise<CommitInfo[]> {
+    return (await this.impl.workspaceRepository.getHistory(depth)).map(commit => ({
+      oid: commit.oid,
+      parents: commit.parent,
+      message: commit.message,
+      author: {
+        name: commit.author.name,
+        email: commit.author.email,
+      },
+      timestamp: new Date(commit.author.timestamp * 1_000),
+    }));
+  }
+
+  async stageWorkspaceFileUpload(
+      request: WorkspaceFileUploadRequest): Promise<WorkspaceFileUpload> {
+    const profile = await this.#getClientProfile();
+    try {
+      const upload = await this.impl.workspaceRepository.stageUpload(profile.id, request);
+      this.impl.updateMaintenanceAlarm();
+      return { ...upload, expiresAt: new Date(upload.expiresAt) };
+    } catch (error) {
+      throwWorkspaceFileError(error);
+    }
+  }
+
+  async applyWorkspaceMutation(
+      request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResult> {
+    const profile = await this.#getClientProfile();
+    try {
+      return await this.impl.workspaceRepository.applyStaged({
+        ...request,
+        actor: { id: profile.id, name: profile.name },
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      throwWorkspaceFileError(error);
+    }
+  }
+
   async subscribeToMetadata(
       callback: RpcStub<(metadata: GadgetMetadata) => void>)
       : Promise<RpcStub<{}>> {
@@ -9263,6 +9339,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
+      await this.impl.workspaceRepository.deleteAllWorkspaceFiles();
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
       await this.impl.ctx.storage.deleteAll();
       this.impl.scheduleRevocationRestart();
@@ -10594,6 +10671,19 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
 
   // --- Denied methods (build-only) ---
+
+  async getWorkspaceRevision(): Promise<WorkspaceFileRevision> { this.#deny(); }
+  async listWorkspaceChildren(_folderId: string): Promise<WorkspaceFileNode[]> { this.#deny(); }
+  async readWorkspaceFile(_fileId: string): Promise<ReadableStream<Uint8Array>> { this.#deny(); }
+  async getWorkspaceHistory(_depth?: number): Promise<CommitInfo[]> { this.#deny(); }
+  async stageWorkspaceFileUpload(
+      _request: WorkspaceFileUploadRequest): Promise<WorkspaceFileUpload> {
+    this.#deny();
+  }
+  async applyWorkspaceMutation(
+      _request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResult> {
+    this.#deny();
+  }
 
   async setTitle(_title: string): Promise<void> { this.#deny(); }
   async setPinned(_pinned: boolean): Promise<void> { this.#deny(); }

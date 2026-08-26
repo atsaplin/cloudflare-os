@@ -11,6 +11,7 @@ import {
   Trash,
   ArrowsOutSimple,
   DotsThree,
+  FolderOpen,
   Pulse,
   type Icon,
 } from '@phosphor-icons/react'
@@ -63,6 +64,7 @@ import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
 import { useWorkspaceOpen } from './useWorkspaceOpen'
 import { reportIssue } from './errorReporting'
 import GadgetExportMenu from './GadgetExportMenu'
+import WorkspaceFilesPanel from './WorkspaceFilesPanel'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './components/menuStyles'
 import { isImeComposing } from './keyboardEvent'
 
@@ -155,12 +157,13 @@ function formatConsoleLogs(logs: BufferedLogEntry[]): string {
 
 // ─── right-panel tabs ─────────────────────────────────────────────────────────
 
-type RightTab = 'app' | 'code' | 'connections'
+type RightTab = 'app' | 'code' | 'connections' | 'files'
 
 type WorkspaceView =
   | { mode: 'chat' }
   // `appId` is absent only while lazily migrating the legacy "open" value.
   | { mode: 'app'; appId?: WorkpieceId }
+  | { mode: 'files' }
   | { mode: 'activity' }
 
 function formatHeaderCost(cost: number) {
@@ -171,11 +174,17 @@ function formatHeaderCost(cost: number) {
 
 // The first tab is named after what the selected workpiece is ("Document" for a gadget built from
 // a document blueprint), falling back to "App" when it declares no format.
-function rightTabs(output?: BlueprintOutput): { value: RightTab; label: string }[] {
+function rightTabs(
+  output: BlueprintOutput | undefined,
+  hasGadget: boolean,
+): { value: RightTab; label: string }[] {
   return [
-    { value: 'app', label: formatOf(output).noun },
-    { value: 'code', label: 'Code' },
-    { value: 'connections', label: 'Connections' },
+    ...(hasGadget ? [
+      { value: 'app', label: formatOf(output).noun },
+      { value: 'code', label: 'Code' },
+      { value: 'connections', label: 'Connections' },
+    ] as const : []),
+    { value: 'files', label: 'Files' },
   ]
 }
 
@@ -366,7 +375,10 @@ function workspaceViewStorageKey(gadgetId: string) {
   return `${WORKSPACE_VIEW_STORAGE_KEY_PREFIX}${gadgetId}`
 }
 
-function persistWorkspaceView(gadgetId: string, view: {mode: 'chat'} | {mode: 'app', appId: WorkpieceId}) {
+function persistWorkspaceView(
+  gadgetId: string,
+  view: {mode: 'chat'} | {mode: 'app', appId: WorkpieceId} | {mode: 'files'},
+) {
   try {
     window.localStorage.setItem(workspaceViewStorageKey(gadgetId), JSON.stringify(view))
   } catch {
@@ -389,6 +401,7 @@ function getStoredWorkspaceView(gadgetId: string | undefined): WorkspaceView | n
     const parsed: unknown = JSON.parse(stored)
     if (typeof parsed !== 'object' || parsed === null || !('mode' in parsed)) return null
     if (parsed.mode === 'chat') return { mode: 'chat' }
+    if (parsed.mode === 'files') return { mode: 'files' }
     if (parsed.mode === 'app' && 'appId' in parsed &&
         typeof parsed.appId === 'number' && Number.isInteger(parsed.appId)) {
       return { mode: 'app', appId: parsed.appId }
@@ -497,9 +510,11 @@ export default function GadgetEditor() {
   const [chatWidth, setChatWidth] = useState(getInitialChatWidth)
   const chatWidthRef = useRef(chatWidth)
   const [isResizing, setIsResizing] = useState(false)
-  const [activeTab, setActiveTab] = useState<RightTab>('app')
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView | null>(() =>
     getStoredWorkspaceView(id)
+  )
+  const [activeTab, setActiveTab] = useState<RightTab>(() =>
+    getStoredWorkspaceView(id)?.mode === 'files' ? 'files' : 'app'
   )
   const [workspaceTransitionEnabled, setWorkspaceTransitionEnabled] = useState(false)
   const activityReturnViewRef = useRef<WorkspaceView | null>(null)
@@ -807,11 +822,14 @@ export default function GadgetEditor() {
     && singleInitialChat && visibleGadgets.length <= 1
   const hasAnyApps = allGadgets.length > 0
   const showingActivity = workspaceView?.mode === 'activity'
+  const showingFiles = workspaceView?.mode === 'files'
   const showFullEditor = layoutModeReady && (
-    showingActivity || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
+    showingActivity || showingFiles ||
+    (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
   )
   const showOutputRail = layoutModeReady && hasAnyApps && !showFullEditor
   const paneShowsActivity = showingActivity || activityClosing
+  const paneShowsFiles = showingFiles && !activityClosing
   useEffect(() => {
     if (!activityClosing) return
     const timeout = window.setTimeout(() => setActivityClosing(false), WORKSPACE_TRANSITION_MS)
@@ -919,7 +937,7 @@ export default function GadgetEditor() {
     }
     setWorkspaceTransitionEnabled(true)
     const returnView = activityReturnViewRef.current
-    const returnShowsPane = returnView?.mode === 'app'
+    const returnShowsPane = returnView?.mode === 'app' || returnView?.mode === 'files'
       || (returnView === null && hasAnyApps && !simpleMode)
     setActivityClosing(!returnShowsPane)
     setWorkspaceView(returnView)
@@ -1015,7 +1033,16 @@ export default function GadgetEditor() {
     let output = turnOutputRef.current
     if (output?.chatId === selectedChatIdRef.current) output.userSelectedTab = true
     setActiveTab(tab)
-  }, [])
+    if (tab === 'files') {
+      const view = { mode: 'files' } as const
+      setWorkspaceTransitionEnabled(true)
+      setActivityClosing(false)
+      setWorkspaceView(view)
+      if (id) persistWorkspaceView(id, view)
+    } else if (workspaceView?.mode === 'files') {
+      setWorkspaceVisibility('open', selectedGadgetId ?? undefined)
+    }
+  }, [id, selectedGadgetId, setWorkspaceVisibility, workspaceView?.mode])
 
   useEffect(() => {
     setChatChanges(undefined)
@@ -1026,7 +1053,9 @@ export default function GadgetEditor() {
     setHasChatZero(false)
     setHasAnyProposedChanges(false)
     setSelectedChatHasProposedChanges(false)
-    setWorkspaceView(getStoredWorkspaceView(id))
+    const storedView = getStoredWorkspaceView(id)
+    setWorkspaceView(storedView)
+    setActiveTab(storedView?.mode === 'files' ? 'files' : 'app')
     openedWorkpieceParamRef.current = null
     activityReturnViewRef.current = null
     setActivityClosing(false)
@@ -1372,7 +1401,9 @@ export default function GadgetEditor() {
 
   const openMobilePane = (tab: RightTab) => {
     handleTabSelect(tab)
-    if (selectedGadgetId !== null) setWorkspaceVisibility('open', selectedGadgetId)
+    if (tab !== 'files' && selectedGadgetId !== null) {
+      setWorkspaceVisibility('open', selectedGadgetId)
+    }
   }
 
   const mobilePreviewActive = showFullEditor && !paneShowsActivity && activeTab === 'app'
@@ -1475,6 +1506,14 @@ export default function GadgetEditor() {
             pendingActions={pendingActions}
             onViewActivity={openActivity}
           />
+
+          <WorkshopIconButton
+            onClick={() => handleTabSelect('files')}
+            title="Workspace files"
+            aria-label="Workspace files"
+          >
+            <FolderOpen size={16} />
+          </WorkshopIconButton>
 
           {showReconnecting && <ReconnectingChip />}
 
@@ -1585,6 +1624,9 @@ export default function GadgetEditor() {
               className={MENU_ITEM}
             >
               Connections
+            </DropdownMenu.Item>
+            <DropdownMenu.Item onClick={() => openMobilePane('files')} className={MENU_ITEM}>
+              Files
             </DropdownMenu.Item>
             {visibleGadgets.length > 1 && <DropdownMenu.Separator />}
             {visibleGadgets.length > 1 && visibleGadgets.map(workpiece => (
@@ -1737,6 +1779,8 @@ export default function GadgetEditor() {
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
               {paneShowsActivity ? (
                 <PaneLabel icon={Pulse} title="Activity" />
+              ) : paneShowsFiles ? (
+                <PaneLabel icon={FolderOpen} title="Files" />
               ) : visibleGadgets.length > 1 ? (
                 <PaneWorkpieceTabs
                   gadgets={visibleGadgets}
@@ -1764,7 +1808,10 @@ export default function GadgetEditor() {
                       onClick={() => setActivityView(tab.value)}
                     />
                   ))
-                  : rightTabs(selectedGadgetSummary?.output).map(tab => (
+                  : rightTabs(
+                    selectedGadgetSummary?.output,
+                    selectedGadgetSummary !== undefined,
+                  ).map(tab => (
                     <PaneTab
                       key={tab.value}
                       active={activeTab === tab.value}
@@ -1909,6 +1956,10 @@ export default function GadgetEditor() {
               ) : (
                 <NoGadgetPlaceholder height="100%" />
               )}
+            </div>
+
+            <div className={activeTab === 'files' ? 'h-full' : 'hidden'}>
+              <WorkspaceFilesPanel overseer={overseer.stub} />
             </div>
 
             </div>
