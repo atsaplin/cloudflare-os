@@ -29,7 +29,8 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   findDeployablePackages, readWranglerConfig,
-  type BindingDecl, type ObservabilityConfig, type ServiceBinding, type WranglerConfig,
+  type ArtifactsBinding, type BindingDecl, type ObservabilityConfig, type ServiceBinding,
+  type WranglerConfig,
 } from "../release/manifest-lib.ts";
 
 /**
@@ -63,8 +64,8 @@ export interface PreviewOverrides {
   ai?: BindingDecl;
   /** Browser Rendering binding. */
   browser?: BindingDecl;
-  /** Artifacts binding (closed beta). */
-  artifacts?: BindingDecl;
+  /** Artifacts namespace bindings (closed beta). */
+  artifacts?: ArtifactsBinding[];
   /** Passed through untouched from the committed config. */
   unsafe?: unknown;
 }
@@ -388,6 +389,7 @@ function applyBackend(
     worker_loaders: previewResourceBindings(config.worker_loaders),
     ai: config.ai,
     ...(config.browser ? { browser: config.browser } : {}),
+    ...(config.artifacts ? { artifacts: config.artifacts } : {}),
   };
 }
 

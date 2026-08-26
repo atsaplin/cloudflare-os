@@ -38,6 +38,26 @@
     "binding": "BROWSER"
   },
 
+  // Sandbox 1.0 preview: the package and image must stay on the same exact release line.
+  "durable_objects": {
+    "bindings": [
+      { "name": "Sandbox", "class_name": "Sandbox" }
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite"
+    }
+  ],
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "workshop-workspaces"
+    }
+  ],
+
   // Gatekeeper service bindings and the Workers AI binding are dynamically
   // added by run-dev-server.ts (for dev) and generate-wrangler-prod.js (for
   // production).
@@ -56,6 +76,11 @@
       // login back to the waiting browser.
       "tag": "v2",
       "new_sqlite_classes": [ "PendingLogin" ]
+    },
+    {
+      // One Sandbox Durable Object per chat/task, backed by the preview Container image.
+      "tag": "v3",
+      "new_sqlite_classes": [ "Sandbox" ]
     }
   ],
 

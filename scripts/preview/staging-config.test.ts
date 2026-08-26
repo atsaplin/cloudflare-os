@@ -228,6 +228,9 @@ test("the backend's per-preview resources carry no ids, so wrangler provisions t
   assert.deepEqual(previews.worker_loaders, [{ binding: "LOADER" }]);
   assert.deepEqual(previews.ai, { binding: "WORKERS_AI" });
   assert.deepEqual(previews.browser, { binding: "BROWSER" });
+  assert.deepEqual(previews.artifacts, [
+    { binding: "ARTIFACTS", namespace: "workshop-workspaces" },
+  ]);
 
   // An id or bucket name here would point the preview at the shared baseline resource, so every
   // preview would read and write one another's blueprints.

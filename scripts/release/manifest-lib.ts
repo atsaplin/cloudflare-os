@@ -29,6 +29,35 @@ export interface BindingDecl {
   binding: string;
 }
 
+/** An Artifacts namespace binding in a Wrangler config. */
+export interface ArtifactsBinding extends BindingDecl {
+  namespace: string;
+  remote?: boolean;
+}
+
+/** A Durable Object namespace binding in a Wrangler config. */
+export interface DurableObjectBinding {
+  name: string;
+  class_name: string;
+  script_name?: string;
+  environment?: string;
+}
+
+/** A Cloudflare Container application attached to a Durable Object class. */
+export interface ContainerConfig {
+  class_name: string;
+  image: string;
+  name?: string;
+  max_instances?: number;
+  image_build_context?: string;
+  image_vars?: Record<string, string>;
+  instance_type?: string | {
+    vcpu?: number;
+    memory_mib?: number;
+    disk_mb?: number;
+  };
+}
+
 /** A service binding declaration in a wrangler config. */
 export interface ServiceBinding {
   /** Binding name the calling worker reads. */
@@ -102,6 +131,8 @@ export interface WranglerConfig {
   compatibility_flags?: string[];
   /** Durable Object migration history, ordered. Replayed verbatim by fresh installs. */
   migrations?: DurableObjectMigration[];
+  /** Durable Object namespace bindings. */
+  durable_objects?: { bindings: DurableObjectBinding[] };
   /** Workers observability settings. */
   observability?: ObservabilityConfig;
   /** KV namespace bindings; ids become `$KV_<BINDING>_ID` placeholders. */
@@ -114,8 +145,10 @@ export interface WranglerConfig {
   services?: ServiceBinding[];
   /** Browser Rendering binding (Gadget PDF exports). */
   browser?: BindingDecl;
-  /** Artifacts binding — closed beta, cut from customer manifests. */
-  artifacts?: BindingDecl;
+  /** Artifacts namespace bindings. */
+  artifacts?: ArtifactsBinding[];
+  /** Cloudflare Container applications. */
+  containers?: ContainerConfig[];
   /** Static-asset serving config (the router). */
   assets?: {
     binding?: string;
@@ -178,6 +211,8 @@ export interface WorkerEntry {
   migrations: DurableObjectMigration[];
   /** Binding templates for the deploy-side renderer. */
   bindings: ManifestBinding[];
+  /** Cloudflare Container applications. */
+  containers?: ContainerConfig[];
   /** Plain-text vars, including the per-kind templated ones. */
   vars: Record<string, unknown>;
   /** Workers observability settings. */
@@ -233,14 +268,14 @@ export interface WorkerBuild {
 // on a deployable worker needs an explicit decision about how customer instances get it.
 const HANDLED_CONFIG_KEYS = new Set([
   "$schema", "name", "main", "build", "compatibility_date", "compatibility_flags", "rules",
-  "migrations", "observability", "kv_namespaces", "r2_buckets", "worker_loaders", "services",
+  "migrations", "durable_objects", "observability", "kv_namespaces", "r2_buckets", "worker_loaders", "services",
   "assets", "vars",
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
   "browser",
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).
-  "artifacts",
+  "artifacts", "containers",
 ]);
 
 const ARTIFACTS_CUT_ALLOWED = new Set(["gatekeeper-context"]);
@@ -337,7 +372,7 @@ export function buildWorkerEntry(
     throw new Error(`${pkgName}/wrangler.jsonc has key(s) this generator doesn't handle: ` +
         unknownKeys.join(", "));
   }
-  if (config.artifacts && !ARTIFACTS_CUT_ALLOWED.has(pkgName)) {
+  if (config.artifacts && !ARTIFACTS_CUT_ALLOWED.has(pkgName) && pkgName !== "workshop-backend") {
     throw new Error(`${pkgName} declares an artifacts binding; only gatekeeper-context's is ` +
         `known (and cut). Decide how customer instances should handle this one.`);
   }
@@ -365,6 +400,24 @@ export function buildWorkerEntry(
   }
   for (const loader of config.worker_loaders ?? []) {
     bindings.push({ type: "worker_loader", name: loader.binding });
+  }
+  for (const durableObject of config.durable_objects?.bindings ?? []) {
+    bindings.push({
+      type: "durable_object_namespace",
+      name: durableObject.name,
+      class_name: durableObject.class_name,
+      ...(durableObject.script_name ? { script_name: durableObject.script_name } : {}),
+      ...(durableObject.environment ? { environment: durableObject.environment } : {}),
+    });
+  }
+  if (config.artifacts && !ARTIFACTS_CUT_ALLOWED.has(pkgName)) {
+    for (const artifact of config.artifacts) {
+      bindings.push({
+        type: "artifacts",
+        name: artifact.binding,
+        namespace: artifact.namespace,
+      });
+    }
   }
   for (const svc of config.services ?? []) {
     bindings.push({
@@ -458,6 +511,7 @@ export function buildWorkerEntry(
     // final tag is what re-PUTs of an existing worker must present as their current tag.
     migrations: config.migrations ?? [],
     bindings,
+    ...(config.containers ? { containers: config.containers } : {}),
     vars,
     observability: config.observability ?? { enabled: false },
     ...(gatekeeperBindingExpansion ? { gatekeeperBindingExpansion } : {}),

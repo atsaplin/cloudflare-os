@@ -37,6 +37,8 @@ overrides:
 minimumReleaseAge: 1440
 
 minimumReleaseAgeExclude:
+  # Sandbox 1.0 preview is intentionally pinned to its current next release.
+  - '@cloudflare/sandbox'
   - capnweb
   - capnweb-validate
   - workerd

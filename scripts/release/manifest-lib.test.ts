@@ -113,6 +113,15 @@ test("worker entries carry the deploy contract", () => {
   assert.deepEqual(
       backend.bindings.find((b) => b.name === "WORKERS_AI"),
       { type: "ai", name: "WORKERS_AI" });
+  assert.deepEqual(
+      backend.bindings.find((b) => b.name === "ARTIFACTS"),
+      { type: "artifacts", name: "ARTIFACTS", namespace: "workshop-workspaces" });
+  assert.deepEqual(
+      backend.bindings.find((b) => b.name === "Sandbox"),
+      { type: "durable_object_namespace", name: "Sandbox", class_name: "Sandbox" });
+  assert.deepEqual(backend.containers, [
+    { class_name: "Sandbox", image: "./Dockerfile", instance_type: "lite" },
+  ]);
   assert.ok(backend.gatekeeperBindingExpansion);
   assert.equal(backend.gatekeeperBindingExpansion.entrypoint, "GatekeeperVendor");
   assert.equal(backend.vars.PUBLIC_BASE_URL, "$PUBLIC_BASE_URL");
