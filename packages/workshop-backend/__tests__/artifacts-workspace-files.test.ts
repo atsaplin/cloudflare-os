@@ -65,6 +65,7 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   throwAfterAccept = false;
   failCleanupOnce = false;
   deleted = false;
+  initialized = false;
   #counter = 1;
 
   constructor() {
@@ -108,11 +109,12 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   }
 
   ensureCanonical(): Promise<WorkspaceArtifactCanonical> {
+    this.initialized = true;
     return Promise.resolve(this.canonical);
   }
 
-  getCanonical(): Promise<WorkspaceArtifactCanonical> {
-    return Promise.resolve(this.canonical);
+  getCanonical(): Promise<WorkspaceArtifactCanonical | undefined> {
+    return Promise.resolve(this.initialized ? this.canonical : undefined);
   }
 
   getForkStatus(chatId: string, epoch: number): Promise<WorkspaceArtifactForkStatus | undefined> {
@@ -345,6 +347,27 @@ async function withFiles<T>(name: string, run: (files: ArtifactsWorkspaceFiles, 
 function textBytes(value: string): Uint8Array { return new TextEncoder().encode(value); }
 
 describe("ArtifactsWorkspaceFiles", () => {
+  it("initializes the canonical repository when an agent writes the first workspace file", async () => {
+    const result = await withFiles("agent-first-write", async (files, artifacts) => {
+      const written = await files.runChatOperation({
+        chatId: "42",
+        epoch: 0,
+        operationId: "tool-write-first",
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:00:00.000Z",
+        operation: { kind: "write", path: "smoke-test.txt", content: "production" },
+      });
+      return { written, initialized: artifacts.initialized };
+    });
+
+    expect(result.initialized).toBe(true);
+    expect(result.written).toMatchObject({
+      kind: "write",
+      path: "smoke-test.txt",
+      changed: true,
+    });
+  });
+
   it("initializes, lists, reads, and commits stable-ID files with the manifest", async () => {
     const result = await withFiles("basic", async (files, artifacts) => {
       const initial = await files.initialize(ACTOR);
