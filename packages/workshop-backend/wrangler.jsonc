@@ -75,6 +75,10 @@
     {
       "binding": "BLUEPRINT_CONTENT",
       "bucket_name": "gadgets-blueprint-content"
+    },
+    {
+      "binding": "WORKSPACE_FILES",
+      "bucket_name": "gadgets-workspace-files"
     }
   ],
   "worker_loaders": [

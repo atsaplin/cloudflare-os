@@ -27,6 +27,7 @@ declare global {
       // Blueprint storage bindings.
       BLUEPRINTS: KVNamespace;             // Workers KV for blueprint metadata lookup
       BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots
+      WORKSPACE_FILES: R2Bucket;           // Large workspace files and Git objects
 
       // User avatar storage.
       AVATARS: KVNamespace;                // Workers KV for user avatar images

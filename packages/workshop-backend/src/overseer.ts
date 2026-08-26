@@ -61,6 +61,7 @@ import {
   type GadgetExportEntrypoint,
   readCustomExportFormats,
 } from "./gadget-export";
+import { WorkspaceRepository } from "./workspace-repository";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -1383,6 +1384,10 @@ class OverseerImpl implements AgentHooks {
   // One instance per DO so isomorphic-git's parse cache is shared.
   readonly gitStore: GitStore;
 
+  // Durable, versioned files owned by this workspace. The repository facade is the only code that
+  // can touch the underlying Shell worktree, Git index, or large-file R2 binding.
+  readonly workspaceRepository: WorkspaceRepository;
+
   // Per-chat in-memory state for running agents and pending agent callbacks.
   #liveChats = new Map<number, LiveChatContext>();
   #chatSubscribers: Set<RpcStub<AiChatSubscriber>> = new Set();
@@ -1665,6 +1670,11 @@ class OverseerImpl implements AgentHooks {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
+    this.workspaceRepository = new WorkspaceRepository({
+      state: ctx,
+      bucket: env.WORKSPACE_FILES,
+      workspaceId: ctx.id.toString(),
+    });
     this.users = this.ctx.exports.UserDurableObject;
     this.ownerId = this.storage.ownerId.get();
 
@@ -8320,6 +8330,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       })();
     }
 
+    await this.impl.workspaceRepository.initialize({ id: profileId, name: profileId });
+
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
@@ -8387,6 +8399,11 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         };
       }
     }
+
+    await this.impl.workspaceRepository.initialize({
+      id: callerProfile.id,
+      name: callerProfile.id,
+    });
 
     // Complete pending registration in the owner's UserDO.
     if (this.impl.storage.ownerRegistrationPending.get()) {

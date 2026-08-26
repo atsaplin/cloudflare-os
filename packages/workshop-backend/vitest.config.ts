@@ -19,6 +19,7 @@ export default defineConfig({
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
         },
+        r2Buckets: ['WORKSPACE_FILES'],
       },
     }),
   ],

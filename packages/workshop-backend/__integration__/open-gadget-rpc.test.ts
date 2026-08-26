@@ -1,4 +1,4 @@
-import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
+import { abortAllDurableObjects, env, runInDurableObject } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 import {
@@ -10,6 +10,7 @@ import {
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
+import { WorkspaceRepository } from "../src/workspace-repository";
 
 type CodedError = Error & { code?: unknown };
 
@@ -181,6 +182,45 @@ describe("user-DO reset flags", () => {
     // Permanently broken, not fail-once: the fresh-stub-per-call design rests on this.
     const nativeErr2 = await rejection(userStub.listModels());
     expect(nativeErr2.message).toBe("Application called abortAllDurableObjects().");
+  });
+});
+
+describe("workspace filesystem initialization", () => {
+  it("initializes an existing workspace when it is opened after deployment", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "workspacefiles");
+    using authenticated = await publicApi.authenticate(account.token);
+    const metadata = await (async () => {
+      using created = await authenticated.newGadget();
+      return created.getMetadata();
+    })();
+    const workspaceId = exports.OverseerDurableObject.idFromString(metadata.id);
+
+    await runInDurableObject(
+      exports.OverseerDurableObject.get(workspaceId),
+      (_instance, state) => {
+        state.storage.sql.exec("DELETE FROM cf_workspace_workspace_files");
+        state.storage.sql.exec("DELETE FROM workspace_file_operations");
+      },
+    );
+    await abortAllDurableObjects();
+
+    using reconnectedPublicApi = await connect();
+    using reauthenticated = await reconnectedPublicApi.authenticate(account.token);
+    using reopened = reauthenticated.openGadget(metadata.id);
+    expect((await reopened.getMetadata()).id).toBe(metadata.id);
+
+    const history = await runInDurableObject(
+      exports.OverseerDurableObject.get(workspaceId),
+      (_instance, state) => new WorkspaceRepository({
+        state,
+        bucket: env.WORKSPACE_FILES,
+        workspaceId: metadata.id,
+      }).getHistory(10),
+    );
+    expect(history).toEqual([
+      expect.objectContaining({ message: "Initialize workspace\n" }),
+    ]);
   });
 });
 
