@@ -65,6 +65,7 @@ import {
   WorkspaceRepository,
   WorkspaceRepositoryConflictError,
   WorkspaceRepositoryExpectedError,
+  type WorkspaceActor,
 } from "./workspace-repository";
 import {
   createArtifactsWorkspaceRepository,
@@ -2080,6 +2081,16 @@ class OverseerImpl implements AgentHooks {
     }
     this.storage.gadgets.put(record);
     return record;
+  }
+
+  async createPermanentGadget(
+      title: string,
+      bindingName: string,
+      actor: WorkspaceActor,
+      output?: BlueprintOutput,
+  ): Promise<GadgetRecord> {
+    const canonical = await this.workspaceCodeRepository.ensureCanonical(actor);
+    return this.createGadget(title, bindingName, undefined, output, canonical.head);
   }
 
   // The gadgets still provisional to the given chat, in id order.
@@ -6926,9 +6937,10 @@ class OverseerImpl implements AgentHooks {
   // the head is absent (a permanent gadget created outside any chat, before its first accept)
   // *or* an empty tree (an accepted creation with no files yet -- a legitimate head, just not a
   // publishable one): either way the archive would be empty, which instantiation refuses.
-  async assertPublishableCommit(commitId: string | undefined): Promise<string> {
+  async assertPublishableCommit(
+      gadgetId: WorkpieceId, commitId: string | undefined): Promise<string> {
     if (commitId !== undefined &&
-        (await this.gitStore.readCommitFiles(commitId)).size > 0) {
+        (await this.readCommitFiles(gadgetId, commitId)).size > 0) {
       return commitId;
     }
     throw new Error("This gadget has no code to publish. Accept some code first.");
@@ -6939,8 +6951,8 @@ class OverseerImpl implements AgentHooks {
   // always uses the unnamed root "" (the canonical archive root), regardless of which root holds
   // the gadget's files in chat docs, so archives stay compatible across gadgets. (Blueprints of
   // code-less gadgets cannot be created, so a commit is always in hand.)
-  async snapshotCode(commitId: string): Promise<Uint8Array> {
-    let files = await this.gitStore.readCommitFiles(commitId);
+  async snapshotCode(gadgetId: WorkpieceId, commitId: string): Promise<Uint8Array> {
+    let files = await this.readCommitFiles(gadgetId, commitId);
 
     // Create a clean doc with only final content (one insert per file, no history).
     let cleanDoc = new Y.Doc();
@@ -9398,18 +9410,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     let record;
     if (chatId === undefined) {
-      // A permanent gadget is born with its head: an empty-tree initial commit (see
-      // GadgetRecord.commitId), giving a chat's first edit a commit to pin. Written before the
-      // record -- it is content-addressed and referenced by nothing yet, so a validation
-      // failure in createGadget below leaves no trace worth cleaning up.
-      let initialCommitId = await this.impl.gitStore.writeFilesAsCommit(new Map(), {
-        parents: [],
-        author: commitIdentityForAuthor(await this.#getClientProfile()),
-        message: `Create gadget: ${title}`,
-        timestamp: new Date(),
-      });
-      // (createGadget validates the title and name.)
-      record = this.impl.createGadget(title, bindingName, undefined, undefined, initialCommitId);
+      let profile = await this.#getClientProfile();
+      record = await this.impl.createPermanentGadget(title, bindingName, profile);
     } else {
       // Creating a gadget with a chat open is provisional to that chat, like code edits: record
       // the creation in the chat log as a "changes" message (with no code update) and mark
@@ -10478,11 +10480,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       record.metadata.bindings = this.impl.collectBindingMetadata(gadgetId);
       if (options.updateCode) {
         let commitId = await this.impl.assertPublishableCommit(
-            this.impl.getGadgetRecord(gadgetId).commitId);
+            gadgetId, this.impl.getGadgetRecord(gadgetId).commitId);
         record.commitId = commitId;
         delete record.codeVersion;
         record.metadata.version++;
-        codeSnapshot = await this.impl.snapshotCode(commitId);
+        codeSnapshot = await this.impl.snapshotCode(gadgetId, commitId);
       }
     }
 
@@ -10521,7 +10523,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error("This blueprint predates git-backed code storage. Republish its code " +
           "with updateBlueprint instead of retrying.");
     }
-    let codeSnapshot = await this.impl.snapshotCode(record.commitId);
+    let gadgetId = this.impl.resolveGadgetId(record.gadgetId);
+    let codeSnapshot = await this.impl.snapshotCode(gadgetId, record.commitId);
     await this.impl.propagateBlueprint(record, codeSnapshot);
   }
 
@@ -11150,7 +11153,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     // record after the awaits above so the head is current.) A blueprint of a code-less gadget
     // would be useless, so refuse rather than publish an empty archive.
     let commitId = await this.impl.assertPublishableCommit(
-        this.impl.getGadgetRecord(this.id).commitId);
+        this.id, this.impl.getGadgetRecord(this.id).commitId);
     let now = new Date();
 
     let metadata: BlueprintMetadata = {
@@ -11179,7 +11182,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     let screenshot = screenshotUpload ? validateBlueprintScreenshotUpload(screenshotUpload) : undefined;
 
     // Snapshot the committed code and propagate to User DO, KV, R2.
-    let codeSnapshot = await this.impl.snapshotCode(commitId);
+    let codeSnapshot = await this.impl.snapshotCode(this.id, commitId);
     await this.impl.propagateBlueprint(record, codeSnapshot, screenshot);
 
     this.impl.recordGadgetAnalytics({

@@ -68,7 +68,9 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
     const files = await this.#gitStore.readCommitFiles(ref);
     const prefix = `.workspace/gadgets/${gadgetId}/`;
     const scoped = [...files].filter(([path]) => path.startsWith(prefix));
-    return scoped.length === 0 ? files
+    const isWorkspaceRevision = [...files.keys()]
+      .some(path => path.startsWith(".workspace/gadgets/"));
+    return !isWorkspaceRevision ? files
       : new Map(scoped.map(([path, content]) => [path.slice(prefix.length), content]));
   }
 
@@ -738,6 +740,37 @@ describe("mergeChanges", () => {
     let head = impl.storage.gadgets.get(1)!.commitId!;
     expect(await impl.readCommitFiles(1, head))
         .toEqual(new Map([["a.txt", "late\none\nfirst\n"]]));
+  }));
+});
+
+describe("blueprint snapshots", () => {
+  it("creates an empty permanent gadget at the canonical workspace revision",
+      () => withImpl(async impl => {
+    const record = await impl.createPermanentGadget("App", "APP", USER);
+
+    expect(record.commitId).toBe("0".repeat(40));
+    expect(impl.storage.gadgets.get(record.id)).toMatchObject({
+      id: record.id,
+      title: "App",
+      bindingName: "APP",
+      commitId: "0".repeat(40),
+    });
+  }));
+
+  it("checks publishability within the selected gadget subtree", () => withImpl(async impl => {
+    const otherOnly = await commitFiles(impl, {
+      ".workspace/gadgets/2/app.js": "export default 2;\n",
+    });
+    addGadget(impl, 1, "APP", otherOnly);
+
+    await expect(impl.assertPublishableCommit(1, otherOnly))
+      .rejects.toThrow(/no code to publish/i);
+
+    const selected = await commitFiles(impl, {
+      ".workspace/gadgets/1/app.js": "export default 1;\n",
+      ".workspace/gadgets/2/app.js": "export default 2;\n",
+    });
+    await expect(impl.assertPublishableCommit(1, selected)).resolves.toBe(selected);
   }));
 });
 
