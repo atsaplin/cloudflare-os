@@ -1,0 +1,773 @@
+import {
+  WORKSPACE_INDEX_PATH,
+  createEmptyWorkspaceIndex,
+  parseWorkspaceIndex,
+  serializeWorkspaceIndex,
+} from "./workspace-manifest";
+import type { WorkspaceActor } from "./workspace-repository";
+
+const gitOidPattern = /^[0-9a-f]{40}$/;
+const maximumEpoch = 1_000_000_000;
+
+/** The Artifacts repo surface used by the workspace lifecycle. */
+export interface WorkspaceArtifactRepo {
+  readonly name: string;
+  readonly remote: string;
+  readonly defaultBranch: string;
+  createToken(scope: "read" | "write", ttl?: number): Promise<{
+    id: string;
+    plaintext: string;
+    scope: "read" | "write";
+  }>;
+  revokeToken(tokenOrId: string): Promise<boolean>;
+  fork(name: string, options?: {
+    description?: string;
+    readOnly?: boolean;
+    defaultBranchOnly?: boolean;
+  }): Promise<{
+    name: string;
+    remote: string;
+    defaultBranch: string;
+    token: string;
+  }>;
+}
+
+/** The namespace-level Artifacts operations used by the workspace lifecycle. */
+export interface WorkspaceArtifactControlPlane {
+  create(name: string, options?: {
+    description?: string;
+    readOnly?: boolean;
+    setDefaultBranch?: string;
+  }): Promise<{
+    name: string;
+    remote: string;
+    defaultBranch: string;
+    token: string;
+  }>;
+  get(name: string): Promise<WorkspaceArtifactRepo>;
+  delete(name: string): Promise<boolean>;
+}
+
+/** Bounded read access to repository refs and files. */
+export interface WorkspaceArtifactReader {
+  getHead(repositoryName: string): Promise<string | undefined>;
+  readFile(
+    repositoryName: string,
+    ref: string,
+    path: string,
+    maximumBytes?: number,
+  ): Promise<Uint8Array>;
+}
+
+interface WorkspaceArtifactCommitSummary {
+  hash: string;
+}
+
+interface WorkspaceArtifactHistoryRepo extends WorkspaceArtifactRepo {
+  log(options: { ref: string; limit: number }): Promise<unknown>;
+}
+
+export interface CloudflareWorkspaceArtifactReaderOptions {
+  artifacts: WorkspaceArtifactControlPlane;
+  accountId: string;
+  namespace: string;
+  apiToken: string;
+  fetch?: (request: Request) => Promise<Response>;
+}
+
+function requireConfigurationValue(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) throw new Error(`${label} is invalid.`);
+  return trimmed;
+}
+
+function hasRepositoryLog(repo: WorkspaceArtifactRepo): repo is WorkspaceArtifactHistoryRepo {
+  return "log" in repo && typeof repo.log === "function";
+}
+
+function parseCommitLog(value: unknown): WorkspaceArtifactCommitSummary[] {
+  if (!Array.isArray(value)) throw new Error("Artifacts commit history response is invalid.");
+  return value.map(commit => {
+    if (typeof commit !== "object" || commit === null || !("hash" in commit) ||
+        typeof commit.hash !== "string") {
+      throw new Error("Artifacts commit history entry is invalid.");
+    }
+    return { hash: requireOid(commit.hash, "Artifacts commit history head") };
+  });
+}
+
+/** Reads bounded repository content without starting a Sandbox. */
+export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReader {
+  readonly #artifacts: WorkspaceArtifactControlPlane;
+  readonly #accountId: string;
+  readonly #namespace: string;
+  readonly #apiToken: string;
+  readonly #fetch: (request: Request) => Promise<Response>;
+
+  constructor(options: CloudflareWorkspaceArtifactReaderOptions) {
+    this.#artifacts = options.artifacts;
+    this.#accountId = requireConfigurationValue(options.accountId, "Artifacts account ID");
+    this.#namespace = requireConfigurationValue(options.namespace, "Artifacts namespace");
+    this.#apiToken = requireConfigurationValue(options.apiToken, "Artifacts API token");
+    this.#fetch = options.fetch ?? (request => fetch(request));
+  }
+
+  async getHead(repositoryName: string): Promise<string | undefined> {
+    const repo = await this.#artifacts.get(repositoryName);
+    if (!hasRepositoryLog(repo)) {
+      throw new Error("The Artifacts binding does not expose repository history.");
+    }
+    const commits = parseCommitLog(await repo.log({ ref: repo.defaultBranch, limit: 1 }));
+    return commits[0]?.hash;
+  }
+
+  async readFile(
+    repositoryName: string,
+    ref: string,
+    path: string,
+    maximumBytes = 4 * 1024 * 1024,
+  ): Promise<Uint8Array> {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
+      throw new Error("Workspace file read bound is invalid.");
+    }
+    requireOid(ref, "Workspace file ref");
+    const url = new URL(
+      `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}` +
+      `/artifacts/namespaces/${encodeURIComponent(this.#namespace)}` +
+      `/repos/${encodeURIComponent(repositoryName)}/file`,
+    );
+    url.searchParams.set("ref", ref);
+    url.searchParams.set("path", path);
+    const response = await this.#fetch(new Request(url, {
+      headers: { Authorization: `Bearer ${this.#apiToken}` },
+    }));
+    if (!response.ok) {
+      throw new Error(`Artifacts file read failed with status ${response.status}.`);
+    }
+    const declaredLength = response.headers.get("Content-Length");
+    if (declaredLength !== null) {
+      const length = Number(declaredLength);
+      if (!Number.isSafeInteger(length) || length < 0) {
+        throw new Error("Artifacts file response length is invalid.");
+      }
+      if (length > maximumBytes) throw new Error("Artifacts file exceeds the read bound.");
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maximumBytes) throw new Error("Artifacts file exceeds the read bound.");
+    return bytes;
+  }
+}
+
+/** Trusted Git operations executed in disposable Cloudflare Sandboxes. */
+export interface WorkspaceArtifactGitRuntime {
+  initialize(request: {
+    repositoryName: string;
+    remote: string;
+    token: string;
+    index: Uint8Array;
+  }): Promise<string>;
+  promote(request: {
+    canonicalRepositoryName: string;
+    canonicalRemote: string;
+    canonicalToken: string;
+    forkRepositoryName: string;
+    forkRemote: string;
+    forkToken: string;
+    expectedCanonicalHead: string;
+  }): Promise<string>;
+  destroy(sandboxId: string): Promise<void>;
+}
+
+/** Minimal Sandbox client used by trusted repository Git operations. */
+export interface WorkspaceArtifactSandbox {
+  exec(command: string[], options?: {
+    cwd?: string;
+    env?: Record<string, string>;
+    timeout?: number;
+  }): Promise<{
+    output(options?: { encoding?: "utf8"; maxBytes?: number }): Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number;
+      timedOut: boolean;
+      truncated: boolean;
+    }>;
+  }>;
+  writeFile(path: string, content: string): Promise<unknown>;
+  destroy(): Promise<void>;
+}
+
+/** Resolves a lazy Sandbox handle without starting its container. */
+export type WorkspaceArtifactSandboxFactory = (sandboxId: string) => WorkspaceArtifactSandbox;
+
+/** Durable projection of one workspace's canonical Artifacts repository. */
+export interface WorkspaceArtifactCanonical {
+  repositoryName: string;
+  remote: string;
+  defaultBranch: string;
+  head: string;
+  rootId: string;
+}
+
+/** Durable identity and baseline for one chat's private Artifacts fork. */
+export interface WorkspaceArtifactChatFork {
+  chatId: string;
+  epoch: number;
+  repositoryName: string;
+  remote: string;
+  defaultBranch: string;
+  baselineHead: string;
+  latestHead: string;
+  sandboxId: string;
+}
+
+/** Result of accepting a chat fork through the existing proposal lifecycle. */
+export type WorkspaceArtifactAcceptResult =
+  | { status: "merged"; head: string }
+  | { status: "stale"; expectedHead: string; currentHead: string };
+
+interface CanonicalRow {
+  [key: string]: string | number;
+  repository_name: string;
+  remote: string;
+  default_branch: string;
+  head: string;
+  root_id: string;
+}
+
+interface ForkRow {
+  [key: string]: string | number | null;
+  chat_id: string;
+  epoch: number;
+  repository_name: string;
+  remote: string;
+  default_branch: string;
+  baseline_head: string;
+  latest_head: string;
+  sandbox_id: string;
+  state: string;
+  accepted_head: string | null;
+}
+
+/** Dependencies for one workspace-owned Artifacts lifecycle. */
+export interface WorkspaceArtifactLifecycleOptions {
+  state: DurableObjectState;
+  workspaceId: string;
+  artifacts: WorkspaceArtifactControlPlane;
+  reader: WorkspaceArtifactReader;
+  gitRuntime: WorkspaceArtifactGitRuntime;
+}
+
+function isArtifactsError(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+function requireOid(value: string, label: string): string {
+  if (!gitOidPattern.test(value)) throw new Error(`${label} is not a Git commit SHA.`);
+  return value;
+}
+
+function gitAuthorization(token: string): string {
+  if (!token || /[\r\n]/.test(token)) throw new Error("Artifacts Git token is invalid.");
+  return `http.extraHeader=Authorization: Bearer ${token}`;
+}
+
+function noop(): void {}
+
+/** Trusted Sandbox implementation of repository initialization and fast-forward promotion. */
+export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitRuntime {
+  readonly #sandbox: WorkspaceArtifactSandboxFactory;
+
+  constructor(sandbox: WorkspaceArtifactSandboxFactory) {
+    this.#sandbox = sandbox;
+  }
+
+  async #run(sandbox: WorkspaceArtifactSandbox, command: string[]): Promise<string> {
+    const process = await sandbox.exec(command, { timeout: 120_000 });
+    const output = await process.output({ encoding: "utf8", maxBytes: 256 * 1024 });
+    if (output.timedOut) throw new Error("Workspace Git operation timed out.");
+    if (output.truncated) throw new Error("Workspace Git operation output exceeded its bound.");
+    if (output.exitCode !== 0) {
+      throw new Error(`Workspace Git operation exited with code ${output.exitCode}.`);
+    }
+    return output.stdout;
+  }
+
+  /** Creates the first commit in a newly created Artifacts repository. */
+  async initialize(request: {
+    repositoryName: string;
+    remote: string;
+    token: string;
+    index: Uint8Array;
+  }): Promise<string> {
+    const sandbox = this.#sandbox(`workspace-initialize-${request.repositoryName}`);
+    const directory = "/workspace/repo";
+    const header = gitAuthorization(request.token);
+    try {
+      await this.#run(sandbox, ["git", "-c", header, "clone", request.remote, directory]);
+      await this.#run(sandbox, ["mkdir", "-p", `${directory}/.workspace`]);
+      await sandbox.writeFile(
+        `${directory}/${WORKSPACE_INDEX_PATH}`,
+        new TextDecoder().decode(request.index),
+      );
+      await this.#run(sandbox, ["git", "-C", directory, "add", "-A"]);
+      await this.#run(sandbox, [
+        "git", "-C", directory,
+        "-c", "user.name=Cloudflare OS",
+        "-c", "user.email=workspace@cloudflare-os.invalid",
+        "commit", "-m", "Initialize workspace",
+      ]);
+      await this.#run(sandbox, [
+        "git", "-C", directory, "-c", header,
+        "push", request.remote, "HEAD:main",
+      ]);
+      return requireOid(
+        (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
+        "Initialized workspace head",
+      );
+    } finally {
+      await sandbox.destroy();
+    }
+  }
+
+  /** Promotes a chat fork through a clean Sandbox without exposing canonical credentials to it. */
+  async promote(request: {
+    canonicalRepositoryName: string;
+    canonicalRemote: string;
+    canonicalToken: string;
+    forkRepositoryName: string;
+    forkRemote: string;
+    forkToken: string;
+    expectedCanonicalHead: string;
+  }): Promise<string> {
+    const sandbox = this.#sandbox(
+      `workspace-promote-${request.canonicalRepositoryName}-${request.forkRepositoryName}`,
+    );
+    const directory = "/workspace/repo";
+    const forkHeader = gitAuthorization(request.forkToken);
+    const canonicalHeader = gitAuthorization(request.canonicalToken);
+    try {
+      await this.#run(sandbox, ["git", "-c", forkHeader, "clone", request.forkRemote, directory]);
+      await this.#run(sandbox, [
+        "git", "-C", directory, "merge-base", "--is-ancestor",
+        requireOid(request.expectedCanonicalHead, "Expected canonical head"), "HEAD",
+      ]);
+      await this.#run(sandbox, [
+        "git", "-C", directory, "-c", canonicalHeader,
+        "push", request.canonicalRemote, "HEAD:main",
+      ]);
+      return requireOid(
+        (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
+        "Promoted workspace head",
+      );
+    } finally {
+      await sandbox.destroy();
+    }
+  }
+
+  /** Destroys the chat's disposable Sandbox if it exists. */
+  async destroy(sandboxId: string): Promise<void> {
+    await this.#sandbox(sandboxId).destroy();
+  }
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function canonicalFromRow(row: CanonicalRow): WorkspaceArtifactCanonical {
+  return {
+    repositoryName: row.repository_name,
+    remote: row.remote,
+    defaultBranch: row.default_branch,
+    head: row.head,
+    rootId: row.root_id,
+  };
+}
+
+function forkFromRow(row: ForkRow): WorkspaceArtifactChatFork {
+  return {
+    chatId: row.chat_id,
+    epoch: row.epoch,
+    repositoryName: row.repository_name,
+    remote: row.remote,
+    defaultBranch: row.default_branch,
+    baselineHead: row.baseline_head,
+    latestHead: row.latest_head,
+    sandboxId: row.sandbox_id,
+  };
+}
+
+/**
+ * Owns canonical workspace repository and per-chat fork lifecycle metadata.
+ *
+ * Artifacts owns Git refs and bytes. This object stores only authorization-adjacent identities and
+ * projections needed to connect those repositories to the existing chat Accept/Discard lifecycle.
+ */
+export class WorkspaceArtifactLifecycle {
+  readonly #state: DurableObjectState;
+  readonly #workspaceId: string;
+  readonly #artifacts: WorkspaceArtifactControlPlane;
+  readonly #reader: WorkspaceArtifactReader;
+  readonly #gitRuntime: WorkspaceArtifactGitRuntime;
+  #tail: Promise<void> = Promise.resolve();
+
+  constructor(options: WorkspaceArtifactLifecycleOptions) {
+    if (!options.workspaceId) throw new Error("Workspace ID is required.");
+    this.#state = options.state;
+    this.#workspaceId = options.workspaceId;
+    this.#artifacts = options.artifacts;
+    this.#reader = options.reader;
+    this.#gitRuntime = options.gitRuntime;
+  }
+
+  #ensureTables(): void {
+    this.#state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS workspace_artifact_repository (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        repository_name TEXT NOT NULL UNIQUE,
+        remote TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        head TEXT NOT NULL,
+        root_id TEXT NOT NULL
+      )
+    `);
+    this.#state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS workspace_artifact_forks (
+        chat_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        repository_name TEXT NOT NULL UNIQUE,
+        remote TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        baseline_head TEXT NOT NULL,
+        latest_head TEXT NOT NULL,
+        sandbox_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('creating', 'open', 'accepting', 'accepted', 'discarding')),
+        accepted_head TEXT,
+        PRIMARY KEY (chat_id, epoch)
+      )
+    `);
+  }
+
+  async #withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#tail;
+    let release = noop;
+    this.#tail = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  #canonicalRow(): CanonicalRow | undefined {
+    this.#ensureTables();
+    return [...this.#state.storage.sql.exec<CanonicalRow>(`
+      SELECT repository_name, remote, default_branch, head, root_id
+      FROM workspace_artifact_repository
+      WHERE singleton = 1
+    `)][0];
+  }
+
+  #forkRow(chatId: string, epoch: number): ForkRow | undefined {
+    this.#ensureTables();
+    return [...this.#state.storage.sql.exec<ForkRow>(`
+      SELECT chat_id, epoch, repository_name, remote, default_branch, baseline_head,
+             latest_head, sandbox_id, state, accepted_head
+      FROM workspace_artifact_forks
+      WHERE chat_id = ? AND epoch = ?
+    `, chatId, epoch)][0];
+  }
+
+  async #canonicalRepositoryName(): Promise<string> {
+    return `workspace-${(await sha256Hex(this.#workspaceId)).slice(0, 40)}`;
+  }
+
+  async #forkRepositoryName(chatId: string, epoch: number): Promise<string> {
+    const [workspaceHash, chatHash] = await Promise.all([
+      sha256Hex(this.#workspaceId),
+      sha256Hex(chatId),
+    ]);
+    return `workspace-${workspaceHash.slice(0, 24)}-chat-${chatHash.slice(0, 24)}-e${epoch}`;
+  }
+
+  async #getReadyRepository(name: string): Promise<WorkspaceArtifactRepo> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        return await this.#artifacts.get(name);
+      } catch (error) {
+        if (!isArtifactsError(error, "FORK_IN_PROGRESS") || attempt === 4) throw error;
+        await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+      }
+    }
+    throw new Error(`Artifacts repository ${name} did not become ready.`);
+  }
+
+  async #revokeToken(repo: WorkspaceArtifactRepo, tokenOrId: string): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await repo.revokeToken(tokenOrId);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error("Could not revoke a workspace Artifacts token.", { cause: lastError });
+  }
+
+  /** Creates or resolves the workspace's one canonical Artifacts repository. */
+  ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical> {
+    return this.#withLock(async () => {
+      const stored = this.#canonicalRow();
+      if (stored) return canonicalFromRow(stored);
+
+      const repositoryName = await this.#canonicalRepositoryName();
+      let initialToken: string | undefined;
+      try {
+        const created = await this.#artifacts.create(repositoryName, {
+          description: `Workspace ${this.#workspaceId}`,
+          readOnly: false,
+          setDefaultBranch: "main",
+        });
+        initialToken = created.token;
+      } catch (error) {
+        if (!isArtifactsError(error, "ALREADY_EXISTS")) throw error;
+      }
+
+      const repo = await this.#getReadyRepository(repositoryName);
+      let head = await this.#reader.getHead(repositoryName);
+      let rootId: string;
+      if (head === undefined) {
+        const index = createEmptyWorkspaceIndex({
+          actorId: actor.id,
+          now: new Date().toISOString(),
+        });
+        const minted = initialToken === undefined ? await repo.createToken("write", 60) : undefined;
+        const token = initialToken ?? minted?.plaintext;
+        if (token === undefined) throw new Error("Workspace initialization has no Git token.");
+        try {
+          head = requireOid(await this.#gitRuntime.initialize({
+            repositoryName,
+            remote: repo.remote,
+            token,
+            index: serializeWorkspaceIndex(index),
+          }), "Initialized workspace head");
+        } finally {
+          await this.#revokeToken(repo, minted?.id ?? token);
+        }
+        rootId = index.rootId;
+      } else {
+        requireOid(head, "Workspace head");
+        const index = parseWorkspaceIndex(
+          await this.#reader.readFile(repositoryName, head, WORKSPACE_INDEX_PATH),
+        );
+        rootId = index.rootId;
+        if (initialToken !== undefined) await this.#revokeToken(repo, initialToken);
+      }
+
+      this.#state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_repository (
+          singleton, repository_name, remote, default_branch, head, root_id
+        ) VALUES (1, ?, ?, ?, ?, ?)
+      `, repositoryName, repo.remote, repo.defaultBranch, head, rootId);
+      return { repositoryName, remote: repo.remote, defaultBranch: repo.defaultBranch, head, rootId };
+    });
+  }
+
+  /** Returns one open chat fork without creating it. */
+  getChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactChatFork | undefined> {
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      return row?.state === "open" ? forkFromRow(row) : undefined;
+    });
+  }
+
+  /** Creates or resolves one private Artifacts fork for a writable chat epoch. */
+  ensureChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactChatFork> {
+    return this.#withLock(async () => {
+      if (!chatId || !Number.isInteger(epoch) || epoch < 0 || epoch > maximumEpoch) {
+        throw new Error("Chat fork identity is invalid.");
+      }
+      const existing = this.#forkRow(chatId, epoch);
+      if (existing?.state === "open") return forkFromRow(existing);
+      if (existing && existing.state !== "creating") {
+        throw new Error(`Chat fork ${chatId}/${epoch} is ${existing.state}.`);
+      }
+
+      const canonicalRow = this.#canonicalRow();
+      if (!canonicalRow) throw new Error("Canonical workspace repository is not initialized.");
+      const liveHead = await this.#reader.getHead(canonicalRow.repository_name);
+      if (liveHead === undefined) throw new Error("Canonical workspace repository has no head.");
+      requireOid(liveHead, "Canonical workspace head");
+      const baselineHead = existing?.baseline_head ?? liveHead;
+      const repositoryName = existing?.repository_name ??
+        await this.#forkRepositoryName(chatId, epoch);
+      const sandboxId = existing?.sandbox_id ?? `workspace-chat-${await sha256Hex(repositoryName)}`;
+
+      if (!existing) {
+        this.#state.storage.sql.exec(`
+          INSERT INTO workspace_artifact_forks (
+            chat_id, epoch, repository_name, remote, default_branch, baseline_head,
+            latest_head, sandbox_id, state, accepted_head
+          ) VALUES (?, ?, ?, '', 'main', ?, ?, ?, 'creating', NULL)
+        `, chatId, epoch, repositoryName, baselineHead, baselineHead, sandboxId);
+      }
+
+      let initialToken: string | undefined;
+      try {
+        const canonical = await this.#getReadyRepository(canonicalRow.repository_name);
+        const forked = await canonical.fork(repositoryName, {
+          description: `Workspace chat ${chatId} epoch ${epoch}`,
+          readOnly: false,
+          defaultBranchOnly: true,
+        });
+        initialToken = forked.token;
+      } catch (error) {
+        if (!isArtifactsError(error, "ALREADY_EXISTS")) throw error;
+      }
+
+      const repo = await this.#getReadyRepository(repositoryName);
+      if (initialToken !== undefined) await this.#revokeToken(repo, initialToken);
+      const forkHead = await this.#reader.getHead(repositoryName);
+      if (forkHead === undefined) throw new Error("Chat fork has no head.");
+      requireOid(forkHead, "Chat fork head");
+      if (forkHead !== baselineHead) {
+        throw new Error(`Chat fork ${repositoryName} does not match its recorded baseline.`);
+      }
+
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks
+        SET remote = ?, default_branch = ?, baseline_head = ?, latest_head = ?, state = 'open'
+        WHERE chat_id = ? AND epoch = ? AND state = 'creating'
+      `, repo.remote, repo.defaultBranch, baselineHead, forkHead, chatId, epoch);
+      const ready = this.#forkRow(chatId, epoch);
+      if (!ready || ready.state !== "open") throw new Error("Chat fork did not become ready.");
+      return forkFromRow(ready);
+    });
+  }
+
+  /** Accepts one chat fork only when canonical main still matches its recorded baseline. */
+  acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
+    return this.#withLock(async () => {
+      const canonicalRow = this.#canonicalRow();
+      if (!canonicalRow) throw new Error("Canonical workspace repository is not initialized.");
+      const row = this.#forkRow(chatId, epoch);
+      if (!row) {
+        const head = await this.#reader.getHead(canonicalRow.repository_name);
+        if (head === undefined) throw new Error("Canonical workspace repository has no head.");
+        return { status: "merged", head: requireOid(head, "Canonical workspace head") };
+      }
+      if (row.state === "accepted") return this.#finishAcceptedFork(row);
+      if (row.state !== "open" && row.state !== "accepting") {
+        throw new Error(`Chat fork ${chatId}/${epoch} is ${row.state}.`);
+      }
+
+      const currentHead = await this.#reader.getHead(canonicalRow.repository_name);
+      if (currentHead === undefined) throw new Error("Canonical workspace repository has no head.");
+      requireOid(currentHead, "Canonical workspace head");
+      if (currentHead !== row.baseline_head) {
+        return { status: "stale", expectedHead: row.baseline_head, currentHead };
+      }
+      const forkHead = await this.#reader.getHead(row.repository_name);
+      if (forkHead === undefined) throw new Error("Chat fork has no head.");
+      requireOid(forkHead, "Chat fork head");
+
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks SET state = 'accepting', latest_head = ?
+        WHERE chat_id = ? AND epoch = ?
+      `, forkHead, chatId, epoch);
+      const canonical = await this.#getReadyRepository(canonicalRow.repository_name);
+      const fork = await this.#getReadyRepository(row.repository_name);
+      const [canonicalToken, forkToken] = await Promise.all([
+        canonical.createToken("write", 60),
+        fork.createToken("read", 60),
+      ]);
+      let acceptedHead: string;
+      try {
+        try {
+          acceptedHead = requireOid(await this.#gitRuntime.promote({
+            canonicalRepositoryName: canonical.name,
+            canonicalRemote: canonical.remote,
+            canonicalToken: canonicalToken.plaintext,
+            forkRepositoryName: fork.name,
+            forkRemote: fork.remote,
+            forkToken: forkToken.plaintext,
+            expectedCanonicalHead: row.baseline_head,
+          }), "Accepted workspace head");
+        } catch (error) {
+          const recoveredHead = await this.#reader.getHead(canonicalRow.repository_name);
+          if (recoveredHead === forkHead) {
+            acceptedHead = forkHead;
+          } else if (recoveredHead !== undefined && recoveredHead !== row.baseline_head) {
+            this.#state.storage.sql.exec(`
+              UPDATE workspace_artifact_forks SET state = 'open'
+              WHERE chat_id = ? AND epoch = ? AND state = 'accepting'
+            `, chatId, epoch);
+            return {
+              status: "stale",
+              expectedHead: row.baseline_head,
+              currentHead: requireOid(recoveredHead, "Canonical workspace head"),
+            };
+          } else {
+            this.#state.storage.sql.exec(`
+              UPDATE workspace_artifact_forks SET state = 'open'
+              WHERE chat_id = ? AND epoch = ? AND state = 'accepting'
+            `, chatId, epoch);
+            throw error;
+          }
+        }
+      } finally {
+        await Promise.all([
+          this.#revokeToken(canonical, canonicalToken.id),
+          this.#revokeToken(fork, forkToken.id),
+        ]);
+      }
+
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_repository SET head = ? WHERE singleton = 1
+      `, acceptedHead);
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks SET state = 'accepted', accepted_head = ?
+        WHERE chat_id = ? AND epoch = ?
+      `, acceptedHead, chatId, epoch);
+      const accepted = this.#forkRow(chatId, epoch);
+      if (!accepted) throw new Error("Accepted chat fork metadata disappeared.");
+      return this.#finishAcceptedFork(accepted);
+    });
+  }
+
+  async #finishAcceptedFork(row: ForkRow): Promise<WorkspaceArtifactAcceptResult> {
+    if (!row.accepted_head) throw new Error("Accepted chat fork has no accepted head.");
+    await this.#cleanupFork(row);
+    return { status: "merged", head: requireOid(row.accepted_head, "Accepted workspace head") };
+  }
+
+  async #cleanupFork(row: ForkRow): Promise<void> {
+    await this.#gitRuntime.destroy(row.sandbox_id);
+    await this.#artifacts.delete(row.repository_name);
+    this.#state.storage.sql.exec(
+      "DELETE FROM workspace_artifact_forks WHERE chat_id = ? AND epoch = ?",
+      row.chat_id,
+      row.epoch,
+    );
+  }
+
+  /** Closes a chat fork before deleting its Sandbox and Artifacts repository. */
+  discardChatFork(chatId: string, epoch: number): Promise<void> {
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      if (!row) return;
+      if (row.state === "accepted") throw new Error("An accepted chat fork cannot be discarded.");
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks SET state = 'discarding'
+        WHERE chat_id = ? AND epoch = ?
+      `, chatId, epoch);
+      await this.#cleanupFork({ ...row, state: "discarding" });
+    });
+  }
+}

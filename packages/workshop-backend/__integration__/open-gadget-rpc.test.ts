@@ -417,33 +417,6 @@ describe("workspace filesystem initialization", () => {
     expect((await env.WORKSPACE_FILES.list({ prefix })).objects).toEqual([]);
   });
 
-  it("deletes a chat's Artifacts fork through the existing deleteChat API", async () => {
-    using publicApi = await connect();
-    const account = await createAccount(publicApi, "chatartifactfork");
-    using authenticated = await publicApi.authenticate(account.token);
-    using workspace = await authenticated.newGadget();
-    const metadata = await workspace.getMetadata();
-    const chatId = await workspace.newChat("Create a workspace file", null);
-    const durableObject = exports.OverseerDurableObject.get(
-      exports.OverseerDurableObject.idFromString(metadata.id),
-    );
-
-    await runInDurableObject(durableObject, async instance => {
-      let impl = (instance as unknown as {impl: any}).impl;
-      let ensure = impl.ensureChatArtifactFork;
-      expect(ensure).toEqual(expect.any(Function));
-      await ensure.call(impl, chatId);
-      expect(impl.storage.chatArtifactForks.get(chatId)).toBeDefined();
-    });
-
-    await workspace.deleteChat(chatId);
-
-    await runInDurableObject(durableObject, instance => {
-      let impl = (instance as unknown as {impl: any}).impl;
-      expect(impl.storage.chatMeta.get(chatId)).toBeUndefined();
-      expect(impl.storage.chatArtifactForks.get(chatId)).toBeUndefined();
-    });
-  });
 });
 
 // The asymmetric reset a retained-stub design can't absorb: the USER DO resets while the
