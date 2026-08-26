@@ -340,8 +340,10 @@ describe("WorkspaceArtifactLifecycle", () => {
         id: "user:aleksey",
         name: "Aleksey",
       }, "Update workspace", {
-        deletePaths: ["old.txt"],
-        writes: [{ path: "new.txt", content: new TextEncoder().encode("new\n") }],
+        operations: [
+          { kind: "delete", path: "old.txt" },
+          { kind: "write", path: "new.txt", content: new TextEncoder().encode("new\n") },
+        ],
       });
 
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
@@ -359,7 +361,7 @@ describe("WorkspaceArtifactLifecycle", () => {
       const checkpoint = await lifecycle.stageChatMutation("chat-one", 1, {
         id: "user:aleksey",
         name: "Aleksey",
-      }, "Retry workspace update", { deletePaths: [], writes: [] });
+      }, "Retry workspace update", { operations: [] });
 
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.mutationExpectedHeads).toEqual([CHECKPOINT_HEAD]);
@@ -584,13 +586,16 @@ describe("ArtifactsWorkspaceRepository", () => {
 
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.mutations).toEqual([{
-        deletePaths: [".workspace/gadgets/7", ".workspace/gadgets/8"],
-        writes: [
+        operations: [
+          { kind: "delete", path: ".workspace/gadgets/7" },
           {
+            kind: "write",
             path: ".workspace/gadgets/7/client.js",
             content: new TextEncoder().encode("client\n"),
           },
+          { kind: "delete", path: ".workspace/gadgets/8" },
           {
+            kind: "write",
             path: ".workspace/gadgets/8/server.js",
             content: new TextEncoder().encode("server\n"),
           },
@@ -771,6 +776,7 @@ describe("CloudflareWorkspaceArtifactReader", () => {
 
 class FakeSandbox implements WorkspaceArtifactSandbox {
   readonly commands: string[][] = [];
+  readonly events: string[] = [];
   readonly files = new Map<string, string | Uint8Array>();
   readonly directories: string[] = [];
   readonly gitAuth: Array<Record<string, { token: string; type: "bearer" }>> = [];
@@ -791,6 +797,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
 
   async mkdir(path: string): Promise<void> {
     this.directories.push(path);
+    this.events.push(`mkdir:${path}`);
   }
 
   async exec(command: SandboxCommand, _options?: ExecOptions): Promise<{
@@ -803,6 +810,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     }>;
   }> {
     this.commands.push([...command]);
+    this.events.push(`exec:${command.join(" ")}`);
     if (command.includes("commit")) this.head = CHECKPOINT_HEAD;
     const stdout = command.includes("rev-parse")
       ? `${this.head}\n`
@@ -819,6 +827,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
   }
 
   async writeFile(path: string, content: string | ReadableStream<Uint8Array>): Promise<void> {
+    this.events.push(`write:${path}`);
     if (typeof content === "string") {
       this.files.set(path, content);
       return;
@@ -956,10 +965,10 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       actor: { id: "user:aleksey", name: "Aleksey" },
       message: "Update workspace files",
       mutation: {
-        deletePaths: ["old.txt"],
-        writes: [
-          { path: "notes.txt", content: new TextEncoder().encode("updated\n") },
-          { path: "nested/data.bin", content: new Uint8Array([0, 255, 1]) },
+        operations: [
+          { kind: "delete", path: "old.txt" },
+          { kind: "write", path: "notes.txt", content: new TextEncoder().encode("updated\n") },
+          { kind: "write", path: "nested/data.bin", content: new Uint8Array([0, 255, 1]) },
         ],
       },
     })).resolves.toBe(CHECKPOINT_HEAD);
@@ -975,6 +984,42 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     expect(sandbox.gitAuth.at(-1)).toEqual({
       "artifacts.example": { token: "fork-write-secret", type: "bearer" },
     });
+  });
+
+  it("applies an ordered mutation sequence with explicit git move arguments", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    sandbox.status = " M renamed.txt\n D old.txt\n";
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Reorganize workspace files",
+      mutation: {
+        operations: [
+          { kind: "move", from: "notes.txt", to: "archive/renamed.txt" },
+          { kind: "delete", path: "old.txt" },
+          { kind: "write", path: "nested/data.bin", content: new Uint8Array([0, 255, 1]) },
+        ],
+      },
+    })).resolves.toBe(CHECKPOINT_HEAD);
+
+    const moveIndex = sandbox.events.findIndex(event => event.includes(" mv "));
+    const deleteIndex = sandbox.events.findIndex(event => event.includes(" rm "));
+    const writeIndex = sandbox.events.findIndex(event => event === "write:/workspace/repo/nested/data.bin");
+    expect(sandbox.commands.find(command => command.includes("mv"))).toEqual([
+      "git", "-C", "/workspace/repo", "mv", "--", "notes.txt", "archive/renamed.txt",
+    ]);
+    expect(sandbox.directories).toContain("/workspace/repo/archive");
+    expect(moveIndex).toBeLessThan(deleteIndex);
+    expect(deleteIndex).toBeLessThan(writeIndex);
+    expect(sandbox.files.get("/workspace/repo/nested/data.bin"))
+      .toEqual(new Uint8Array([0, 255, 1]));
   });
 
   it.each([
@@ -996,15 +1041,14 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       actor: { id: "user:aleksey", name: "Aleksey" },
       message: "Unsafe write",
       mutation: {
-        deletePaths: [],
-        writes: [{ path, content: new Uint8Array() }],
+        operations: [{ kind: "write", path, content: new Uint8Array() }],
       },
     })).rejects.toThrow(/path/i);
 
     expect(sandbox.commands).toHaveLength(0);
   });
 
-  it("rejects conflicting file paths before changing the working tree", async () => {
+  it("rejects unsafe move paths before changing the working tree", async () => {
     const sandbox = new FakeSandbox();
     sandbox.repositoryExists = true;
     const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
@@ -1016,13 +1060,58 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       defaultBranch: "main",
       expectedHead: INITIAL_HEAD,
       actor: { id: "user:aleksey", name: "Aleksey" },
-      message: "Conflicting writes",
+      message: "Unsafe move",
       mutation: {
-        deletePaths: [],
-        writes: [
-          { path: "file", content: new Uint8Array() },
-          { path: "file/nested", content: new Uint8Array() },
+        operations: [{ kind: "move", from: "safe.txt", to: "nested/.git/config" }],
+      },
+    })).rejects.toThrow(/path/i);
+
+    expect(sandbox.commands).toHaveLength(0);
+  });
+
+  it("allows an ordered move followed by a replacement at its destination", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    sandbox.status = "R  notes.txt -> renamed.txt\n";
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Move and replace",
+      mutation: {
+        operations: [
+          { kind: "move", from: "notes.txt", to: "renamed.txt" },
+          { kind: "write", path: "renamed.txt", content: new Uint8Array() },
         ],
+      },
+    })).resolves.toBe(CHECKPOINT_HEAD);
+
+    expect(sandbox.commands.find(command => command.includes("mv"))).toEqual([
+      "git", "-C", "/workspace/repo", "mv", "--", "notes.txt", "renamed.txt",
+    ]);
+    expect(sandbox.files.get("/workspace/repo/renamed.txt")).toEqual(new Uint8Array());
+  });
+
+  it("rejects a move into its own descendant before changing the working tree", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.stageChatMutation({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Invalid move",
+      mutation: {
+        operations: [{ kind: "move", from: "folder", to: "folder/nested" }],
       },
     })).rejects.toThrow(/conflict/i);
 

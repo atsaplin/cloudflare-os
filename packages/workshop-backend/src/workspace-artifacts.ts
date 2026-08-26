@@ -22,6 +22,7 @@ const maximumCommitParents = 32;
 const maximumCommitMessageBytes = 64 * 1024;
 const maximumCommitIdentityBytes = 4 * 1024;
 const maximumCommitTimestampSeconds = 1_000_000_000_000;
+const maximumMutationOperations = 1_000;
 const maximumRepositoryPathBytes = 4_096;
 const maximumRepositorySegmentBytes = 255;
 const maximumRepositoryTreeDepth = 128;
@@ -385,13 +386,14 @@ export interface WorkspaceArtifactGitRuntime {
   destroy(sandboxId: string): Promise<void>;
 }
 
+export type WorkspaceArtifactMutationOperation =
+  | { kind: "delete"; path: string }
+  | { kind: "move"; from: string; to: string }
+  | { kind: "write"; path: string; content: Uint8Array };
+
 /** File changes applied to one chat fork before its next durable checkpoint. */
 export interface WorkspaceArtifactMutation {
-  deletePaths: readonly string[];
-  writes: readonly {
-    path: string;
-    content: Uint8Array;
-  }[];
+  operations: readonly WorkspaceArtifactMutationOperation[];
 }
 
 /** Minimal Sandbox client used by trusted repository Git operations. */
@@ -518,7 +520,7 @@ function requireBranch(value: string): string {
 }
 
 function requireRepositoryPath(value: string): string {
-  if (!value || value.startsWith("/") || value.endsWith("/") || value.includes("\0") ||
+  if (typeof value !== "string" || !value || value.startsWith("/") || value.endsWith("/") || value.includes("\0") ||
       value.includes("\\") || value !== value.normalize("NFC") || /\p{Cc}/u.test(value) ||
       new TextEncoder().encode(value).byteLength > maximumRepositoryPathBytes) {
     throw new Error("Workspace repository path is invalid.");
@@ -532,28 +534,46 @@ function requireRepositoryPath(value: string): string {
   return value;
 }
 
-function requireMutation(mutation: WorkspaceArtifactMutation): WorkspaceArtifactMutation {
-  const deletePaths = mutation.deletePaths.map(requireRepositoryPath);
-  if (new Set(deletePaths).size !== deletePaths.length) {
-    throw new Error("Workspace repository mutation contains duplicate delete paths.");
+function pathConflicts(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function requireOrderedMutation(
+  operations: readonly WorkspaceArtifactMutationOperation[],
+): WorkspaceArtifactMutationOperation[] {
+  if (operations.length > maximumMutationOperations) {
+    throw new Error("Workspace repository mutation has too many operations.");
   }
-  const writes = mutation.writes.map(write => ({
-    path: requireRepositoryPath(write.path),
-    content: write.content,
-  }));
-  const writtenPaths = new Set<string>();
-  for (const write of writes) {
-    if (writtenPaths.has(write.path)) {
-      throw new Error(`Workspace repository path ${write.path} is written more than once.`);
+  return operations.map(operation => {
+    if (!isRecord(operation) || typeof operation.kind !== "string") {
+      throw new Error("Workspace repository mutation operation is invalid.");
     }
-    for (const existing of writtenPaths) {
-      if (write.path.startsWith(`${existing}/`) || existing.startsWith(`${write.path}/`)) {
-        throw new Error(`Workspace repository paths ${existing} and ${write.path} conflict.`);
+    if (operation.kind === "delete" || operation.kind === "write") {
+      const path = requireRepositoryPath(operation.path);
+      if (operation.kind === "write" && !(operation.content instanceof Uint8Array)) {
+        throw new Error(`Workspace repository file ${path} content is invalid.`);
       }
+      return operation.kind === "delete"
+        ? { kind: "delete", path }
+        : { kind: "write", path, content: operation.content };
     }
-    writtenPaths.add(write.path);
+    if (operation.kind !== "move") {
+      throw new Error("Workspace repository mutation operation is invalid.");
+    }
+    const from = requireRepositoryPath(operation.from);
+    const to = requireRepositoryPath(operation.to);
+    if (pathConflicts(from, to)) {
+      throw new Error(`Workspace repository paths ${from} and ${to} conflict.`);
+    }
+    return { kind: "move", from, to };
+  });
+}
+
+function requireMutation(mutation: WorkspaceArtifactMutation): WorkspaceArtifactMutation {
+  if (!Array.isArray(mutation.operations)) {
+    throw new Error("Workspace repository mutation operations are invalid.");
   }
-  return { deletePaths, writes };
+  return { operations: requireOrderedMutation(mutation.operations) };
 }
 
 function byteStream(content: Uint8Array): ReadableStream<Uint8Array> {
@@ -773,17 +793,26 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     const expectedHead = requireOid(request.expectedHead, "Expected chat fork head");
     await this.#run(sandbox, ["git", "-C", directory, "reset", "--hard", expectedHead]);
     await this.#run(sandbox, ["git", "-C", directory, "clean", "-fdx"]);
-    for (const path of mutation.deletePaths) {
-      await this.#run(sandbox, [
-        "git", "-C", directory, "rm", "-r", "-f", "--ignore-unmatch", "--", path,
-      ]);
-    }
-    for (const write of mutation.writes) {
-      const slash = write.path.lastIndexOf("/");
-      if (slash !== -1) {
-        await sandbox.mkdir(`${directory}/${write.path.slice(0, slash)}`, { recursive: true });
+    for (const operation of mutation.operations) {
+      if (operation.kind === "delete") {
+        await this.#run(sandbox, [
+          "git", "-C", directory, "rm", "-r", "-f", "--ignore-unmatch", "--", operation.path,
+        ]);
+      } else if (operation.kind === "move") {
+        const slash = operation.to.lastIndexOf("/");
+        if (slash !== -1) {
+          await sandbox.mkdir(`${directory}/${operation.to.slice(0, slash)}`, { recursive: true });
+        }
+        await this.#run(sandbox, [
+          "git", "-C", directory, "mv", "--", operation.from, operation.to,
+        ]);
+      } else {
+        const slash = operation.path.lastIndexOf("/");
+        if (slash !== -1) {
+          await sandbox.mkdir(`${directory}/${operation.path.slice(0, slash)}`, { recursive: true });
+        }
+        await sandbox.writeFile(`${directory}/${operation.path}`, byteStream(operation.content));
       }
-      await sandbox.writeFile(`${directory}/${write.path}`, byteStream(write.content));
     }
     return this.checkpointChat(request);
   }
@@ -1527,26 +1556,23 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
     message: string,
     gadgets: ReadonlyMap<number, ReadonlyMap<string, string>>,
   ): Promise<WorkspaceArtifactChatFork> {
-    const deletePaths: string[] = [];
-    const writes: { path: string; content: Uint8Array }[] = [];
+    const operations: WorkspaceArtifactMutationOperation[] = [];
     for (const [gadgetId, files] of [...gadgets].toSorted((left, right) => left[0] - right[0])) {
       if (!Number.isSafeInteger(gadgetId) || gadgetId < 1) {
         throw new Error("Workspace gadget ID is invalid.");
       }
       const root = `${workspaceGadgetRoot}/${gadgetId}`;
-      deletePaths.push(root);
+      operations.push({ kind: "delete", path: root });
       for (const [path, content] of [...files].toSorted((left, right) =>
         left[0].localeCompare(right[0]))) {
-        writes.push({
+        operations.push({
+          kind: "write",
           path: requireRepositoryPath(`${root}/${path}`),
           content: new TextEncoder().encode(content),
         });
       }
     }
-    return this.#lifecycle.stageChatMutation(chatId, epoch, actor, message, {
-      deletePaths,
-      writes,
-    });
+    return this.#lifecycle.stageChatMutation(chatId, epoch, actor, message, { operations });
   }
 
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
