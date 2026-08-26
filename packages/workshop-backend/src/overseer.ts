@@ -3111,19 +3111,6 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  async #discardChatForkAndReceipts(chatId: number, epoch: number): Promise<void> {
-    const id = String(chatId);
-    await this.workspaceCodeRepository.discardChatFork(id, epoch);
-    await this.workspaceRepository.deleteChatOperationReceipts(id, epoch);
-  }
-
-  async #completeAcceptedChatForkAndReceipts(
-      chatId: number, epoch: number, head: string): Promise<void> {
-    const id = String(chatId);
-    await this.workspaceCodeRepository.completeAcceptedChatFork(id, epoch, head);
-    await this.workspaceRepository.deleteChatOperationReceipts(id, epoch);
-  }
-
   async #checkpointAgentChange(
       chatId: number, epoch: number, author: AiChatAuthorInfo,
       change: CodeChange, content: CodeContent, title: string): Promise<void> {
@@ -3651,7 +3638,10 @@ class OverseerImpl implements AgentHooks {
       throw new Error("The chat changed while merging from mainline; please retry.");
     }
 
-    await this.#discardChatForkAndReceipts(chatId, codeBase.epoch ?? 0);
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBase.epoch ?? 0,
+    );
     freshMeta = this.assertChatNotActive(chatId);
     freshCodeBase = this.chatCodeBase(freshMeta);
     if (this.nextChatSequencePeek(chatId) !== sequenceToken ||
@@ -3812,7 +3802,11 @@ class OverseerImpl implements AgentHooks {
       chat_id: chatId,
       interaction_type: "code_merged",
     });
-    await this.#completeAcceptedChatForkAndReceipts(chatId, intent.epoch, acceptedHead);
+    await this.workspaceCodeRepository.completeAcceptedChatFork(
+      String(chatId),
+      intent.epoch,
+      acceptedHead,
+    );
     this.storage.chatArtifactAccepts.delete(chatId);
     return {outcome: "merged"};
   }
@@ -3825,8 +3819,8 @@ class OverseerImpl implements AgentHooks {
     const pendingAccept = this.storage.chatArtifactAccepts.get(chatId);
     if (pendingAccept !== undefined) {
       if (pendingAccept.state === "finalized") {
-        await this.#completeAcceptedChatForkAndReceipts(
-          chatId,
+        await this.workspaceCodeRepository.completeAcceptedChatFork(
+          String(chatId),
           pendingAccept.epoch,
           pendingAccept.acceptedHead,
         );
@@ -3839,7 +3833,7 @@ class OverseerImpl implements AgentHooks {
       );
       if (accepted.status === "stale") {
         if (!pendingAccept.workspaceFilesChanged) {
-          await this.#discardChatForkAndReceipts(chatId, pendingAccept.epoch);
+          await this.workspaceCodeRepository.discardChatFork(String(chatId), pendingAccept.epoch);
         }
         this.storage.chatArtifactAccepts.delete(chatId);
         return {outcome: "stale"};
@@ -4022,7 +4016,7 @@ class OverseerImpl implements AgentHooks {
     const accepted = await this.workspaceCodeRepository.acceptChatFork(forkChatId, forkEpoch);
     if (accepted.status === "stale") {
       if (!hasWorkspaceFileChanges) {
-        await this.#discardChatForkAndReceipts(chatId, forkEpoch);
+        await this.workspaceCodeRepository.discardChatFork(forkChatId, forkEpoch);
       }
       this.storage.chatArtifactAccepts.delete(chatId);
       return {outcome: "stale"};
@@ -4179,7 +4173,10 @@ class OverseerImpl implements AgentHooks {
     // now marked reverted), keeping the deletion path single.
     await this.reconcilePendingGadgets(chatId);
     const codeBaseAfterRevert = this.chatCodeBase(this.getChatMetaOrThrow(chatId));
-    await this.#discardChatForkAndReceipts(chatId, codeBaseAfterRevert.epoch ?? 0);
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBaseAfterRevert.epoch ?? 0,
+    );
   }
 
   // The body of Overseer.discardChatDraftChanges().
@@ -4215,7 +4212,7 @@ class OverseerImpl implements AgentHooks {
       this.recomputeHasProposedChanges(chatId, meta);
       this.proposedChangesChanged(chatId);
     }
-    await this.#discardChatForkAndReceipts(chatId, forkEpoch);
+    await this.workspaceCodeRepository.discardChatFork(String(chatId), forkEpoch);
   }
 
   async prepareChatDeletion(chatId: number): Promise<void> {
@@ -4224,7 +4221,10 @@ class OverseerImpl implements AgentHooks {
       throw new Error("Chat changes are being accepted; please retry.");
     }
     const codeBase = this.chatCodeBase(meta);
-    await this.#discardChatForkAndReceipts(chatId, codeBase.epoch ?? 0);
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBase.epoch ?? 0,
+    );
   }
 
 

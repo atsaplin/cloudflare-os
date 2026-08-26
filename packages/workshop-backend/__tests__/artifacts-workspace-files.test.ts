@@ -338,11 +338,45 @@ function expectCode(operation: Promise<unknown>, code: string): Promise<void> {
   );
 }
 
-async function withFiles<T>(name: string, run: (files: ArtifactsWorkspaceFiles, artifacts: InMemoryArtifacts, uploads: InMemoryUploads) => Promise<T>): Promise<T> {
-  return runInDurableObject(env.TEST_OVERSEER.getByName(`artifacts-workspace-files:${name}`), (_instance, state) => {
+function createChatOperationReceiptTable(state: DurableObjectState): void {
+  state.storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS workspace_artifact_chat_operation_receipts (
+      chat_id TEXT NOT NULL,
+      epoch INTEGER NOT NULL,
+      operation_id TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      repository_name TEXT NOT NULL,
+      result_kind TEXT NOT NULL CHECK (result_kind IN ('list', 'read', 'write', 'mkdir', 'move', 'delete')),
+      result_head TEXT NOT NULL,
+      result_path TEXT NOT NULL,
+      result_changed INTEGER CHECK (result_changed IS NULL OR result_changed IN (0, 1)),
+      result_node_id TEXT,
+      PRIMARY KEY (chat_id, epoch, operation_id)
+    )
+  `);
+}
+
+async function withFiles<T>(
+  name: string,
+  run: (
+    files: ArtifactsWorkspaceFiles,
+    artifacts: InMemoryArtifacts,
+    uploads: InMemoryUploads,
+    state: DurableObjectState,
+  ) => Promise<T>,
+): Promise<T> {
+  const id = env.TEST_OVERSEER.getByName(`artifacts-workspace-files:${name}`);
+  return runInDurableObject(id, (_instance, state) => {
     const artifacts = new InMemoryArtifacts();
     const uploads = new InMemoryUploads();
-    return run(new ArtifactsWorkspaceFiles({ state, lifecycle: artifacts, reader: artifacts, uploadStore: uploads }), artifacts, uploads);
+    createChatOperationReceiptTable(state);
+    const files = new ArtifactsWorkspaceFiles({
+      state,
+      lifecycle: artifacts,
+      reader: artifacts,
+      uploadStore: uploads,
+    });
+    return run(files, artifacts, uploads, state);
   });
 }
 
@@ -829,7 +863,7 @@ describe("ArtifactsWorkspaceFiles", () => {
   });
 
   it("recovers a lost receipt from the operation commit after later fork changes and pagination", async () => {
-    await withFiles("agent-chat-operation-old-retry", async (files, artifacts) => {
+    await withFiles("agent-chat-operation-old-retry", async (files, artifacts, _uploads, state) => {
       await files.initialize(ACTOR);
       const request: ChatWorkspaceOperationRequest = {
         chatId: "45-old",
@@ -848,7 +882,11 @@ describe("ArtifactsWorkspaceFiles", () => {
         timestamp: "2026-08-26T02:31:00.000Z",
         operation: { kind: "move", path: "old", destination: "renamed" },
       });
-      await files.deleteChatOperationReceipts(request.chatId, request.epoch);
+      state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        request.chatId,
+        request.epoch,
+      );
       for (let index = 0; index < 101; index += 1) {
         await artifacts.stageChatMutation("45-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
@@ -873,7 +911,7 @@ describe("ArtifactsWorkspaceFiles", () => {
   });
 
   it("recovers a lost delete receipt from the operation commit parent after pagination", async () => {
-    await withFiles("agent-chat-delete-operation-old-retry", async (files, artifacts) => {
+    await withFiles("agent-chat-delete-operation-old-retry", async (files, artifacts, _uploads, state) => {
       await files.initialize(ACTOR);
       const created = await files.runChatOperation({
         chatId: "49-delete-old",
@@ -892,7 +930,11 @@ describe("ArtifactsWorkspaceFiles", () => {
         operation: { kind: "delete", path: "deleted" },
       };
       const original = await files.runChatOperation(request);
-      await files.deleteChatOperationReceipts(request.chatId, request.epoch);
+      state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        request.chatId,
+        request.epoch,
+      );
       for (let index = 0; index < 101; index += 1) {
         await artifacts.stageChatMutation("49-delete-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
@@ -954,34 +996,30 @@ describe("ArtifactsWorkspaceFiles", () => {
     });
   });
 
-  it("deletes chat operation receipts for a completed epoch", async () => {
-    await withFiles("agent-chat-operation-receipt-cleanup", async files => {
-      await files.initialize(ACTOR);
-      const request: ChatWorkspaceOperationRequest = {
-        chatId: "48-receipt-cleanup",
-        epoch: 0,
-        operationId: "tool-list-cleanup",
-        actor: ACTOR,
-        timestamp: "2026-08-26T02:50:00.000Z",
-        operation: { kind: "list", path: "/" },
-      };
-      await files.runChatOperation(request);
-      await files.deleteChatOperationReceipts(request.chatId, request.epoch);
-      await files.runChatOperation({
-        ...request,
-        operationId: "tool-create-before-retry",
-        operation: { kind: "mkdir", path: "after-cleanup" },
-      });
+  it.each(["accepting", "accepted", "discarding"] as const)(
+    "does not replay a receipt while the chat fork is %s",
+    async state => {
+      await withFiles(`agent-chat-operation-terminal-${state}`, async (files, artifacts) => {
+        await files.initialize(ACTOR);
+        const request: ChatWorkspaceOperationRequest = {
+          chatId: "48-terminal",
+          epoch: 0,
+          operationId: "tool-terminal",
+          actor: ACTOR,
+          timestamp: "2026-08-26T02:45:00.000Z",
+          operation: { kind: "mkdir", path: "notes" },
+        };
+        const original = await files.runChatOperation(request);
+        const fork = artifacts.forks.get("48-terminal:0");
+        if (!fork) throw new Error("Test chat fork was not created.");
+        fork.state = state;
 
-      const replay = await files.runChatOperation(request);
-
-      expect(replay).toMatchObject({
-        kind: "list",
-        path: "",
-        entries: [expect.objectContaining({ path: "after-cleanup" })],
+        await expectCode(files.runChatOperation(request), WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+        expect(artifacts.stagedMutations).toHaveLength(1);
+        expect(original).toMatchObject({ kind: "mkdir", path: "notes", changed: true });
       });
-    });
-  });
+    },
+  );
 
   it("finds workspace file changes older than one commit-log page", async () => {
     await withFiles("agent-chat-old-dirty", async (files, artifacts) => {

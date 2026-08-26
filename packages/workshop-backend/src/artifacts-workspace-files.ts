@@ -144,7 +144,6 @@ export interface WorkspaceFileRepository {
   getNextUploadExpiry(): number | undefined;
   cleanupExpiredUploads(now?: number): Promise<number>;
   deleteAllWorkspaceFiles(): Promise<void>;
-  deleteChatOperationReceipts(chatId: string, epoch: number): Promise<void>;
   applyStaged(request: StagedWorkspaceMutationRequest): Promise<WorkspaceMutationResult>;
   hasChatFileChanges(chatId: string, epoch: number): Promise<boolean>;
   runChatOperation(request: ChatWorkspaceOperationRequest): Promise<ChatWorkspaceOperationResult>;
@@ -365,8 +364,10 @@ function normalizeChatPath(value: string): string {
 }
 
 function parseChatOperationKind(value: string): ChatWorkspaceOperation["kind"] {
-  if (value === "list" || value === "read" || value === "write" || value === "mkdir" ||
-      value === "move" || value === "delete") return value;
+  if (
+    value === "list" || value === "read" || value === "write" || value === "mkdir" ||
+    value === "move" || value === "delete"
+  ) return value;
   throw new Error("Workspace chat operation receipt has an invalid operation kind.");
 }
 
@@ -492,24 +493,6 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       FROM workspace_artifact_file_operations
       WHERE operation_id = ?
     `, operationId)][0];
-  }
-
-  #ensureChatOperationReceiptTable(): void {
-    this.#state.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS workspace_artifact_chat_operation_receipts (
-        chat_id TEXT NOT NULL,
-        epoch INTEGER NOT NULL,
-        operation_id TEXT NOT NULL,
-        request_digest TEXT NOT NULL,
-        repository_name TEXT NOT NULL,
-        result_kind TEXT NOT NULL CHECK (result_kind IN ('list', 'read', 'write', 'mkdir', 'move', 'delete')),
-        result_head TEXT NOT NULL,
-        result_path TEXT NOT NULL,
-        result_changed INTEGER CHECK (result_changed IS NULL OR result_changed IN (0, 1)),
-        result_node_id TEXT,
-        PRIMARY KEY (chat_id, epoch, operation_id)
-      )
-    `);
   }
 
   #getChatOperationReceipt(
@@ -1199,7 +1182,17 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   runChatOperation(request: ChatWorkspaceOperationRequest): Promise<ChatWorkspaceOperationResult> {
     requireChatOperationIdentity(request);
     return this.#withLock(async () => {
-      this.#ensureChatOperationReceiptTable();
+      await this.#lifecycle.ensureCanonical(request.actor);
+      const fork = await this.#lifecycle.getForkStatus(request.chatId, request.epoch);
+      if (
+        fork?.state === "accepting" || fork?.state === "accepted" ||
+        fork?.state === "discarding"
+      ) {
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          `Workspace chat epoch is ${fork.state}; retry after its lifecycle operation completes.`,
+        );
+      }
       const digest = await digestChatOperation(request);
       const receipt = this.#getChatOperationReceipt(
         request.chatId,
@@ -1215,7 +1208,6 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
         }
         return this.#replayChatOperationReceipt(receipt);
       }
-      await this.#lifecycle.ensureCanonical(request.actor);
       const path = normalizeChatPath(request.operation.path);
       if (request.operation.kind === "list") {
         const revision = await this.#readChatRevision(request.chatId, request.epoch);
@@ -1361,19 +1353,6 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
         this.#lifecycle.deleteWorkspaceRepositories(),
         this.#uploadStore.deleteAllUploads(),
       ]);
-      this.#ensureChatOperationReceiptTable();
-      this.#state.storage.sql.exec("DELETE FROM workspace_artifact_chat_operation_receipts");
-    });
-  }
-
-  deleteChatOperationReceipts(chatId: string, epoch: number): Promise<void> {
-    return this.#withLock(async () => {
-      this.#ensureChatOperationReceiptTable();
-      this.#state.storage.sql.exec(
-        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
-        chatId,
-        epoch,
-      );
     });
   }
 
