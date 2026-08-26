@@ -1339,7 +1339,8 @@ export class ArtifactsWorkspaceRepository {
         throw new Error("Workspace gadget source exceeds the read bound.");
       }
       const relativePath = path.slice(prefix.length);
-      files.set(relativePath, new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      files.set(relativePath,
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
     }
     return files;
   }
