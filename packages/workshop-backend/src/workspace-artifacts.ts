@@ -1501,6 +1501,13 @@ export interface WorkspaceCodeRepository {
     message: string,
     gadgets: ReadonlyMap<number, ReadonlyMap<string, string>>,
   ): Promise<WorkspaceArtifactChatFork>;
+  commitGadgetFiles(
+    operationId: string,
+    actor: WorkspaceActor,
+    message: string,
+    gadgetId: number,
+    files: ReadonlyMap<string, string>,
+  ): Promise<string>;
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult>;
   completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void>;
   discardChatFork(chatId: string, epoch: number): Promise<void>;
@@ -1632,6 +1639,35 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
       }
     }
     return this.#lifecycle.stageChatMutation(chatId, epoch, actor, message, { operations });
+  }
+
+  async commitGadgetFiles(
+    operationId: string,
+    actor: WorkspaceActor,
+    message: string,
+    gadgetId: number,
+    files: ReadonlyMap<string, string>,
+  ): Promise<string> {
+    const chatId = `trusted-gadget-operation:${operationId}`;
+    const epoch = 0;
+    await this.ensureCanonical(actor);
+    const existing = await this.#lifecycle.getForkStatus(chatId, epoch);
+    if (!existing || existing.state === "open") {
+      await this.stageGadgetFiles(
+        chatId,
+        epoch,
+        actor,
+        message,
+        new Map([[gadgetId, files]]),
+      );
+    }
+    const accepted = await this.#lifecycle.acceptChatFork(chatId, epoch);
+    if (accepted.status === "stale") {
+      await this.#lifecycle.discardChatFork(chatId, epoch);
+      throw new Error("Workspace changed while committing trusted gadget files.");
+    }
+    await this.#lifecycle.completeAcceptedChatFork(chatId, epoch, accepted.head);
+    return accepted.head;
   }
 
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {

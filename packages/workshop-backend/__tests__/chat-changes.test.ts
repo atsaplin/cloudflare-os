@@ -138,6 +138,17 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
     };
   }
 
+  async commitGadgetFiles(
+      operationId: string, actor: WorkspaceActor, message: string, gadgetId: number,
+      files: ReadonlyMap<string, string>): Promise<string> {
+    const chatId = `trusted:${operationId}`;
+    await this.stageGadgetFiles(chatId, 0, actor, message, new Map([[gadgetId, files]]));
+    const accepted = await this.acceptChatFork(chatId, 0);
+    if (accepted.status === "stale") throw new Error("Test trusted commit became stale.");
+    await this.completeAcceptedChatFork(chatId, 0, accepted.head);
+    return accepted.head;
+  }
+
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
     this.accepted.push({ chatId, epoch });
     const head = this.#forkHeads.get(`${chatId}:${epoch}`);

@@ -244,12 +244,16 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
 
   stageChatMutation(request: {
     sandboxId: string;
+    remote: string;
     expectedHead: string;
     mutation: WorkspaceArtifactMutation;
   }): Promise<string> {
     this.stagedMutations.push(request.sandboxId);
     this.mutations.push(request.mutation);
     this.mutationExpectedHeads.push(request.expectedHead);
+    const repositoryName = new URL(request.remote).pathname.split("/").at(-1)?.replace(/\.git$/, "");
+    if (!repositoryName) throw new Error("Test repository remote is invalid.");
+    this.reader.heads.set(repositoryName, CHECKPOINT_HEAD);
     return Promise.resolve(CHECKPOINT_HEAD);
   }
 }
@@ -638,6 +642,23 @@ describe("ArtifactsWorkspaceRepository", () => {
           },
         ],
       }]);
+    });
+  });
+
+  it("commits a trusted gadget snapshot through an isolated fork", async () => {
+    await withLifecycle("repository-commit", async (lifecycle, fixtures) => {
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      await expect(repository.commitGadgetFiles("blueprint-7", {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Instantiate blueprint", 7, new Map([
+        ["client.js", "client\n"],
+      ]))).resolves.toBe(CHECKPOINT_HEAD);
+
+      expect(fixtures.runtime.promotions).toHaveLength(1);
+      expect(fixtures.runtime.destroyed).toHaveLength(1);
+      expect(fixtures.artifacts.deleted).toHaveLength(1);
     });
   });
 

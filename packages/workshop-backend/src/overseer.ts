@@ -8696,15 +8696,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // Set the title. The default gadget (created below) inherits it.
     this.impl.storage.title.put(title);
 
-    // Decode the archive and write the gadget's initial (parentless) commit *before* creating
-    // the gadget record: every permanent gadget is born with a head (see GadgetRecord.commitId),
-    // so a failure here -- an empty archive, an unreachable owner -- must not leave a headless
-    // record behind. The commit is content-addressed and referenced by nothing until the record
-    // lands, so writing it first is safe. Archives always use the doc's unnamed root "" (see
-    // snapshotCode); the file contents transfer as plain text, becoming the gadget's first
-    // committed tree. An empty archive is refused rather than instantiated as a code-less
-    // gadget: blueprints of such gadgets cannot be created (see createBlueprint), so one can
-    // only arrive corrupted or hand-crafted.
+    // Decode the archive into the default gadget's Artifacts subtree. An empty archive is refused
+    // because blueprint creation never emits one, so it can only be corrupted or hand-crafted.
     let archiveDoc = new Y.Doc();
     Y.applyUpdateV2(archiveDoc, code);
     let files = new Map<string, string>();
@@ -8723,16 +8716,19 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let owner = () => wrapDoStubForTelemetry(
         this.impl.users.get(this.impl.users.idFromString(ownerId)), this.impl.logger);
     let ownerProfile = await retryOnDoReset(() => owner().whoami(), this.impl.logger);
-    let commitId = await this.impl.gitStore.writeFilesAsCommit(files, {
-      parents: [],
-      author: commitIdentityForAuthor(ownerProfile),
-      message: `Instantiate blueprint: ${title}`,
-      timestamp: new Date(),
-    });
-
-    // Blueprint instantiation still creates a fresh workspace containing one auto-created gadget,
-    // recorded as the default gadget (see ensureDefaultGadget).
-    this.impl.ensureDefaultGadget(commitId);
+    const actor = { id: ownerProfile.id, name: ownerProfile.name };
+    const canonical = await this.impl.workspaceCodeRepository.ensureCanonical(actor);
+    const gadgetId = this.impl.ensureDefaultGadget(canonical.head);
+    const commitId = await this.impl.workspaceCodeRepository.commitGadgetFiles(
+      `initialize-blueprint-${gadgetId}`,
+      actor,
+      `Instantiate blueprint: ${title}`,
+      gadgetId,
+      files,
+    );
+    const gadget = this.impl.getGadgetRecord(gadgetId);
+    gadget.commitId = commitId;
+    this.impl.storage.gadgets.put(gadget);
 
     // The gadget inherits the blueprint's declared format, so it is named and drawn as a Document
     // (or whatever it produces) rather than a generic app.
