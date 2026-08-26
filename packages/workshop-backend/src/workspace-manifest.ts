@@ -3,6 +3,9 @@ import { z } from "zod";
 /** Repository path containing the versioned workspace identity index. */
 export const WORKSPACE_INDEX_PATH = ".workspace/index.json";
 
+const workspaceGadgetRoot = ".workspace/gadgets";
+const positiveGadgetIdPattern = /^[1-9][0-9]*$/;
+
 /** Metadata for one versioned workspace file or folder identity. */
 export interface WorkspaceIndexNode {
   kind: "file" | "folder";
@@ -419,6 +422,26 @@ export function deleteWorkspaceNode(
   return { index: next, deletedIds };
 }
 
+function isInternalGadgetPath(path: string, kind: WorkspaceTreeEntryKind): boolean {
+  if (path === ".workspace" || path === workspaceGadgetRoot) return kind === "folder";
+  if (!path.startsWith(`${workspaceGadgetRoot}/`)) return false;
+
+  const segments = path.split("/");
+  const gadgetId = segments[2];
+  if (gadgetId === undefined || !positiveGadgetIdPattern.test(gadgetId) ||
+      !Number.isSafeInteger(Number(gadgetId))) {
+    return false;
+  }
+  if (segments.length === 3) return kind === "folder";
+  if (segments.some(segment => segment === "" || segment === "." || segment === ".." ||
+      segment.toLowerCase() === ".git" || segment.includes("\\") ||
+      segment !== segment.normalize("NFC") ||
+      /\p{Cc}/u.test(segment))) {
+    return false;
+  }
+  return true;
+}
+
 /** Verifies that visible Git entries and versioned workspace identities describe the same tree. */
 export function validateWorkspaceTree(
   index: WorkspaceIndexV1,
@@ -438,6 +461,15 @@ export function validateWorkspaceTree(
   for (const [path, kind] of tree) {
     if (path === WORKSPACE_INDEX_PATH) continue;
     if (path === ".workspace" && kind === "folder") continue;
+    if (path.startsWith(`${workspaceGadgetRoot}/`) || path === workspaceGadgetRoot) {
+      if (!isInternalGadgetPath(path, kind)) {
+        throw new Error(`Reserved workspace path: ${path}`);
+      }
+      if (kind === "symlink" || kind === "submodule") {
+        throw new Error(`Workspace tree contains unsupported ${kind}: ${path}`);
+      }
+      continue;
+    }
     if (path.startsWith(".workspace/")) throw new Error(`Reserved workspace path: ${path}`);
     if (kind === "symlink" || kind === "submodule") {
       throw new Error(`Workspace tree contains unsupported ${kind}: ${path}`);

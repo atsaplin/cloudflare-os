@@ -9,6 +9,7 @@ import {
   parseWorkspaceIndex,
   resolveWorkspacePath,
   serializeWorkspaceIndex,
+  type WorkspaceTreeEntryKind,
   updateWorkspaceFileMetadata,
   validateWorkspaceTree,
 } from "../src/workspace-manifest";
@@ -225,5 +226,58 @@ describe("workspace manifest", () => {
     expect(() => validateWorkspaceTree(file.index, new Map([
       [".workspace/index.json", "file"],
     ]))).toThrow(/payload\.bin/);
+  });
+
+  it("allows internal gadget files without exposing them as workspace nodes", () => {
+    const empty = createEmptyWorkspaceIndex(context());
+    const folder = createWorkspaceNode(empty, {
+      kind: "folder",
+      parentId: ROOT_ID,
+      name: "Documents",
+    }, context(() => FOLDER_ID));
+    const file = createWorkspaceNode(folder.index, {
+      kind: "file",
+      parentId: FOLDER_ID,
+      name: "notes.txt",
+    }, context(() => FILE_ID));
+
+    expect(() => validateWorkspaceTree(file.index, new Map([
+      [".workspace", "folder"],
+      [".workspace/index.json", "file"],
+      [".workspace/gadgets", "folder"],
+      [".workspace/gadgets/7", "folder"],
+      [".workspace/gadgets/7/client.js", "file"],
+      [".workspace/gadgets/7/nested", "folder"],
+      [".workspace/gadgets/7/nested/data.json", "file"],
+      ["Documents", "folder"],
+      ["Documents/notes.txt", "file"],
+    ]))).not.toThrow();
+
+    expect(listWorkspaceChildren(file.index, ROOT_ID)).toEqual([
+      expect.objectContaining({ id: FOLDER_ID, name: "Documents" }),
+    ]);
+  });
+
+  it("rejects malformed or unsafe internal gadget paths", () => {
+    const index = createEmptyWorkspaceIndex(context());
+    const invalidPaths: [string, WorkspaceTreeEntryKind][] = [
+      [".workspace/gadgets", "file"],
+      [".workspace/gadgets/0", "folder"],
+      [".workspace/gadgets/01", "folder"],
+      [".workspace/gadgets/not-a-gadget", "folder"],
+      [".workspace/gadgets/7", "file"],
+      [".workspace/gadgets/7/client.js", "symlink"],
+      [".workspace/gadgets/7/.git/config", "file"],
+      [".workspace/gadgets/7/.GIT/config", "file"],
+      [".workspace/gadgets/7/../escape", "file"],
+      [".workspace/other.txt", "file"],
+    ];
+
+    for (const [path, kind] of invalidPaths) {
+      expect(() => validateWorkspaceTree(index, new Map([
+        [".workspace", "folder"],
+        [path, kind],
+      ]))).toThrow(/reserved|unsupported|gadget/i);
+    }
   });
 });
