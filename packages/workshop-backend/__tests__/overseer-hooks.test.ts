@@ -116,6 +116,7 @@ async function makeTargetOverseer(gadgetId?: number) {
       markOutputsDirty: () => {},
       joinPresence: () => () => {},
       joinOutputsFanout: () => () => {},
+      workspaceRepository: { initialize: async () => ({ head: "0".repeat(40), rootId: "root" }) },
       users: {
         idFromString: (id: string) => id,
         get: () => ({

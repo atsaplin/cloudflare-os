@@ -104,6 +104,9 @@ test("worker entries carry the deploy contract", () => {
       backend.bindings.find((b) => b.name === "BLUEPRINT_CONTENT"),
       { type: "r2_bucket", name: "BLUEPRINT_CONTENT", bucket_name: "$R2_BLUEPRINT_CONTENT_NAME" });
   assert.deepEqual(
+      backend.bindings.find((b) => b.name === "WORKSPACE_FILES"),
+      { type: "r2_bucket", name: "WORKSPACE_FILES", bucket_name: "$R2_WORKSPACE_FILES_NAME" });
+  assert.deepEqual(
       backend.bindings.find((b) => b.name === "LOADER"),
       { type: "worker_loader", name: "LOADER" });
   // The Workers AI binding always ships (webFetch's toMarkdown conversion depends on it).
