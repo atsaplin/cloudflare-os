@@ -54,7 +54,8 @@
   "artifacts": [
     {
       "binding": "ARTIFACTS",
-      "namespace": "workshop-workspaces"
+      "namespace": "workshop-workspaces",
+      "remote": true
     }
   ],
 

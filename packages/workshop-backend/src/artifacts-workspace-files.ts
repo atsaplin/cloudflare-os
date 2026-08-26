@@ -417,11 +417,6 @@ function workspaceUuidFromDigest(digest: string): string {
     `${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function commitsAfterBaseline(commits: CommitInfo[], baselineHead: string): CommitInfo[] {
-  const baselineIndex = commits.findIndex(commit => commit.oid === baselineHead);
-  return baselineIndex === -1 ? commits : commits.slice(0, baselineIndex);
-}
-
 export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   readonly #state: DurableObjectState;
   readonly #lifecycle: ArtifactsWorkspaceFileLifecycle;
@@ -558,6 +553,38 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       baselineHead: canonical.head,
       index: await this.#readIndex(canonical),
     };
+  }
+
+  async #readChatCommitsAfterBaseline(
+    chatId: string,
+    epoch: number,
+    head: string,
+    baselineHead: string,
+  ): Promise<CommitInfo[]> {
+    const commits: CommitInfo[] = [];
+    const visited = new Set<string>();
+    let ref = head;
+    while (ref !== baselineHead) {
+      if (visited.has(ref)) throw new Error("Chat workspace commit history contains a cycle.");
+      visited.add(ref);
+      const page = await this.#lifecycle.readChatCommitLog(chatId, epoch, ref, {
+        depth: maximumHistoryDepth,
+      });
+      if (page.length === 0 || page[0]?.oid !== ref) {
+        throw new Error("Chat workspace commit history is incomplete.");
+      }
+      const baselineIndex = page.findIndex(commit => commit.oid === baselineHead);
+      if (baselineIndex !== -1) {
+        commits.push(...page.slice(0, baselineIndex));
+        return commits;
+      }
+      commits.push(...page);
+      const oldest = page.at(-1);
+      const parent = oldest?.parents[0];
+      if (!parent) throw new Error("Chat workspace baseline is not in the fork history.");
+      ref = parent;
+    }
+    return commits;
   }
 
   async #planChatMutation(
@@ -1027,12 +1054,12 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
     return this.#withLock(async () => {
       const fork = await this.#lifecycle.getForkStatus(chatId, epoch);
       if (fork?.state !== "open" || fork.latestHead === fork.baselineHead) return false;
-      const commits = commitsAfterBaseline(await this.#lifecycle.readChatCommitLog(
+      const commits = await this.#readChatCommitsAfterBaseline(
         chatId,
         epoch,
         fork.latestHead,
-        { depth: maximumHistoryDepth },
-      ), fork.baselineHead);
+        fork.baselineHead,
+      );
       return commits.some(commit => commit.message.split("\n")
         .some(line => line.startsWith("Workspace-Operation: ")));
     });
@@ -1070,12 +1097,12 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       const digest = await digestChatOperation(request);
       const revision = await this.#readChatRevision(request.chatId, request.epoch);
       if (revision.head !== revision.baselineHead) {
-        const commits = commitsAfterBaseline(await this.#lifecycle.readChatCommitLog(
+        const commits = await this.#readChatCommitsAfterBaseline(
           request.chatId,
           request.epoch,
           revision.head,
-          { depth: maximumHistoryDepth },
-        ), revision.baselineHead);
+          revision.baselineHead,
+        );
         const prior = commits.find(commit => commitHasOperationId(commit, request.operationId));
         if (prior !== undefined) {
           if (!commitHasRecoveryTrailers(prior, request.operationId, digest)) {
