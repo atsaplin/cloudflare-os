@@ -2993,6 +2993,23 @@ class OverseerImpl implements AgentHooks {
         .map(row => ({change: row.change, generation: row.generation, revision: row.revision}));
   }
 
+  async #checkpointAgentChange(
+      chatId: number, epoch: number, author: AiChatAuthorInfo,
+      change: CodeChange, content: CodeContent, title: string): Promise<void> {
+    const gadgets = new Map<number, ReadonlyMap<string, string>>();
+    for (const gadgetId of changedGadgets(change)) {
+      gadgets.set(gadgetId, content.get(gadgetId) ?? new Map());
+    }
+    if (gadgets.size === 0) return;
+    await this.workspaceCodeRepository.stageGadgetFiles(
+      String(chatId),
+      epoch,
+      { id: author.id, name: author.name },
+      `Checkpoint agent changes: ${title}`,
+      gadgets,
+    );
+  }
+
   // AgentHooks implementation: append one agent tool edit to the chat's change stream, durable
   // and broadcast immediately (superseding the provisional editPreview* stream of the call's
   // in-progress content; see AiChatSubscriber.changeApplied).
@@ -3011,7 +3028,7 @@ class OverseerImpl implements AgentHooks {
     let baseFiles = pin !== undefined
         ? await this.readCommitFiles(pin.gadgetId, pin.baseCommit) : undefined;
 
-    // ---- synchronous tail ----
+    // Resolve the exact proposal snapshot that will be checkpointed.
     let fresh = this.getChatMetaOrThrow(chatId);
     let codeBase = this.chatCodeBase(fresh);
     let cached = this.#chatContentCache.get(chatId);
@@ -3043,8 +3060,40 @@ class OverseerImpl implements AgentHooks {
     }
 
     validateCodeChangeContent(change, content);
-    let row = this.#appendChatChangeRow(chatId, fresh, author, change, "agent", newPins,
-                                        applyCodeChange(content, change));
+    const nextContent = applyCodeChange(content, change);
+    await this.#checkpointAgentChange(
+      chatId,
+      codeBase.epoch ?? 0,
+      author,
+      change,
+      nextContent,
+      fresh.title,
+    );
+
+    // The checkpoint awaits external systems. Revalidate the stream before the synchronous
+    // append so a concurrent change can never be recorded against the wrong fork snapshot.
+    fresh = this.getChatMetaOrThrow(chatId);
+    const currentCodeBase = this.chatCodeBase(fresh);
+    const currentCache = this.#chatContentCache.get(chatId);
+    if (currentCodeBase.generation !== codeBase.generation ||
+        currentCodeBase.revision !== codeBase.revision ||
+        (currentCodeBase.epoch ?? 0) !== (codeBase.epoch ?? 0) ||
+        currentCache === undefined ||
+        currentCache.generation !== codeBase.generation ||
+        currentCache.revision !== codeBase.revision) {
+      throw new Error("Chat content changed during an agent checkpoint.");
+    }
+    if (pin !== undefined) {
+      const existing = currentCodeBase.pins.find(candidate => candidate.gadgetId === pin.gadgetId);
+      if (existing?.baseCommit !== pin.baseCommit &&
+          this.storage.gadgets.get(pin.gadgetId)?.commitId !== pin.baseCommit) {
+        throw new Error("Pinned commit is no longer the gadget's head; mainline moved while " +
+            "the changes were being made.");
+      }
+    }
+
+    const row = this.#appendChatChangeRow(
+      chatId, fresh, author, change, "agent", newPins, nextContent);
     return {generation: row.generation, revision: row.revision};
   }
 

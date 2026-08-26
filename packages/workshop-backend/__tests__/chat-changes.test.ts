@@ -45,6 +45,7 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
   readonly discarded: Array<{chatId: string; epoch: number}> = [];
   failNextAcceptAfterPromotion = false;
   failNextCompletion = false;
+  failNextStage = false;
   readonly #gitStore: GitStore;
   readonly #gadgetHead: (gadgetId: number) => string | undefined;
   readonly #forkHeads = new Map<string, string>();
@@ -105,6 +106,10 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
       gadgets: ReadonlyMap<number, ReadonlyMap<string, string>>)
       : Promise<WorkspaceArtifactChatFork> {
     this.staged.push({ chatId, epoch, gadgetIds: [...gadgets.keys()] });
+    if (this.failNextStage) {
+      this.failNextStage = false;
+      throw new Error("checkpoint failed");
+    }
     const files = new Map<string, string>();
     for (const [gadgetId, gadgetFiles] of gadgets) {
       for (const [path, content] of gadgetFiles) {
@@ -1352,6 +1357,22 @@ describe("updateChatFromMainline", () => {
 });
 
 describe("agent change appends", () => {
+  it("does not append an agent edit when its Sandbox checkpoint fails",
+      () => withImpl(async impl => {
+    let c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    impl.workspaceCodeRepository.failNextStage = true;
+
+    await expect(impl.appendAgentCodeChange(1, AGENT,
+        { 1: [["a.txt", { set: "one\nagent\n" }]] }, { gadgetId: 1, baseCommit: c1 }))
+        .rejects.toThrow("checkpoint failed");
+
+    expect(impl.storage.chatMeta.get(1)!.codeBase).toBeUndefined();
+    expect(impl.listUnmaterializedChatChanges(1)).toEqual([]);
+    expect(await gadgetContent(impl, 1, 1)).toEqual({});
+  }));
+
   it("appendAgentCodeChange pins at the current head and mirrors the pin at append time",
       () => withImpl(async impl => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
@@ -1366,6 +1387,9 @@ describe("agent change appends", () => {
     expect(await gadgetContent(impl, 1, 1)).toEqual({ "a.txt": "one\nagent\n" });
     expect(impl.listUnmaterializedChatChanges(1)).toHaveLength(1);
     expect(impl.undeclaredChatPins(1)).toEqual([{ gadgetId: 1, baseCommit: c1 }]);
+    expect(impl.workspaceCodeRepository.staged).toEqual([
+      { chatId: "1", epoch: 0, gadgetIds: [1] },
+    ]);
 
     // The turn flush materializes the rows and declares the pin.
     expect(impl.flushAgentChanges(1, AGENT, {})).toBe(true);
