@@ -803,6 +803,64 @@ describe("ArtifactsWorkspaceFiles", () => {
     });
   });
 
+  it("recovers agent operations older than one commit-log page", async () => {
+    await withFiles("agent-chat-operation-old-retry", async (files, artifacts) => {
+      await files.initialize(ACTOR);
+      const request: ChatWorkspaceOperationRequest = {
+        chatId: "45-old",
+        epoch: 0,
+        operationId: "tool-old",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:30:00.000Z",
+        operation: { kind: "mkdir", path: "old" },
+      };
+      const original = await files.runChatOperation(request);
+      for (let index = 0; index < 101; index += 1) {
+        await artifacts.stageChatMutation("45-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
+          operations: [{
+            kind: "write",
+            path: `gadgets/${index}/index.ts`,
+            content: textBytes("export {}"),
+          }],
+        });
+      }
+
+      const recovered = await files.runChatOperation(request);
+
+      expect(recovered).toEqual(original);
+      expect(artifacts.stagedMutations).toHaveLength(102);
+      await expectCode(files.runChatOperation({
+        ...request,
+        operation: { kind: "mkdir", path: "different" },
+      }), WORKSPACE_FILE_ERROR_CODES.operationReused);
+    });
+  });
+
+  it("finds workspace file changes older than one commit-log page", async () => {
+    await withFiles("agent-chat-old-dirty", async (files, artifacts) => {
+      await files.initialize(ACTOR);
+      await files.runChatOperation({
+        chatId: "45-dirty",
+        epoch: 0,
+        operationId: "tool-old-dirty",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:30:00.000Z",
+        operation: { kind: "mkdir", path: "old" },
+      });
+      for (let index = 0; index < 101; index += 1) {
+        await artifacts.stageChatMutation("45-dirty", 0, ACTOR, `Gadget checkpoint ${index}`, {
+          operations: [{
+            kind: "write",
+            path: `gadgets/${index}/index.ts`,
+            content: textBytes("export {}"),
+          }],
+        });
+      }
+
+      expect(await files.hasChatFileChanges("45-dirty", 0)).toBe(true);
+    });
+  });
+
   it("does not report gadget-only fork checkpoints as workspace file changes", async () => {
     await withFiles("agent-chat-gadget-only", async (files, artifacts) => {
       await files.initialize(ACTOR);
