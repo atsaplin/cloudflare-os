@@ -1002,24 +1002,14 @@ describe("CloudflareWorkspaceArtifactReader", () => {
 
 class FakeSandbox implements WorkspaceArtifactSandbox {
   readonly commands: string[][] = [];
+  readonly execOptions: Array<ExecOptions | undefined> = [];
   readonly events: string[] = [];
   readonly files = new Map<string, string | Uint8Array>();
   readonly directories: string[] = [];
-  readonly gitAuth: Array<Record<string, {
-    token: string;
-    username: string;
-    type: "basic";
-  }>> = [];
   destroyed = false;
   repositoryExists = false;
   status = "";
   head = INITIAL_HEAD;
-
-  async registerGitAuthInterceptor(params: {
-    hosts: Record<string, { token: string; username: string; type: "basic" }>;
-  }): Promise<void> {
-    this.gitAuth.push(params.hosts);
-  }
 
   exists(_path: string): Promise<{ exists: boolean }> {
     return Promise.resolve({ exists: this.repositoryExists });
@@ -1030,7 +1020,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     this.events.push(`mkdir:${path}`);
   }
 
-  async exec(command: SandboxCommand, _options?: ExecOptions): Promise<{
+  async exec(command: SandboxCommand, options?: ExecOptions): Promise<{
     output(): Promise<{
       stdout: string;
       stderr: string;
@@ -1040,6 +1030,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     }>;
   }> {
     this.commands.push([...command]);
+    this.execOptions.push(options);
     this.events.push(`exec:${command.join(" ")}`);
     if (command.includes("commit")) this.head = CHECKPOINT_HEAD;
     const stdout = command.includes("rev-parse")
@@ -1071,7 +1062,7 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
 }
 
 describe("SandboxWorkspaceArtifactGitRuntime", () => {
-  it("initializes an empty repository through Sandbox's Git auth interceptor", async () => {
+  it("initializes an empty repository with Artifacts Bearer authentication", async () => {
     const sandbox = new FakeSandbox();
     sandbox.head = CHECKPOINT_HEAD;
     let sandboxId = "";
@@ -1096,13 +1087,15 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       "https://artifacts.example/workspace-123.git",
       "/workspace/repo",
     ]);
-    expect(sandbox.gitAuth).toEqual([{
-      "artifacts.example": {
-        token: "one-use-secret",
-        username: "x-access-token",
-        type: "basic",
-      },
-    }]);
+    const cloneIndex = sandbox.commands.findIndex(command => command.includes("clone"));
+    const pushIndex = sandbox.commands.findIndex(command => command.includes("push"));
+    const expectedAuth = {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.extraHeader",
+      GIT_CONFIG_VALUE_0: "Authorization: Bearer one-use-secret",
+    };
+    expect(sandbox.execOptions[cloneIndex]?.env).toEqual(expectedAuth);
+    expect(sandbox.execOptions[pushIndex]?.env).toEqual(expectedAuth);
     expect(sandbox.commands.flat()).not.toContain("one-use-secret");
     expect(sandbox.commands.flat().filter(argument => argument.startsWith("https://")))
       .toEqual([
@@ -1134,18 +1127,12 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       canonicalDefaultBranch: "main",
     })).resolves.toBe(CHECKPOINT_HEAD);
 
-    expect(sandbox.gitAuth).toEqual([
-      { "artifacts.example": {
-        token: "fork-secret",
-        username: "x-access-token",
-        type: "basic",
-      } },
-      { "artifacts.example": {
-        token: "canonical-secret",
-        username: "x-access-token",
-        type: "basic",
-      } },
-    ]);
+    const cloneIndex = sandbox.commands.findIndex(command => command.includes("clone"));
+    const pushIndex = sandbox.commands.findIndex(command => command.includes("push"));
+    expect(sandbox.execOptions[cloneIndex]?.env?.GIT_CONFIG_VALUE_0)
+      .toBe("Authorization: Bearer fork-secret");
+    expect(sandbox.execOptions[pushIndex]?.env?.GIT_CONFIG_VALUE_0)
+      .toBe("Authorization: Bearer canonical-secret");
     expect(sandbox.commands.flat()).not.toContain("fork-secret");
     expect(sandbox.commands.flat()).not.toContain("canonical-secret");
     expect(sandbox.commands.find(command => command.includes("--is-ancestor")))
@@ -1174,17 +1161,12 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     expect(sandbox.commands[0]).toEqual([
       "git", "clone", "https://artifacts.example/fork.git", "/workspace/repo",
     ]);
-    expect(sandbox.gitAuth.at(-1)).toEqual({
-      "artifacts.example": {
-        token: "fork-write-secret",
-        username: "x-access-token",
-        type: "basic",
-      },
-    });
+    expect(sandbox.execOptions[0]?.env?.GIT_CONFIG_VALUE_0)
+      .toBe("Authorization: Bearer fork-write-secret");
     expect(sandbox.destroyed).toBe(false);
   });
 
-  it("checkpoints chat changes with an expected-head push and intercepted credential", async () => {
+  it("checkpoints chat changes with an expected-head push and Bearer credential", async () => {
     const sandbox = new FakeSandbox();
     sandbox.repositoryExists = true;
     sandbox.status = " M notes.txt\n";
@@ -1202,13 +1184,9 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
 
     expect(sandbox.commands.find(command => command.includes("push")))
       .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
-    expect(sandbox.gitAuth.at(-1)).toEqual({
-      "artifacts.example": {
-        token: "fork-write-secret",
-        username: "x-access-token",
-        type: "basic",
-      },
-    });
+    const pushIndex = sandbox.commands.findIndex(command => command.includes("push"));
+    expect(sandbox.execOptions[pushIndex]?.env?.GIT_CONFIG_VALUE_0)
+      .toBe("Authorization: Bearer fork-write-secret");
     expect(sandbox.destroyed).toBe(false);
   });
 
@@ -1243,13 +1221,9 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     expect(sandbox.files.get("/workspace/repo/nested/data.bin")).toEqual(new Uint8Array([0, 255, 1]));
     expect(sandbox.commands.find(command => command.includes("push")))
       .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
-    expect(sandbox.gitAuth.at(-1)).toEqual({
-      "artifacts.example": {
-        token: "fork-write-secret",
-        username: "x-access-token",
-        type: "basic",
-      },
-    });
+    const pushIndex = sandbox.commands.findIndex(command => command.includes("push"));
+    expect(sandbox.execOptions[pushIndex]?.env?.GIT_CONFIG_VALUE_0)
+      .toBe("Authorization: Bearer fork-write-secret");
   });
 
   it("applies an ordered mutation sequence with explicit filesystem arguments", async () => {
