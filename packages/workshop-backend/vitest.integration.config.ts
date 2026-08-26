@@ -2,9 +2,12 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
 
-const EXPECTED_OPEN_ERROR_CODES = new Set([
+const EXPECTED_RPC_ERROR_CODES = new Set([
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_ACCESS_DENIED",
+  "WORKSPACE_FILE_CONFLICT",
+  "WORKSPACE_FILE_INVALID_REQUEST",
+  "WORKSPACE_FILE_UPLOAD_UNAVAILABLE",
 ]);
 
 export default defineConfig({
@@ -34,13 +37,18 @@ export default defineConfig({
     // The tests assert these exact rejections; all unrelated unhandled errors remain fatal.
     onUnhandledError(error) {
       const code = "code" in error ? error.code : undefined;
-      if (typeof code === "string" && EXPECTED_OPEN_ERROR_CODES.has(code)) return false;
+      if (typeof code === "string" && EXPECTED_RPC_ERROR_CODES.has(code)) return false;
       // The reset-recovery tests abort every Durable Object mid-session; capabilities that were
       // held across the abort (e.g. the fire-and-forget AdminSettings install kicked off by the
       // fetch handler) reject on their own schedule, independent of any awaited call.
       if (error.message?.includes("abortAllDurableObjects")) return false;
       // Same, for the test that aborts only the user DO (state.abort with this reason).
       if (error.message?.includes("user-DO reset injected by test")) return false;
+      // deleteSelf() removes the Durable Object's own storage while replying to the caller. The
+      // awaited RPC succeeds, but workerd separately cancels the now-empty execution context.
+      if (error.message === "The execution context responding to this call was canceled.") {
+        return false;
+      }
     },
   },
 });

@@ -1477,6 +1477,137 @@ export type CommitInfo = {
   timestamp: Date;
 };
 
+/** One accepted file or folder in a workspace's persistent filesystem. */
+export type WorkspaceFileNode = {
+  id: string;
+  parentId: string | null;
+  kind: "file" | "folder";
+  name: string;
+  path: string;
+  mediaType?: string;
+  size: number;
+  createdAt: Date;
+  createdBy: string;
+  updatedAt: Date;
+  updatedBy: string;
+};
+
+/** The current accepted workspace filesystem revision. */
+export type WorkspaceFileRevision = {
+  head: string;
+  rootId: string;
+};
+
+/** A stable node or a node created earlier in the same workspace mutation. */
+export type WorkspaceFileNodeReference = { nodeId: string } | { clientId: string };
+
+/** One authorized change to accepted workspace files. File content uses a staged upload handle. */
+export type WorkspaceFileMutation =
+  | {
+      kind: "createFolder";
+      clientId: string;
+      parent: WorkspaceFileNodeReference;
+      name: string;
+    }
+  | {
+      kind: "createFile";
+      clientId: string;
+      parent: WorkspaceFileNodeReference;
+      name: string;
+      uploadId: string;
+    }
+  | {
+      kind: "replaceFile";
+      nodeId: string;
+      uploadId: string;
+    }
+  | {
+      kind: "move";
+      nodeId: string;
+      parent: WorkspaceFileNodeReference;
+      name: string;
+    }
+  | {
+      kind: "delete";
+      nodeId: string;
+      recursive?: boolean;
+    };
+
+/** One idempotent compare-and-swap request against accepted workspace files. */
+export type WorkspaceFileMutationRequest = {
+  operationId: string;
+  expectedHead: string;
+  message: string;
+  changes: WorkspaceFileMutation[];
+};
+
+/** The accepted result of a workspace file mutation. */
+export type WorkspaceFileMutationResult = WorkspaceFileRevision & {
+  operationId: string;
+  created: Record<string, string>;
+};
+
+/** Product limits enforced by both the workspace capability and repository. */
+export const MAXIMUM_WORKSPACE_FILE_UPLOAD_BYTES = 25 * 1024 * 1024;
+export const MAXIMUM_WORKSPACE_TOTAL_BYTES = 1024 * 1024 * 1024;
+
+/** Stable error codes attached to expected workspace file failures. */
+export const WORKSPACE_FILE_ERROR_CODES = {
+  conflict: "WORKSPACE_FILE_CONFLICT",
+  invalidRequest: "WORKSPACE_FILE_INVALID_REQUEST",
+  uploadQuotaExceeded: "WORKSPACE_FILE_UPLOAD_QUOTA_EXCEEDED",
+  uploadUnavailable: "WORKSPACE_FILE_UPLOAD_UNAVAILABLE",
+  uploadAccessDenied: "WORKSPACE_FILE_UPLOAD_ACCESS_DENIED",
+  uploadIntegrityFailed: "WORKSPACE_FILE_UPLOAD_INTEGRITY_FAILED",
+  workspaceQuotaExceeded: "WORKSPACE_FILE_QUOTA_EXCEEDED",
+  operationReused: "WORKSPACE_FILE_OPERATION_REUSED",
+} as const;
+
+/** An expected workspace file failure code. */
+export type WorkspaceFileErrorCode =
+    typeof WORKSPACE_FILE_ERROR_CODES[keyof typeof WORKSPACE_FILE_ERROR_CODES];
+
+const workspaceFileErrors = codedErrorFamily<WorkspaceFileErrorCode>({
+  [WORKSPACE_FILE_ERROR_CODES.conflict]:
+    "Workspace files changed before this operation could be applied.",
+  [WORKSPACE_FILE_ERROR_CODES.invalidRequest]: "The workspace file request is invalid.",
+  [WORKSPACE_FILE_ERROR_CODES.uploadQuotaExceeded]: "Workspace upload capacity was exceeded.",
+  [WORKSPACE_FILE_ERROR_CODES.uploadUnavailable]: "The workspace upload is unavailable.",
+  [WORKSPACE_FILE_ERROR_CODES.uploadAccessDenied]:
+    "The workspace upload belongs to another profile.",
+  [WORKSPACE_FILE_ERROR_CODES.uploadIntegrityFailed]:
+    "The workspace upload failed its integrity check.",
+  [WORKSPACE_FILE_ERROR_CODES.workspaceQuotaExceeded]: "Workspace storage capacity was exceeded.",
+  [WORKSPACE_FILE_ERROR_CODES.operationReused]:
+    "The workspace operation ID was already used for different input.",
+});
+
+/** Creates an expected workspace file error with a machine-readable code. */
+export function createWorkspaceFileError(
+  code: WorkspaceFileErrorCode,
+  details: { currentHead?: string } = {},
+): Error & { code: WorkspaceFileErrorCode; currentHead?: string } {
+  return Object.assign(workspaceFileErrors.create(code), details);
+}
+
+/** Reads the machine-readable code from an expected workspace file error. */
+export const getWorkspaceFileErrorCode = workspaceFileErrors.getCode;
+
+/** A bounded file stream staged for one subsequent workspace mutation. */
+export type WorkspaceFileUpload = {
+  uploadId: string;
+  size: number;
+  mediaType?: string;
+  expiresAt: Date;
+};
+
+/** A file stream to stage without exposing the workspace's underlying object store. */
+export type WorkspaceFileUploadRequest = {
+  content: ReadableStream<Uint8Array>;
+  size: number;
+  mediaType?: string;
+};
+
 /**
  * Specifies the state of an action in the action log:
  * * pending: Action has not been applied yet. It is waiting for approval.
@@ -1600,6 +1731,26 @@ export type AgentSpawnerConfig = {
 export interface Overseer extends RpcTarget {
   /** Get metadata describing this workspace. */
   getMetadata(): Promise<GadgetMetadata>;
+
+  /** Return the current accepted workspace filesystem head and stable root ID. */
+  getWorkspaceRevision(): Promise<WorkspaceFileRevision>;
+
+  /** List the accepted direct children of one stable workspace folder ID. */
+  listWorkspaceChildren(folderId: string): Promise<WorkspaceFileNode[]>;
+
+  /** Stream the current accepted bytes for one stable workspace file ID. */
+  readWorkspaceFile(fileId: string): Promise<ReadableStream<Uint8Array>>;
+
+  /** Return accepted workspace filesystem commits, newest first. */
+  getWorkspaceHistory(depth?: number): Promise<CommitInfo[]>;
+
+  /** Stage one bounded file stream for a subsequent create or replace mutation. */
+  stageWorkspaceFileUpload(request: WorkspaceFileUploadRequest): Promise<WorkspaceFileUpload>;
+
+  /** Apply one build-authorized, idempotent mutation to accepted workspace files. */
+  applyWorkspaceMutation(
+    request: WorkspaceFileMutationRequest,
+  ): Promise<WorkspaceFileMutationResult>;
 
   /**
    * Get metadata describing this workspace and subscribe to changes.
