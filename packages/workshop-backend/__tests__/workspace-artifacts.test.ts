@@ -1011,7 +1011,7 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     })).resolves.toBe(CHECKPOINT_HEAD);
 
     expect(sandbox.commands).toContainEqual([
-      "git", "-C", "/workspace/repo", "rm", "-r", "-f", "--ignore-unmatch", "--", "old.txt",
+      "rm", "-rf", "--", "/workspace/repo/old.txt",
     ]);
     expect(sandbox.files.get("/workspace/repo/notes.txt"))
       .toEqual(new TextEncoder().encode("updated\n"));
@@ -1023,7 +1023,7 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
     });
   });
 
-  it("applies an ordered mutation sequence with explicit git move arguments", async () => {
+  it("applies an ordered mutation sequence with explicit filesystem arguments", async () => {
     const sandbox = new FakeSandbox();
     sandbox.repositoryExists = true;
     sandbox.status = " M renamed.txt\n D old.txt\n";
@@ -1046,11 +1046,11 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       },
     })).resolves.toBe(CHECKPOINT_HEAD);
 
-    const moveIndex = sandbox.events.findIndex(event => event.includes(" mv "));
-    const deleteIndex = sandbox.events.findIndex(event => event.includes(" rm "));
+    const moveIndex = sandbox.events.findIndex(event => event.startsWith("exec:mv "));
+    const deleteIndex = sandbox.events.findIndex(event => event.startsWith("exec:rm "));
     const writeIndex = sandbox.events.findIndex(event => event === "write:/workspace/repo/nested/data.bin");
-    expect(sandbox.commands.find(command => command.includes("mv"))).toEqual([
-      "git", "-C", "/workspace/repo", "mv", "--", "notes.txt", "archive/renamed.txt",
+    expect(sandbox.commands.find(command => command[0] === "mv")).toEqual([
+      "mv", "--", "/workspace/repo/notes.txt", "/workspace/repo/archive/renamed.txt",
     ]);
     expect(sandbox.directories).toContain("/workspace/repo/archive");
     expect(moveIndex).toBeLessThan(deleteIndex);
@@ -1128,8 +1128,8 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       },
     })).resolves.toBe(CHECKPOINT_HEAD);
 
-    expect(sandbox.commands.find(command => command.includes("mv"))).toEqual([
-      "git", "-C", "/workspace/repo", "mv", "--", "notes.txt", "renamed.txt",
+    expect(sandbox.commands.find(command => command[0] === "mv")).toEqual([
+      "mv", "--", "/workspace/repo/notes.txt", "/workspace/repo/renamed.txt",
     ]);
     expect(sandbox.files.get("/workspace/repo/renamed.txt")).toEqual(new Uint8Array());
   });

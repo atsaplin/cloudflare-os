@@ -801,7 +801,7 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     for (const operation of mutation.operations) {
       if (operation.kind === "delete") {
         await this.#run(sandbox, [
-          "git", "-C", directory, "rm", "-r", "-f", "--ignore-unmatch", "--", operation.path,
+          "rm", "-rf", "--", `${directory}/${operation.path}`,
         ]);
       } else if (operation.kind === "move") {
         const slash = operation.to.lastIndexOf("/");
@@ -809,7 +809,7 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
           await sandbox.mkdir(`${directory}/${operation.to.slice(0, slash)}`, { recursive: true });
         }
         await this.#run(sandbox, [
-          "git", "-C", directory, "mv", "--", operation.from, operation.to,
+          "mv", "--", `${directory}/${operation.from}`, `${directory}/${operation.to}`,
         ]);
       } else {
         const slash = operation.path.lastIndexOf("/");
