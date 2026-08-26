@@ -257,7 +257,19 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
     return Promise.resolve();
   }
 
-  getHead(repositoryName: string): Promise<string | undefined> {
+  getRepositoryMetadata(repositoryName: string): Promise<{
+    name: string;
+    remote: string;
+    defaultBranch: string;
+  }> {
+    return Promise.resolve({
+      name: repositoryName,
+      remote: `https://artifacts.example/${repositoryName}.git`,
+      defaultBranch: "main",
+    });
+  }
+
+  getHead(repositoryName: string, _defaultBranch: string): Promise<string | undefined> {
     if (repositoryName === this.canonical.repositoryName) return Promise.resolve(this.canonical.head);
     const snapshots = this.snapshots.get(repositoryName);
     return Promise.resolve(snapshots === undefined ? undefined : [...snapshots.keys()].at(-1));

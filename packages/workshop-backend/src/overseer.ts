@@ -81,6 +81,21 @@ const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
 const CURRENT_WORKSPACE_STORAGE_VERSION = 3;
 
+/** Selects the workspace code repository used by an Overseer instance. */
+export type WorkspaceCodeRepositoryFactory = (
+  repository: WorkspaceCodeRepository,
+  workspaceId: string,
+) => WorkspaceCodeRepository;
+
+let workspaceCodeRepositoryFactory: WorkspaceCodeRepositoryFactory = repository => repository;
+
+/** Replaces workspace code storage in the Worker integration entrypoint. */
+export function setWorkspaceCodeRepositoryFactoryForTest(
+  factory: WorkspaceCodeRepositoryFactory,
+): void {
+  workspaceCodeRepositoryFactory = factory;
+}
+
 function throwWorkspaceFileError(error: unknown): never {
   if (error instanceof WorkspaceRepositoryConflictError) {
     throw createWorkspaceFileError(WORKSPACE_FILE_ERROR_CODES.conflict, {
@@ -1746,7 +1761,10 @@ class OverseerImpl implements AgentHooks {
       env,
       ctx.id.toString(),
     );
-    this.workspaceCodeRepository = workspaceArtifacts.codeRepository;
+    this.workspaceCodeRepository = workspaceCodeRepositoryFactory(
+      workspaceArtifacts.codeRepository,
+      ctx.id.toString(),
+    );
     this.workspaceRepository = createArtifactsWorkspaceFiles({
       state: ctx,
       bucket: env.WORKSPACE_FILES,
@@ -8670,8 +8688,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       })();
     }
 
-    await this.impl.workspaceRepository.initialize({ id: profileId, name: profileId });
-
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
@@ -8739,11 +8755,6 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         };
       }
     }
-
-    await this.impl.workspaceRepository.initialize({
-      id: callerProfile.id,
-      name: callerProfile.id,
-    });
 
     // Complete pending registration in the owner's UserDO.
     if (this.impl.storage.ownerRegistrationPending.get()) {
@@ -9424,11 +9435,18 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return result;
   }
 
+  async #ensureWorkspaceRepository(): Promise<void> {
+    const profile = await this.#getClientProfile();
+    await this.impl.workspaceRepository.initialize({ id: profile.id, name: profile.name });
+  }
+
   async getWorkspaceRevision(): Promise<WorkspaceFileRevision> {
+    await this.#ensureWorkspaceRepository();
     return this.impl.workspaceRepository.getRevision();
   }
 
   async listWorkspaceChildren(folderId: string): Promise<WorkspaceFileNode[]> {
+    await this.#ensureWorkspaceRepository();
     return (await this.impl.workspaceRepository.list(folderId)).map(node => ({
       ...node,
       createdAt: new Date(node.createdAt),
@@ -9437,10 +9455,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async readWorkspaceFile(fileId: string): Promise<ReadableStream<Uint8Array>> {
+    await this.#ensureWorkspaceRepository();
     return this.impl.workspaceRepository.readFileStream(fileId);
   }
 
   async getWorkspaceHistory(depth = 50): Promise<CommitInfo[]> {
+    await this.#ensureWorkspaceRepository();
     return this.impl.workspaceRepository.getHistory(depth);
   }
 
