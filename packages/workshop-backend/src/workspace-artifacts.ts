@@ -1074,6 +1074,18 @@ export class WorkspaceArtifactLifecycle {
     });
   }
 
+  async #readRepositoryCommitLog(
+    repositoryName: string,
+    ref: string,
+    limit: number,
+  ): Promise<CommitInfo[]> {
+    const repo = await this.#getReadyRepository(repositoryName);
+    if (!hasRepositoryLog(repo)) {
+      throw new Error("The Artifacts binding does not expose repository history.");
+    }
+    return parseCommitLog(await repo.log({ ref, limit }), limit);
+  }
+
   /** Returns bounded commit metadata from the canonical Artifacts repository. */
   readCommitLog(oid: string, options: { depth?: number } = {}): Promise<CommitInfo[]> {
     const ref = requireOid(oid, "Workspace commit");
@@ -1081,11 +1093,26 @@ export class WorkspaceArtifactLifecycle {
     return this.#withLock(async () => {
       const row = this.#canonicalRow();
       if (!row) throw new Error("Canonical workspace repository is not initialized.");
-      const repo = await this.#getReadyRepository(row.repository_name);
-      if (!hasRepositoryLog(repo)) {
-        throw new Error("The Artifacts binding does not expose repository history.");
-      }
-      return parseCommitLog(await repo.log({ ref, limit }), limit);
+      return this.#readRepositoryCommitLog(row.repository_name, ref, limit);
+    });
+  }
+
+  /** Returns bounded commit metadata from one existing chat fork. */
+  readChatCommitLog(
+    chatId: string,
+    epoch: number,
+    oid: string,
+    options: { depth?: number } = {},
+  ): Promise<CommitInfo[]> {
+    if (!chatId || !Number.isInteger(epoch) || epoch < 0 || epoch > maximumEpoch) {
+      throw new Error("Chat fork identity is invalid.");
+    }
+    const ref = requireOid(oid, "Chat fork commit");
+    const limit = requireCommitHistoryDepth(options.depth, maximumCommitHistoryDepth);
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      if (!row) throw new Error("Chat fork does not exist.");
+      return this.#readRepositoryCommitLog(row.repository_name, ref, limit);
     });
   }
 

@@ -391,6 +391,43 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("reads bounded commit history from a chat fork", async () => {
+    await withLifecycle("fork-history", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      const repository = await fixtures.artifacts.get(fork.repositoryName);
+      repository.history = [commitFixture(CHECKPOINT_HEAD, [INITIAL_HEAD])];
+
+      await expect(lifecycle.readChatCommitLog(
+        "chat-one",
+        1,
+        CHECKPOINT_HEAD,
+        { depth: 1 },
+      )).resolves.toEqual([{
+        oid: CHECKPOINT_HEAD,
+        parents: [INITIAL_HEAD],
+        message: "Workspace change\n",
+        author: { name: "Aleksey", email: "aleksey@example.com" },
+        timestamp: new Date(1_700_000_000 * 1_000),
+      }]);
+      expect(repository.logCalls).toEqual([{ ref: CHECKPOINT_HEAD, limit: 1 }]);
+    });
+  });
+
+  it("validates chat fork commit history inputs", async () => {
+    await withLifecycle("fork-history-validation", async lifecycle => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      await lifecycle.ensureChatFork("chat-one", 1);
+
+      expect(() => lifecycle.readChatCommitLog("chat-one", 1, "invalid"))
+        .toThrow("Chat fork commit is not a Git commit SHA.");
+      expect(() => lifecycle.readChatCommitLog("chat-one", 1, CHECKPOINT_HEAD, { depth: 0 }))
+        .toThrow("Workspace history limit must be an integer from 1 to 100.");
+      await expect(lifecycle.readChatCommitLog("missing-chat", 1, CHECKPOINT_HEAD))
+        .rejects.toThrow("Chat fork does not exist.");
+    });
+  });
+
   it("persists acceptance before deleting the chat fork", async () => {
     await withLifecycle("accept", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
