@@ -368,6 +368,23 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("reconciles a pushed fork head when reading its lifecycle status", async () => {
+    await withLifecycle("fork-status-recovery", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("operation-one", 0);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+
+      await expect(lifecycle.getForkStatus("operation-one", 0)).resolves.toMatchObject({
+        state: "open",
+        baselineHead: INITIAL_HEAD,
+        latestHead: CHECKPOINT_HEAD,
+      });
+      await expect(lifecycle.getChatFork("operation-one", 0)).resolves.toMatchObject({
+        latestHead: CHECKPOINT_HEAD,
+      });
+    });
+  });
+
   it("persists acceptance before deleting the chat fork", async () => {
     await withLifecycle("accept", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
@@ -393,6 +410,26 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("deletes every fork Sandbox and repository with the canonical workspace", async () => {
+    await withLifecycle("delete-workspace", async (lifecycle, fixtures) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const first = await lifecycle.ensureChatFork("chat-one", 1);
+      const second = await lifecycle.ensureChatFork("chat-two", 1);
+
+      await lifecycle.deleteWorkspaceRepositories();
+
+      expect(fixtures.runtime.destroyed).toEqual([first.sandboxId, second.sandboxId]);
+      expect(fixtures.artifacts.deleted).toEqual([
+        first.repositoryName,
+        second.repositoryName,
+        canonical.repositoryName,
+      ]);
+      await expect(lifecycle.getCanonical()).resolves.toBeUndefined();
+      await expect(lifecycle.getForkStatus("chat-one", 1)).resolves.toBeUndefined();
+      await expect(lifecycle.deleteWorkspaceRepositories()).resolves.toBeUndefined();
+    });
+  });
+
   it("returns stale without promoting when canonical main moved", async () => {
     await withLifecycle("stale", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
@@ -409,7 +446,7 @@ describe("WorkspaceArtifactLifecycle", () => {
       expect(await lifecycle.getChatFork("chat-one", 1)).toMatchObject({
         repositoryName: fork.repositoryName,
         baselineHead: fork.baselineHead,
-        latestHead: INITIAL_HEAD,
+        latestHead: CHECKPOINT_HEAD,
       });
     });
   });

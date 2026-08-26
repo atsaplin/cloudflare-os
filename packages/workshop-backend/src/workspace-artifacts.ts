@@ -432,6 +432,11 @@ export interface WorkspaceArtifactChatFork {
   sandboxId: string;
 }
 
+export interface WorkspaceArtifactForkStatus extends WorkspaceArtifactChatFork {
+  state: "creating" | "open" | "accepting" | "accepted" | "discarding";
+  acceptedHead?: string;
+}
+
 /** Result of accepting a chat fork through the existing proposal lifecycle. */
 export type WorkspaceArtifactAcceptResult =
   | { status: "merged"; head: string }
@@ -851,6 +856,19 @@ function forkFromRow(row: ForkRow): WorkspaceArtifactChatFork {
   };
 }
 
+function forkStatusFromRow(row: ForkRow): WorkspaceArtifactForkStatus {
+  const fork = forkFromRow(row);
+  if (row.state !== "creating" && row.state !== "open" && row.state !== "accepting" &&
+      row.state !== "accepted" && row.state !== "discarding") {
+    throw new Error(`Workspace fork ${row.chat_id}/${row.epoch} has invalid state.`);
+  }
+  return {
+    ...fork,
+    state: row.state,
+    ...(row.accepted_head === null ? {} : { acceptedHead: row.accepted_head }),
+  };
+}
+
 /**
  * Owns canonical workspace repository and per-chat fork lifecycle metadata.
  *
@@ -1091,8 +1109,19 @@ export class WorkspaceArtifactLifecycle {
   /** Returns one open chat fork without creating it. */
   getChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactChatFork | undefined> {
     return this.#withLock(async () => {
-      const row = this.#forkRow(chatId, epoch);
+      let row = this.#forkRow(chatId, epoch);
+      if (row?.state === "open") row = await this.#reconcileOpenForkHead(row);
       return row?.state === "open" ? forkFromRow(row) : undefined;
+    });
+  }
+
+  /** Returns durable lifecycle state for one existing fork without creating it. */
+  getForkStatus(chatId: string, epoch: number): Promise<WorkspaceArtifactForkStatus | undefined> {
+    return this.#withLock(async () => {
+      let row = this.#forkRow(chatId, epoch);
+      if (!row) return undefined;
+      if (row.state === "open") row = await this.#reconcileOpenForkHead(row);
+      return forkStatusFromRow(row);
     });
   }
 
@@ -1423,6 +1452,26 @@ export class WorkspaceArtifactLifecycle {
         WHERE chat_id = ? AND epoch = ?
       `, chatId, epoch);
       await this.#cleanupFork({ ...row, state: "discarding" });
+    });
+  }
+
+  /** Deletes the canonical repository and every fork and Sandbox owned by this workspace. */
+  deleteWorkspaceRepositories(): Promise<void> {
+    return this.#withLock(async () => {
+      this.#ensureTables();
+      const forks = [...this.#state.storage.sql.exec<ForkRow>(`
+        SELECT chat_id, epoch, repository_name, remote, default_branch, baseline_head,
+               latest_head, sandbox_id, state, accepted_head
+        FROM workspace_artifact_forks
+        ORDER BY chat_id, epoch
+      `)];
+      for (const fork of forks) await this.#cleanupFork(fork);
+      const canonical = this.#canonicalRow();
+      if (!canonical) return;
+      await this.#artifacts.delete(canonical.repository_name);
+      this.#state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_repository WHERE singleton = 1",
+      );
     });
   }
 }
