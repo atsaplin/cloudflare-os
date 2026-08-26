@@ -88,6 +88,8 @@ function workshopConfig(
     gatekeepers: { binding: string; name: string }[],
     patch?: (config: WorkerConfig) => void): WorkerConfig {
   const config = readWorkerConfig(WORKSHOP_DIR);
+  // The integration entrypoint replaces the Artifacts factories with in-memory implementations.
+  delete config.artifacts;
   config.build = { command: "pnpm run build:integration-worker", cwd: WORKSHOP_DIR };
   config.main = resolve(
     WORKSHOP_DIR,
