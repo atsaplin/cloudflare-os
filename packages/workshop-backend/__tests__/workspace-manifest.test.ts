@@ -38,6 +38,7 @@ describe("workspace manifest", () => {
           kind: "folder",
           parentId: null,
           name: "",
+          size: 0,
           createdAt: "2026-08-26T04:00:00.000Z",
           createdBy: "user:aleksey",
           updatedAt: "2026-08-26T04:00:00.000Z",
@@ -48,7 +49,7 @@ describe("workspace manifest", () => {
     expect(new TextDecoder().decode(serializeWorkspaceIndex(index))).toBe(
       '{"version":1,"rootId":"00000000-0000-4000-8000-000000000001","nodes":' +
       '{"00000000-0000-4000-8000-000000000001":{"kind":"folder","parentId":null,' +
-      '"name":"","createdAt":"2026-08-26T04:00:00.000Z","createdBy":"user:aleksey",' +
+      '"name":"","size":0,"createdAt":"2026-08-26T04:00:00.000Z","createdBy":"user:aleksey",' +
       '"updatedAt":"2026-08-26T04:00:00.000Z","updatedBy":"user:aleksey"}}}\n',
     );
   });
@@ -75,6 +76,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: FOLDER_ID,
       name: "notes.txt",
+      size: 12,
       mediaType: "text/plain",
     }, context(() => FILE_ID));
 
@@ -95,6 +97,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: FOLDER_ID,
       name: "notes.txt",
+      size: 0,
     }, context(() => FILE_ID));
 
     const moved = moveWorkspaceNode(file.index, FILE_ID, ROOT_ID, "renamed.txt", {
@@ -122,6 +125,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: ROOT_ID,
       name: "e\u0301.txt",
+      size: 0,
     }, context(() => FILE_ID))).toThrow(/NFC/i);
 
     const folder = createWorkspaceNode(empty, {
@@ -144,6 +148,7 @@ describe("workspace manifest", () => {
       kind: "folder",
       parentId: FILE_ID,
       name: "a",
+      size: 0,
       createdAt: context().now,
       createdBy: context().actorId,
       updatedAt: context().now,
@@ -153,6 +158,7 @@ describe("workspace manifest", () => {
       kind: "folder",
       parentId: FOLDER_ID,
       name: "b",
+      size: 0,
       createdAt: context().now,
       createdBy: context().actorId,
       updatedAt: context().now,
@@ -167,8 +173,9 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: ROOT_ID,
       name: "data",
+      size: 0,
     }, context(() => FILE_ID));
-    const updated = updateWorkspaceFileMetadata(file.index, FILE_ID, "application/octet-stream", {
+    const updated = updateWorkspaceFileMetadata(file.index, FILE_ID, "application/octet-stream", 7, {
       ...context(),
       actorId: "agent:7",
       now: "2026-08-26T04:02:00.000Z",
@@ -179,6 +186,29 @@ describe("workspace manifest", () => {
       mediaType: "application/octet-stream",
       createdBy: "user:aleksey",
       updatedBy: "agent:7",
+    });
+  });
+
+  it("versions accepted file sizes with the stable node identity", () => {
+    const empty = createEmptyWorkspaceIndex(context());
+    const created = createWorkspaceNode(empty, {
+      kind: "file",
+      parentId: ROOT_ID,
+      name: "payload.bin",
+      size: 4,
+    }, context(() => FILE_ID));
+
+    expect(getWorkspaceNode(created.index, FILE_ID)).toMatchObject({ size: 4 });
+    const replaced = updateWorkspaceFileMetadata(
+      created.index,
+      FILE_ID,
+      "application/octet-stream",
+      9,
+      context(),
+    );
+    expect(getWorkspaceNode(replaced, FILE_ID)).toMatchObject({
+      size: 9,
+      mediaType: "application/octet-stream",
     });
   });
 
@@ -193,6 +223,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: FOLDER_ID,
       name: "notes.txt",
+      size: 0,
     }, context(() => FILE_ID));
 
     expect(() => deleteWorkspaceNode(file.index, FOLDER_ID, false)).toThrow(/not empty/i);
@@ -213,6 +244,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: ROOT_ID,
       name: "payload.bin",
+      size: 0,
     }, context(() => FILE_ID));
 
     expect(() => validateWorkspaceTree(file.index, new Map([
@@ -239,6 +271,7 @@ describe("workspace manifest", () => {
       kind: "file",
       parentId: FOLDER_ID,
       name: "notes.txt",
+      size: 0,
     }, context(() => FILE_ID));
 
     expect(() => validateWorkspaceTree(file.index, new Map([

@@ -1170,6 +1170,7 @@ export class WorkspaceRepository {
           kind: "file",
           parentId: resolveReference(change.parent, created),
           name: change.name,
+          size: change.content.byteLength,
           ...(change.mediaType === undefined ? {} : { mediaType: change.mediaType }),
         }, { ...context, createId: () => created[change.clientId] }));
         index = result.index;
@@ -1198,7 +1199,13 @@ export class WorkspaceRepository {
           change.mediaType,
         );
         index = resolveMutationInput(() =>
-          updateWorkspaceFileMetadata(index, change.nodeId, change.mediaType, context));
+          updateWorkspaceFileMetadata(
+            index,
+            change.nodeId,
+            change.mediaType,
+            change.content.byteLength,
+            context,
+          ));
       } else if (change.kind === "move") {
         const node = getWorkspaceNode(index, change.nodeId);
         if (!node) {

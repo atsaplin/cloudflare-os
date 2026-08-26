@@ -11,6 +11,7 @@ export interface WorkspaceIndexNode {
   kind: "file" | "folder";
   parentId: string | null;
   name: string;
+  size: number;
   mediaType?: string;
   createdAt: string;
   createdBy: string;
@@ -51,6 +52,7 @@ const nodeSchema: z.ZodType<WorkspaceIndexNode> = z.strictObject({
   kind: z.enum(["file", "folder"]),
   parentId: z.string().nullable(),
   name: z.string(),
+  size: z.number(),
   mediaType: z.string().optional(),
   createdAt: z.string(),
   createdBy: z.string(),
@@ -103,6 +105,7 @@ function canonicalNode(node: WorkspaceIndexNode): WorkspaceIndexNode {
     kind: node.kind,
     parentId: node.parentId,
     name: node.name,
+    size: node.size,
     ...(node.mediaType === undefined ? {} : { mediaType: node.mediaType }),
     createdAt: node.createdAt,
     createdBy: node.createdBy,
@@ -173,6 +176,7 @@ export function createEmptyWorkspaceIndex(context: WorkspaceIndexContext): Works
         kind: "folder",
         parentId: null,
         name: "",
+        size: 0,
         createdAt: context.now,
         createdBy: context.actorId,
         updatedAt: context.now,
@@ -198,6 +202,10 @@ export function validateWorkspaceIndex(index: WorkspaceIndexV1): void {
     requireActorId(node.createdBy);
     requireActorId(node.updatedBy);
     requireMediaType(node.mediaType);
+    if (!Number.isSafeInteger(node.size) || node.size < 0 ||
+        (node.kind === "folder" && node.size !== 0)) {
+      throw new Error("Workspace node sizes must be non-negative integers, and folders must be zero.");
+    }
     if (node.kind === "folder" && node.mediaType !== undefined) {
       throw new Error("Workspace folders cannot have media types.");
     }
@@ -301,9 +309,14 @@ export function listWorkspaceChildren(index: WorkspaceIndexV1, parentId: string)
 export function createWorkspaceNode(
   index: WorkspaceIndexV1,
   operation: {
-    kind: "file" | "folder";
+    kind: "folder";
     parentId: string;
     name: string;
+  } | {
+    kind: "file";
+    parentId: string;
+    name: string;
+    size: number;
     mediaType?: string;
   },
   context: WorkspaceIndexContext,
@@ -311,9 +324,11 @@ export function createWorkspaceNode(
   validateWorkspaceIndex(index);
   requireFolder(index, operation.parentId);
   requireName(operation.name);
-  requireMediaType(operation.mediaType);
-  if (operation.kind === "folder" && operation.mediaType !== undefined) {
-    throw new Error("Workspace folders cannot have media types.");
+  const mediaType = operation.kind === "file" ? operation.mediaType : undefined;
+  requireMediaType(mediaType);
+  const size = operation.kind === "file" ? operation.size : 0;
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error("Workspace file sizes must be non-negative safe integers.");
   }
   requireCanonicalTimestamp(context.now);
   requireActorId(context.actorId);
@@ -327,7 +342,8 @@ export function createWorkspaceNode(
     kind: operation.kind,
     parentId: operation.parentId,
     name: operation.name,
-    ...(operation.mediaType === undefined ? {} : { mediaType: operation.mediaType }),
+    size,
+    ...(mediaType === undefined ? {} : { mediaType }),
     createdAt: context.now,
     createdBy: context.actorId,
     updatedAt: context.now,
@@ -379,17 +395,22 @@ export function updateWorkspaceFileMetadata(
   index: WorkspaceIndexV1,
   nodeId: string,
   mediaType: string | undefined,
+  size: number,
   context: WorkspaceIndexContext,
 ): WorkspaceIndexV1 {
   validateWorkspaceIndex(index);
   const node = requireNode(index, nodeId);
   if (node.kind !== "file") throw new Error(`Workspace node ${nodeId} is not a file.`);
   requireMediaType(mediaType);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error("Workspace file sizes must be non-negative safe integers.");
+  }
   requireCanonicalTimestamp(context.now);
   requireActorId(context.actorId);
   const next = copyIndex(index);
   next.nodes[nodeId] = {
     ...next.nodes[nodeId],
+    size,
     ...(mediaType === undefined ? { mediaType: undefined } : { mediaType }),
     updatedAt: context.now,
     updatedBy: context.actorId,
