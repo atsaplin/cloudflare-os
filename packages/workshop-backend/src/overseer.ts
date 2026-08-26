@@ -385,6 +385,7 @@ type GadgetRecord = {
   // the head. Accepting a covered creation likewise always writes a first commit (an empty tree
   // when the gadget has no files yet), so promotion establishes the invariant too.
   commitId?: string;
+  previousCommitId?: string;
 
   // This gadget's bindings: binding name (as it appears in the gadget worker's `env`) -> binding
   // edge. Expected to stay small, so it's a map on the record rather than a separate collection.
@@ -3132,16 +3133,16 @@ class OverseerImpl implements AgentHooks {
       // depends on the transform below, but transforms only ever drop file changes, so prefetching
       // for every *declared* pin (plus every bridge boundary commit) covers all cases.
       let content = await this.getCurrentChatContent(chatId, meta);
-      let pinData = new Map<string, {head: string, headParents: string[],
+      let pinData = new Map<string, {head: string, previousHead: string | undefined,
                                      baseFiles: Map<string, string>}>();
       let prefetchPin = async (gadgetId: WorkpieceId, baseCommit: string) => {
         if (pinData.has(`${gadgetId}:${baseCommit}`)) return;
-        let head = this.storage.gadgets.get(gadgetId)?.commitId;
+        let record = this.storage.gadgets.get(gadgetId);
+        let head = record?.commitId;
         if (head === undefined) return;  // validated (and rejected) in the sync tail
         pinData.set(`${gadgetId}:${baseCommit}`, {
           head,
-          headParents: head === baseCommit
-              ? [] : (await this.gitStore.readCommitLog(head, {depth: 1}))[0].parents,
+          previousHead: record.previousCommitId,
           baseFiles: await this.readCommitFiles(gadgetId, baseCommit),
         });
       };
@@ -3216,7 +3217,7 @@ class OverseerImpl implements AgentHooks {
   #applyValidatedSubmission(
       chatId: number, meta: AiChatMetadata, codeBase: ChatCodeBase,
       submission: CodeChangeSubmission, author: AiChatAuthorInfo, content: CodeContent,
-      pinData: Map<string, {head: string, headParents: string[],
+      pinData: Map<string, {head: string, previousHead: string | undefined,
                             baseFiles: Map<string, string>}>,
       bridge: ChatChangeBoundaryRecord | undefined)
       : {generation: number, revision: number} | "retry" {
@@ -3300,7 +3301,7 @@ class OverseerImpl implements AgentHooks {
       if (prefetched === undefined || prefetched.head !== record.commitId) {
         return "retry";  // the head moved during the prefetches; re-resolve
       }
-      if (baseCommit !== prefetched.head && !prefetched.headParents.includes(baseCommit)) {
+      if (baseCommit !== prefetched.head && baseCommit !== prefetched.previousHead) {
         throw new Error("Pin declaration does not match the gadget's current head.");
       }
       newPins.push({gadgetId, baseCommit, mergedCommit: baseCommit});
@@ -3544,10 +3545,15 @@ class OverseerImpl implements AgentHooks {
     }
 
     const commits = intent.gadgets.map(({gadgetId}) => ({gadgetId, commitId: acceptedHead}));
-    for (const {gadgetId, commitId} of commits) {
+    for (const {gadgetId, baseHead} of intent.gadgets) {
       const record = this.storage.gadgets.get(gadgetId);
       if (!record) throw new Error("Accepted gadget disappeared.");
-      record.commitId = commitId;
+      if (baseHead === undefined) {
+        delete record.previousCommitId;
+      } else {
+        record.previousCommitId = baseHead;
+      }
+      record.commitId = acceptedHead;
       this.storage.gadgets.put(record);
     }
 
@@ -9500,7 +9506,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (depth !== undefined && (!Number.isInteger(depth) || depth <= 0)) {
       throw new Error("Invalid depth.");
     }
-    return await this.impl.gitStore.readCommitLog(validateOid(fromCommit), {depth});
+    return await this.impl.workspaceCodeRepository.readCommitLog(
+        validateOid(fromCommit), {depth});
   }
 
   async updateChatFromMainline(chatId: number): Promise<{conflictPaths: string[]}> {
@@ -10442,7 +10449,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // own last-updated time.
   async #blueprintCodeDate(record: BlueprintGadgetRecord): Promise<Date> {
     if (record.commitId !== undefined) {
-      return (await this.impl.gitStore.readCommitLog(record.commitId, {depth: 1}))[0].timestamp;
+      return (await this.impl.workspaceCodeRepository.readCommitLog(
+          record.commitId, {depth: 1}))[0].timestamp;
     }
     if (record.codeVersion !== undefined) {
       let codeUpdate = this.impl.storage.code.get(record.codeVersion);
@@ -11193,7 +11201,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
     // Derive codeVersionDate from the exported commit.
     let codeVersionDate =
-        (await this.impl.gitStore.readCommitLog(commitId, {depth: 1}))[0].timestamp;
+        (await this.impl.workspaceCodeRepository.readCommitLog(
+            commitId, {depth: 1}))[0].timestamp;
 
     return {
       id,

@@ -64,6 +64,16 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
     });
   }
 
+  readCommitLog(oid: string, options?: { depth?: number }): Promise<CommitInfo[]> {
+    return this.#gitStore.readCommitLog(oid, options);
+  }
+
+  getHistory(limit?: number): Promise<CommitInfo[]> {
+    const head = [...this.#forkHeads.values()].at(-1) ?? this.#gadgetHead(1);
+    if (head === undefined) return Promise.resolve([]);
+    return this.#gitStore.readCommitLog(head, { depth: limit });
+  }
+
   async readGadgetFiles(gadgetId: number, ref: string): Promise<Map<string, string>> {
     const files = await this.#gitStore.readCommitFiles(ref);
     const prefix = `.workspace/gadgets/${gadgetId}/`;
@@ -163,15 +173,19 @@ async function withImpl(fn: (impl: any) => Promise<void>): Promise<void> {
   });
 }
 
-function addGadget(impl: any, id: number, bindingName: string, commitId?: string): void {
+function addGadget(
+    impl: any, id: number, bindingName: string, commitId?: string,
+    previousCommitId?: string): void {
   impl.storage.gadgets.put({
     id, title: bindingName, created: new Date(0), bindingName, bindings: {},
     ...(commitId !== undefined ? { commitId } : {}),
+    ...(previousCommitId !== undefined ? { previousCommitId } : {}),
   });
 }
 
 function setHead(impl: any, id: number, commitId: string): void {
   let record = impl.storage.gadgets.get(id)!;
+  record.previousCommitId = record.commitId;
   record.commitId = commitId;
   impl.storage.gadgets.put(record);
 }
@@ -267,8 +281,9 @@ describe("submitCodeChange", () => {
   it("accepts a pin at the head's parent but rejects older bases", () => withImpl(async impl => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let c2 = await commitFiles(impl, { "a.txt": "two\n" }, [c1]);
-    let c3 = await commitFiles(impl, { "a.txt": "three\n" }, [c2]);
-    addGadget(impl, 1, "APP", c3);
+    let unrelated = await commitFiles(impl, { "other.txt": "other\n" }, [c2]);
+    let c3 = await commitFiles(impl, { "a.txt": "three\n" }, [unrelated]);
+    addGadget(impl, 1, "APP", c3, c2);
     addChat(impl, 1);
 
     await expect(submit(impl, 1, {

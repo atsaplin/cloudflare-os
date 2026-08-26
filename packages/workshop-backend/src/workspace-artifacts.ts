@@ -11,10 +11,17 @@ import {
   parseWorkspaceIndex,
   serializeWorkspaceIndex,
 } from "./workspace-manifest";
+import type { CommitInfo } from "@gadgets/workshop-shared/api";
 import type { WorkspaceActor } from "./workspace-repository";
 
 const gitOidPattern = /^[0-9a-f]{40}$/;
 const maximumEpoch = 1_000_000_000;
+const maximumCommitHistoryDepth = 100;
+const defaultCommitHistoryDepth = 50;
+const maximumCommitParents = 32;
+const maximumCommitMessageBytes = 64 * 1024;
+const maximumCommitIdentityBytes = 4 * 1024;
+const maximumCommitTimestampSeconds = 1_000_000_000_000;
 const maximumRepositoryPathBytes = 4_096;
 const maximumRepositorySegmentBytes = 255;
 const maximumRepositoryTreeDepth = 128;
@@ -71,10 +78,6 @@ export interface WorkspaceArtifactReader {
   ): Promise<Uint8Array>;
 }
 
-interface WorkspaceArtifactCommitSummary {
-  hash: string;
-}
-
 interface WorkspaceArtifactHistoryRepo extends WorkspaceArtifactRepo {
   log(options: { ref: string; limit: number }): Promise<unknown>;
 }
@@ -109,15 +112,80 @@ function hasRepositoryLog(repo: WorkspaceArtifactRepo): repo is WorkspaceArtifac
   return "log" in repo && typeof repo.log === "function";
 }
 
-function parseCommitLog(value: unknown): WorkspaceArtifactCommitSummary[] {
-  if (!Array.isArray(value)) throw new Error("Artifacts commit history response is invalid.");
-  return value.map(commit => {
-    if (typeof commit !== "object" || commit === null || !("hash" in commit) ||
-        typeof commit.hash !== "string") {
-      throw new Error("Artifacts commit history entry is invalid.");
-    }
-    return { hash: requireOid(commit.hash, "Artifacts commit history head") };
-  });
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function requireBoundedCommitText(value: unknown, label: string, maximumBytes: number): string {
+  if (typeof value !== "string" ||
+      new TextEncoder().encode(value).byteLength > maximumBytes) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value;
+}
+
+function parseCommitIdentity(value: unknown): { name: string; email: string } {
+  if (!isRecord(value)) throw new Error("Artifacts commit identity is invalid.");
+  return {
+    name: requireBoundedCommitText(value.name, "Artifacts commit author name",
+      maximumCommitIdentityBytes),
+    email: requireBoundedCommitText(value.email, "Artifacts commit author email",
+      maximumCommitIdentityBytes),
+  };
+}
+
+function parseCommitTimestamp(value: unknown): Date {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) ||
+      value < -maximumCommitTimestampSeconds || value > maximumCommitTimestampSeconds) {
+    throw new Error("Artifacts commit author timestamp is invalid.");
+  }
+  const timestamp = new Date(value * 1_000);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new Error("Artifacts commit author timestamp is invalid.");
+  }
+  return timestamp;
+}
+
+function parseCommit(value: unknown): CommitInfo {
+  if (!isRecord(value)) throw new Error("Artifacts commit history entry is invalid.");
+  const hash = requireOid(
+    requireBoundedCommitText(value.hash, "Artifacts commit hash", 40),
+    "Artifacts commit hash",
+  );
+  requireOid(
+    requireBoundedCommitText(value.treeHash, "Artifacts commit tree", 40),
+    "Artifacts commit tree",
+  );
+  if (!Array.isArray(value.parents) || value.parents.length > maximumCommitParents) {
+    throw new Error("Artifacts commit parents are invalid.");
+  }
+  const parents = value.parents.map(parent => requireOid(
+    requireBoundedCommitText(parent, "Artifacts commit parent", 40),
+    "Artifacts commit parent",
+  ));
+  return {
+    oid: hash,
+    parents,
+    message: requireBoundedCommitText(value.message, "Artifacts commit message",
+      maximumCommitMessageBytes),
+    author: parseCommitIdentity(value.author),
+    timestamp: parseCommitTimestamp(value.authoredAt),
+  };
+}
+
+function parseCommitLog(value: unknown, limit: number): CommitInfo[] {
+  if (!Array.isArray(value) || value.length > limit) {
+    throw new Error("Artifacts commit history response is invalid.");
+  }
+  return value.map(parseCommit);
+}
+
+function requireCommitHistoryDepth(depth: number | undefined, defaultDepth: number): number {
+  const resolved = depth ?? defaultDepth;
+  if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > maximumCommitHistoryDepth) {
+    throw new Error("Workspace history limit must be an integer from 1 to 100.");
+  }
+  return resolved;
 }
 
 function hasRepositoryInspection(
@@ -128,11 +196,10 @@ function hasRepositoryInspection(
 }
 
 function parseCommitTree(value: unknown): string {
-  if (typeof value !== "object" || value === null || !("tree" in value) ||
-      typeof value.tree !== "string") {
+  if (!isRecord(value) || typeof value.treeHash !== "string") {
     throw new Error("Artifacts commit response is invalid.");
   }
-  return requireOid(value.tree, "Artifacts commit tree");
+  return requireOid(value.treeHash, "Artifacts commit tree");
 }
 
 function parseTreeEntries(value: unknown): WorkspaceArtifactTreeEntry[] {
@@ -174,8 +241,8 @@ export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReade
     if (!hasRepositoryLog(repo)) {
       throw new Error("The Artifacts binding does not expose repository history.");
     }
-    const commits = parseCommitLog(await repo.log({ ref: repo.defaultBranch, limit: 1 }));
-    return commits[0]?.hash;
+    const commits = parseCommitLog(await repo.log({ ref: repo.defaultBranch, limit: 1 }), 1);
+    return commits[0]?.oid;
   }
 
   async listFiles(repositoryName: string, ref: string): Promise<string[]> {
@@ -960,6 +1027,38 @@ export class WorkspaceArtifactLifecycle {
     });
   }
 
+  /** Returns bounded commit metadata from the canonical Artifacts repository. */
+  readCommitLog(oid: string, options: { depth?: number } = {}): Promise<CommitInfo[]> {
+    const ref = requireOid(oid, "Workspace commit");
+    const limit = requireCommitHistoryDepth(options.depth, maximumCommitHistoryDepth);
+    return this.#withLock(async () => {
+      const row = this.#canonicalRow();
+      if (!row) throw new Error("Canonical workspace repository is not initialized.");
+      const repo = await this.#getReadyRepository(row.repository_name);
+      if (!hasRepositoryLog(repo)) {
+        throw new Error("The Artifacts binding does not expose repository history.");
+      }
+      return parseCommitLog(await repo.log({ ref, limit }), limit);
+    });
+  }
+
+  /** Returns recent commits from the canonical repository's default branch. */
+  getHistory(limit = defaultCommitHistoryDepth): Promise<CommitInfo[]> {
+    const depth = requireCommitHistoryDepth(limit, defaultCommitHistoryDepth);
+    return this.#withLock(async () => {
+      const row = this.#canonicalRow();
+      if (!row) throw new Error("Canonical workspace repository is not initialized.");
+      const repo = await this.#getReadyRepository(row.repository_name);
+      if (!hasRepositoryLog(repo)) {
+        throw new Error("The Artifacts binding does not expose repository history.");
+      }
+      return parseCommitLog(
+        await repo.log({ ref: repo.defaultBranch, limit: depth }),
+        depth,
+      );
+    });
+  }
+
   /** Returns one open chat fork without creating it. */
   getChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactChatFork | undefined> {
     return this.#withLock(async () => {
@@ -1309,6 +1408,8 @@ export interface ArtifactsWorkspaceRepositoryOptions {
 
 export interface WorkspaceCodeRepository {
   ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical>;
+  readCommitLog(oid: string, options?: { depth?: number }): Promise<CommitInfo[]>;
+  getHistory(limit?: number): Promise<CommitInfo[]>;
   readGadgetFiles(gadgetId: number, ref: string): Promise<Map<string, string>>;
   changedGadgetPaths(
     gadgetId: number,
@@ -1362,6 +1463,14 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
 
   ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical> {
     return this.#lifecycle.ensureCanonical(actor);
+  }
+
+  readCommitLog(oid: string, options?: { depth?: number }): Promise<CommitInfo[]> {
+    return this.#lifecycle.readCommitLog(oid, options);
+  }
+
+  getHistory(limit?: number): Promise<CommitInfo[]> {
+    return this.#lifecycle.getHistory(limit);
   }
 
   async #canonical(): Promise<WorkspaceArtifactCanonical> {

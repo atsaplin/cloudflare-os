@@ -23,12 +23,28 @@ declare module "cloudflare:test" {
 
 const INITIAL_HEAD = "1".repeat(40);
 const CHECKPOINT_HEAD = "2".repeat(40);
+const INITIAL_TREE = "a".repeat(40);
+
+function commitFixture(hash: string, parents: string[] = []): Record<string, unknown> {
+  return {
+    hash,
+    treeHash: INITIAL_TREE,
+    message: "Workspace change\n",
+    author: { name: "Aleksey", email: "aleksey@example.com" },
+    committer: { name: "Aleksey", email: "aleksey@example.com" },
+    parents,
+    authoredAt: 1_700_000_000,
+    committedAt: 1_700_000_000,
+  };
+}
 
 class FakeRepo implements WorkspaceArtifactRepo {
   readonly tokens = new Map<string, "read" | "write">();
   readonly revoked: string[] = [];
   readonly commits = new Map<string, unknown>();
   readonly trees = new Map<string, unknown>();
+  history: unknown = [];
+  readonly logCalls: Array<{ ref: string; limit: number }> = [];
 
   constructor(
     readonly name: string,
@@ -69,8 +85,9 @@ class FakeRepo implements WorkspaceArtifactRepo {
     };
   }
 
-  async log(): Promise<Array<{ hash: string }>> {
-    return [];
+  async log(options: { ref: string; limit: number }): Promise<unknown> {
+    this.logCalls.push(options);
+    return this.history;
   }
 
   readCommit(hash: string): Promise<unknown> {
@@ -471,6 +488,62 @@ describe("WorkspaceArtifactLifecycle", () => {
 });
 
 describe("ArtifactsWorkspaceRepository", () => {
+  it("reads bounded workspace history from the canonical Artifacts repository", async () => {
+    await withLifecycle("repository-history", async (lifecycle, fixtures) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "alice", name: "Alice" });
+      const parent = "3".repeat(40);
+      const head = "4".repeat(40);
+      const artifactRepo = await fixtures.artifacts.get(canonical.repositoryName);
+      artifactRepo.history = [commitFixture(head, [parent]), commitFixture(parent)];
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      await expect(repository.readCommitLog(head, { depth: 2 })).resolves.toEqual([
+        {
+          oid: head,
+          parents: [parent],
+          message: "Workspace change\n",
+          author: { name: "Aleksey", email: "aleksey@example.com" },
+          timestamp: new Date(1_700_000_000 * 1_000),
+        },
+        {
+          oid: parent,
+          parents: [],
+          message: "Workspace change\n",
+          author: { name: "Aleksey", email: "aleksey@example.com" },
+          timestamp: new Date(1_700_000_000 * 1_000),
+        },
+      ]);
+      expect(artifactRepo.logCalls).toEqual([{ ref: head, limit: 2 }]);
+    });
+  });
+
+  it("reads default-branch history with the workspace history bound", async () => {
+    await withLifecycle("repository-default-history", async (lifecycle, fixtures) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "alice", name: "Alice" });
+      const artifactRepo = await fixtures.artifacts.get(canonical.repositoryName);
+      artifactRepo.history = [commitFixture(INITIAL_HEAD)];
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      await expect(repository.getHistory()).resolves.toHaveLength(1);
+      expect(artifactRepo.logCalls).toEqual([{ ref: "main", limit: 50 }]);
+    });
+  });
+
+  it("rejects malformed or over-sized Artifacts history responses", async () => {
+    await withLifecycle("repository-history-bounds", async (lifecycle, fixtures) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "alice", name: "Alice" });
+      const artifactRepo = await fixtures.artifacts.get(canonical.repositoryName);
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader: fixtures.reader });
+
+      await expect(Promise.resolve().then(() => repository.getHistory(101)))
+        .rejects.toThrow(/1 to 100/);
+      artifactRepo.history = [commitFixture(INITIAL_HEAD), commitFixture("2".repeat(40))];
+      await expect(repository.getHistory(1)).rejects.toThrow(/history response/i);
+      artifactRepo.history = [{ ...commitFixture(INITIAL_HEAD), parents: ["not-a-sha"] }];
+      await expect(repository.getHistory()).rejects.toThrow(/parent/i);
+    });
+  });
+
   it("reads one gadget subtree at an explicit workspace revision", async () => {
     await withLifecycle("repository-read", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
@@ -573,7 +646,7 @@ describe("CloudflareWorkspaceArtifactReader", () => {
     const repo = await artifacts.create("workspace-one");
     readerState.heads.set(repo.name, INITIAL_HEAD);
     const artifactRepo = await artifacts.get(repo.name);
-    artifactRepo.log = () => Promise.resolve([{ hash: INITIAL_HEAD }]);
+    artifactRepo.history = [commitFixture(INITIAL_HEAD)];
     const requests: Request[] = [];
     const reader = new CloudflareWorkspaceArtifactReader({
       artifacts,
@@ -655,7 +728,7 @@ describe("CloudflareWorkspaceArtifactReader", () => {
     const repo = await artifacts.get(created.name);
     const rootTree = "3".repeat(40);
     const nestedTree = "4".repeat(40);
-    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, tree: rootTree });
+    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, treeHash: rootTree });
     repo.trees.set(rootTree, [
       { name: ".workspace", hash: nestedTree, mode: "040000", type: "tree" },
       { name: "README.md", hash: "5".repeat(40), mode: "100644", type: "blob" },
@@ -681,7 +754,7 @@ describe("CloudflareWorkspaceArtifactReader", () => {
     const created = await artifacts.create("workspace-one");
     const repo = await artifacts.get(created.name);
     const rootTree = "3".repeat(40);
-    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, tree: rootTree });
+    repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, treeHash: rootTree });
     repo.trees.set(rootTree, [
       { name: "escape", hash: "5".repeat(40), mode: "120000", type: "blob" },
     ]);
