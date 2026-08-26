@@ -10,6 +10,7 @@ import {
   WORKSPACE_INDEX_PATH,
 } from "../../src/workspace-manifest";
 import { WorkspaceUploadStore } from "../../src/workspace-upload-store";
+import { ArtifactsWorkspaceRepository } from "../../src/workspace-artifacts";
 import type {
   WorkspaceArtifactAcceptResult,
   WorkspaceArtifactCanonical,
@@ -17,6 +18,7 @@ import type {
   WorkspaceArtifactForkStatus,
   WorkspaceArtifactMutation,
   WorkspaceArtifactReader,
+  WorkspaceCodeRepository,
 } from "../../src/workspace-artifacts";
 import type { WorkspaceActor } from "../../src/workspace-files";
 
@@ -138,7 +140,19 @@ class LocalArtifacts implements WorkspaceArtifactReader, ArtifactsWorkspaceFileL
     return Promise.resolve(this.#state.canonical);
   }
 
-  getHead(repositoryName: string): Promise<string | undefined> {
+  getRepositoryMetadata(repositoryName: string): Promise<{
+    name: string;
+    remote: string;
+    defaultBranch: string;
+  }> {
+    return Promise.resolve({
+      name: repositoryName,
+      remote: `https://artifacts.test/${repositoryName}.git`,
+      defaultBranch: "main",
+    });
+  }
+
+  getHead(repositoryName: string, _defaultBranch: string): Promise<string | undefined> {
     return Promise.resolve(this.#state.repositories.get(repositoryName)?.head);
   }
 
@@ -317,4 +331,10 @@ export function createArtifactsWorkspaceFiles(
       workspaceId: options.workspaceId,
     }),
   });
+}
+
+/** Creates the shared in-memory code repository for a Worker integration workspace. */
+export function createWorkspaceCodeRepository(workspaceId: string): WorkspaceCodeRepository {
+  const artifacts = new LocalArtifacts(workspaceId);
+  return new ArtifactsWorkspaceRepository({ lifecycle: artifacts, reader: artifacts });
 }
