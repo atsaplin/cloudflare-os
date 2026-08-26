@@ -1068,6 +1068,7 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   runChatOperation(request: ChatWorkspaceOperationRequest): Promise<ChatWorkspaceOperationResult> {
     requireChatOperationIdentity(request);
     return this.#withLock(async () => {
+      await this.#lifecycle.ensureCanonical(request.actor);
       const path = normalizeChatPath(request.operation.path);
       if (request.operation.kind === "list") {
         const revision = await this.#readChatRevision(request.chatId, request.epoch);
