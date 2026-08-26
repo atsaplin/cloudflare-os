@@ -317,7 +317,7 @@ export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReade
           throw new Error("Artifacts workspace tree exceeds the entry limit.");
         }
         const path = requireRepositoryPath(prefix ? `${prefix}/${entry.name}` : entry.name);
-        if (entry.type === "tree" && entry.mode === "040000") {
+        if (entry.type === "tree" && entry.mode === "40000") {
           await visit(entry.hash, path, depth + 1);
         } else if (entry.type === "blob" &&
             (entry.mode === "100644" || entry.mode === "100755")) {
