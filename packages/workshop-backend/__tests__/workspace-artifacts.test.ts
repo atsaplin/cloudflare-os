@@ -961,7 +961,7 @@ describe("CloudflareWorkspaceArtifactReader", () => {
     const nestedTree = "4".repeat(40);
     repo.commits.set(INITIAL_HEAD, { hash: INITIAL_HEAD, treeHash: rootTree });
     repo.trees.set(rootTree, [
-      { name: ".workspace", hash: nestedTree, mode: "040000", type: "tree" },
+      { name: ".workspace", hash: nestedTree, mode: "40000", type: "tree" },
       { name: "README.md", hash: "5".repeat(40), mode: "100644", type: "blob" },
     ]);
     repo.trees.set(nestedTree, [
