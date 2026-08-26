@@ -630,6 +630,25 @@ describe("CloudflareWorkspaceArtifactReader", () => {
       .rejects.toThrow(/exceeds/i);
   });
 
+  it("rejects an invalid repository path before issuing the request", async () => {
+    const artifacts = new FakeArtifacts(new FakeReader());
+    let requested = false;
+    const reader = new CloudflareWorkspaceArtifactReader({
+      artifacts,
+      accountId: "62f4d80db4b47c969f575420fa2aae29",
+      namespace: "workshop-workspaces",
+      apiToken: "rest-secret",
+      fetch: () => {
+        requested = true;
+        return Promise.resolve(new Response());
+      },
+    });
+
+    await expect(reader.readFile("workspace-one", INITIAL_HEAD, "../secret"))
+      .rejects.toThrow(/path is invalid/i);
+    expect(requested).toBe(false);
+  });
+
   it("lists regular files recursively from the Artifacts binding", async () => {
     const artifacts = new FakeArtifacts(new FakeReader());
     const created = await artifacts.create("workspace-one");

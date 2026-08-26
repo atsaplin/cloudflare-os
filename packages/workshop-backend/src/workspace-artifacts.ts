@@ -221,13 +221,14 @@ export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReade
       throw new Error("Workspace file read bound is invalid.");
     }
     requireOid(ref, "Workspace file ref");
+    const repositoryPath = requireRepositoryPath(path);
     const url = new URL(
       `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(this.#accountId)}` +
       `/artifacts/namespaces/${encodeURIComponent(this.#namespace)}` +
       `/repos/${encodeURIComponent(repositoryName)}/file`,
     );
     url.searchParams.set("ref", ref);
-    url.searchParams.set("path", path);
+    url.searchParams.set("path", repositoryPath);
     const response = await this.#fetch(new Request(url, {
       headers: { Authorization: `Bearer ${this.#apiToken}` },
     }));

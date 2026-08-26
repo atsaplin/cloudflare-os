@@ -40,7 +40,11 @@ let doCounter = 0;
 class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
   readonly staged: Array<{chatId: string; epoch: number; gadgetIds: number[]}> = [];
   readonly accepted: Array<{chatId: string; epoch: number}> = [];
+  readonly completionAttempts: Array<{chatId: string; epoch: number; head: string}> = [];
   readonly completed: Array<{chatId: string; epoch: number; head: string}> = [];
+  readonly discarded: Array<{chatId: string; epoch: number}> = [];
+  failNextAcceptAfterPromotion = false;
+  failNextCompletion = false;
   readonly #gitStore: GitStore;
   readonly #gadgetHead: (gadgetId: number) => string | undefined;
   readonly #forkHeads = new Map<string, string>();
@@ -121,16 +125,25 @@ class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
     this.accepted.push({ chatId, epoch });
     const head = this.#forkHeads.get(`${chatId}:${epoch}`);
     if (head === undefined) throw new Error("Test chat fork is missing.");
+    if (this.failNextAcceptAfterPromotion) {
+      this.failNextAcceptAfterPromotion = false;
+      throw new Error("accept response lost");
+    }
     return Promise.resolve({ status: "merged", head });
   }
 
-  completeAcceptedChatFork(chatId: string, epoch: number, head: string): Promise<void> {
+  async completeAcceptedChatFork(chatId: string, epoch: number, head: string): Promise<void> {
+    this.completionAttempts.push({ chatId, epoch, head });
+    if (this.failNextCompletion) {
+      this.failNextCompletion = false;
+      throw new Error("fork cleanup failed");
+    }
     this.completed.push({ chatId, epoch, head });
     this.#forkHeads.delete(`${chatId}:${epoch}`);
-    return Promise.resolve();
   }
 
   discardChatFork(chatId: string, epoch: number): Promise<void> {
+    this.discarded.push({ chatId, epoch });
     this.#forkHeads.delete(`${chatId}:${epoch}`);
     return Promise.resolve();
   }
@@ -484,7 +497,7 @@ describe("submitCodeChange dedupe", () => {
       pins: [{ gadgetId: 1, baseCommit: head }],
       change: editChange(1, { "a.txt": "xone\n" }, { "a.txt": "zxone\n" }),
     });
-    impl.discardChatDraftChanges(1);
+    await impl.discardChatDraftChanges(1);
     expect(await submit(impl, 1, submission)).toEqual(ack);
   }));
 
@@ -533,6 +546,84 @@ describe("submitCodeChange dedupe", () => {
 });
 
 describe("mergeChanges", () => {
+  it("recovers an accepted fork before reopening the chat", () => withImpl(async impl => {
+    const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    await submit(impl, 1, {
+      generation: 0,
+      revision: 0,
+      clientId: "cli",
+      seq: 1,
+      pins: [{ gadgetId: 1, baseCommit: c1 }],
+      change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "accepted\n" }),
+    });
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    repository.failNextAcceptAfterPromotion = true;
+
+    await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+      .rejects.toThrow("accept response lost");
+    expect(impl.storage.gadgets.get(1)!.commitId).toBe(c1);
+    await expect(submit(impl, 1, {
+      generation: 0,
+      revision: 1,
+      clientId: "cli",
+      seq: 2,
+      change: editChange(1, { "a.txt": "accepted\n" }, { "a.txt": "too late\n" }),
+    })).rejects.toThrow(/being accepted/);
+
+    await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+      .resolves.toEqual({ outcome: "merged" });
+    const head = impl.storage.gadgets.get(1)!.commitId!;
+    expect(await impl.readCommitFiles(1, head)).toEqual(new Map([["a.txt", "accepted\n"]]));
+    expect(impl.storage.chatArtifactAccepts.get(1)).toBeUndefined();
+    expect(repository.accepted).toHaveLength(2);
+    expect(repository.completed).toEqual([{ chatId: "1", epoch: 0, head }]);
+  }));
+
+  it("retries fork cleanup without recording a second merge", () => withImpl(async impl => {
+    const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    await submit(impl, 1, {
+      generation: 0,
+      revision: 0,
+      clientId: "cli",
+      seq: 1,
+      pins: [{ gadgetId: 1, baseCommit: c1 }],
+      change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "accepted\n" }),
+    });
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    repository.failNextCompletion = true;
+
+    await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+      .rejects.toThrow("fork cleanup failed");
+    const acceptedHead = impl.storage.gadgets.get(1)!.commitId!;
+    expect(chatMessages(impl, 1).filter(message => message.type === "merge")).toHaveLength(1);
+    expect(impl.storage.chatArtifactAccepts.get(1)).toMatchObject({
+      state: "finalized",
+      acceptedHead,
+    });
+    await expect(submit(impl, 1, {
+      generation: 1,
+      revision: 0,
+      clientId: "cli",
+      seq: 2,
+      pins: [{ gadgetId: 1, baseCommit: acceptedHead }],
+      change: editChange(1, { "a.txt": "accepted\n" }, { "a.txt": "too late\n" }),
+    })).rejects.toThrow(/being accepted/);
+
+    await expect(impl.mergeChanges(1, USER_META, "user-do-id"))
+      .resolves.toEqual({ outcome: "merged" });
+    expect(chatMessages(impl, 1).filter(message => message.type === "merge")).toHaveLength(1);
+    expect(repository.accepted).toHaveLength(1);
+    expect(repository.completionAttempts).toEqual([
+      { chatId: "1", epoch: 0, head: acceptedHead },
+      { chatId: "1", epoch: 0, head: acceptedHead },
+    ]);
+    expect(impl.storage.chatArtifactAccepts.get(1)).toBeUndefined();
+  }));
+
   it("commits, fast-forwards, and closes the epoch content-preservingly",
       () => withImpl(async impl => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
@@ -845,7 +936,7 @@ describe("straggler bridge", () => {
       pins: [{ gadgetId: 1, baseCommit: c1 }],
       change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "one\nedited\n" }),
     });
-    impl.discardChatDraftChanges(1);
+    await impl.discardChatDraftChanges(1);
     expect(impl.storage.chatMeta.get(1)!.codeBase!.prior).toBeUndefined();
 
     await expect(submit(impl, 1, {
@@ -856,6 +947,25 @@ describe("straggler bridge", () => {
 });
 
 describe("revert and draft discard", () => {
+  it("discards the current fork before deleting chat state", () => withImpl(async impl => {
+    const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    await repository.stageGadgetFiles(
+      "1",
+      0,
+      { id: USER.id, name: USER.name },
+      "staged before deletion",
+      new Map([[1, new Map([["a.txt", "changed\n"]])]]),
+    );
+
+    await impl.prepareChatDeletion(1);
+
+    expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
+    expect(impl.storage.chatMeta.get(1)).toBeDefined();
+  }));
+
   it("rolls back reverted pins, erases rows, and bumps the generation destructively",
       () => withImpl(async impl => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
@@ -909,7 +1019,7 @@ describe("revert and draft discard", () => {
       change: editChange(2, { "b.txt": "bee\n" }, { "b.txt": "ybee\n" }),
     });
 
-    impl.discardChatDraftChanges(1);
+    await impl.discardChatDraftChanges(1);
 
     let codeBase = impl.storage.chatMeta.get(1)!.codeBase!;
     expect(codeBase.pins.map((pin: { gadgetId: number }) => pin.gadgetId)).toEqual([1]);
@@ -1084,6 +1194,34 @@ describe("updateChatFromMainline", () => {
     // The still-proposed mainline-merge batch cannot be reverted: it advanced the pin.
     await expect(impl.revertChanges(1, mainlineBatch.sequence, USER))
         .rejects.toThrow(/update from mainline/);
+  }));
+
+  it("discards a staged fork before recording an update from mainline",
+      () => withImpl(async impl => {
+    const c1 = await commitFiles(impl, { "a.txt": "one\n" });
+    addGadget(impl, 1, "APP", c1);
+    addChat(impl, 1);
+    await submit(impl, 1, {
+      generation: 0,
+      revision: 0,
+      clientId: "cli",
+      seq: 1,
+      pins: [{ gadgetId: 1, baseCommit: c1 }],
+      change: editChange(1, { "a.txt": "one\n" }, { "a.txt": "chat\n" }),
+    });
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    await repository.stageGadgetFiles(
+      "1",
+      0,
+      { id: USER.id, name: USER.name },
+      "staged before mainline moved",
+      new Map([[1, new Map([["a.txt", "chat\n"]])]]),
+    );
+    const c2 = await commitFiles(impl, { "a.txt": "mainline\n" }, [c1]);
+    setHead(impl, 1, c2);
+
+    await impl.updateChatFromMainline(1, USER);
+    expect(repository.discarded).toEqual([{ chatId: "1", epoch: 0 }]);
   }));
 
   it("records the advancement even when the chat's content already matched mainline",

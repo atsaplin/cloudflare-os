@@ -737,6 +737,26 @@ type ChatChangeBoundaryRecord = {
   boundaries: {gadgetId: WorkpieceId, commitId: string | null}[];
 };
 
+type ChatArtifactAcceptBase = {
+  chatId: number;
+  epoch: number;
+  generation: number;
+  revision: number;
+  sequenceToken: number;
+  mergeThrough: number;
+  isFirstChange: boolean;
+  author: AiChatAuthorInfo;
+  clientUserId: string;
+  gadgets: {gadgetId: WorkpieceId, baseHead?: string}[];
+};
+
+type ChatArtifactAcceptRecord = ChatArtifactAcceptBase & (
+  | {state: "accepting"}
+  | {state: "finalized", acceptedHead: string}
+);
+
+type ChatArtifactAcceptIntent = ChatArtifactAcceptBase & {state: "accepting"};
+
 /** A user opt-in to auto-approve actions carrying a given `actionKind` on a given gatekeeper */
 export type AutoApproveTagRecord = {
   gatekeeperId: WorkpieceId;
@@ -1208,6 +1228,10 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // Each chat's most recent content-preserving generation boundary, for the straggler
       // bridge (see ChatChangeBoundaryRecord). At most one per chat.
       chatChangeBoundaries: collection<ChatChangeBoundaryRecord>()({
+        primaryKey: "chatId"
+      }),
+
+      chatArtifactAccepts: collection<ChatArtifactAcceptRecord>()({
         primaryKey: "chatId"
       }),
 
@@ -3046,6 +3070,9 @@ class OverseerImpl implements AgentHooks {
                          author: AiChatAuthorInfo, userId: string)
       : Promise<{generation: number, revision: number}> {
     this.getChatMetaOrThrow(chatId);  // fail fast
+    if (this.storage.chatArtifactAccepts.get(chatId) !== undefined) {
+      throw new Error("Chat changes are being accepted; please retry.");
+    }
     this.#validateSubmissionShape(submission);
     let digest = await submissionDigest(submission);
 
@@ -3423,6 +3450,18 @@ class OverseerImpl implements AgentHooks {
       throw new Error("The chat changed while merging from mainline; please retry.");
     }
 
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBase.epoch ?? 0,
+    );
+    freshMeta = this.assertChatNotActive(chatId);
+    freshCodeBase = this.chatCodeBase(freshMeta);
+    if (this.nextChatSequencePeek(chatId) !== sequenceToken ||
+        freshCodeBase.generation !== generationToken ||
+        freshCodeBase.revision !== revisionToken) {
+      throw new Error("The chat changed while resetting its staged workspace; please retry.");
+    }
+
     // Persist the advanced pins before recording the row and message: addChatMessages re-reads
     // and re-writes the chat meta, so it must see this state. The advancement is applied to the
     // freshly-read meta's own code base (its pins array is authoritative); a pin we merged is
@@ -3449,11 +3488,162 @@ class OverseerImpl implements AgentHooks {
     return {conflictPaths};
   }
 
+  async #finishArtifactAccept(
+      intent: ChatArtifactAcceptIntent, acceptedHead: string,
+      quickModel: AiModelConfig | undefined): Promise<MergeChangesResult> {
+    const {chatId} = intent;
+    const meta = this.getChatMetaOrThrow(chatId);
+    if (meta.activeAgent || this.isPreparingChatMessage(chatId) ||
+        this.nextChatSequencePeek(chatId) !== intent.sequenceToken) {
+      throw new Error("Chat state changed during its Artifacts acceptance.");
+    }
+    const codeBase = this.chatCodeBase(meta);
+    if (codeBase.generation !== intent.generation || codeBase.revision !== intent.revision) {
+      throw new Error("Chat code changed during its Artifacts acceptance.");
+    }
+    for (const {gadgetId, baseHead} of intent.gadgets) {
+      const gadget = this.storage.gadgets.get(gadgetId);
+      if (!gadget || gadget.commitId !== baseHead) {
+        throw new Error("Workspace code changed during its Artifacts acceptance.");
+      }
+    }
+
+    const messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
+    const statuses = chatChangeStatuses(messages);
+    const revertedStamp = (pending: {sequence?: number} | undefined) =>
+      pending?.sequence !== undefined && statuses.get(pending.sequence) === "reverted";
+
+    for (const gadget of this.listPendingGadgets(chatId)) {
+      if (gadget.pending!.sequence !== undefined &&
+          gadget.pending!.sequence <= intent.mergeThrough && !revertedStamp(gadget.pending)) {
+        delete gadget.pending;
+        this.storage.gadgets.put(gadget);
+      }
+    }
+    for (const gadget of this.storage.gadgets.list()) {
+      let promoted = false;
+      for (const edge of Object.values(gadget.bindings)) {
+        if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
+            edge.pending.sequence <= intent.mergeThrough && !revertedStamp(edge.pending)) {
+          delete edge.pending;
+          promoted = true;
+        }
+      }
+      if (promoted) this.storage.gadgets.put(gadget);
+    }
+
+    const commits = intent.gadgets.map(({gadgetId}) => ({gadgetId, commitId: acceptedHead}));
+    for (const {gadgetId, commitId} of commits) {
+      const record = this.storage.gadgets.get(gadgetId);
+      if (!record) throw new Error("Accepted gadget disappeared.");
+      record.commitId = commitId;
+      this.storage.gadgets.put(record);
+    }
+
+    this.bumpVersion();
+    const timestamp = this.getChatTimestamp();
+    const mergeSequence = this.nextChatSequence(chatId);
+    this.storage.chats.put({
+      chatId,
+      sequence: mergeSequence,
+      timestamp,
+      author: intent.author,
+      type: "merge",
+      mergeThrough: intent.mergeThrough,
+      commits,
+      epochBoundary: true,
+    });
+
+    const boundaries: ChatChangeBoundaryRecord["boundaries"] =
+      commits.map(({gadgetId, commitId}) => ({gadgetId, commitId}));
+    const committedIds = new Set(commits.map(commit => commit.gadgetId));
+    const discontinuousGadgets: WorkpieceId[] = [];
+    for (const pin of codeBase.pins) {
+      if (committedIds.has(pin.gadgetId)) continue;
+      const head = this.storage.gadgets.get(pin.gadgetId)?.commitId;
+      if (head !== undefined && head === pin.mergedCommit) {
+        boundaries.push({gadgetId: pin.gadgetId, commitId: head});
+      } else {
+        boundaries.push({gadgetId: pin.gadgetId, commitId: null});
+        discontinuousGadgets.push(pin.gadgetId);
+      }
+    }
+
+    this.#retireChatChanges(this.listLiveChatChanges(chatId, intent.generation));
+    this.#pruneRetiredChatChanges(chatId);
+    this.storage.chatChangeBoundaries.put({
+      chatId,
+      generation: intent.generation,
+      finalRevision: intent.revision,
+      boundaries,
+    });
+    this.#chatContentCache.delete(chatId);
+    meta.codeBase = {
+      pins: [],
+      generation: intent.generation + 1,
+      revision: 0,
+      epoch: mergeSequence,
+      prior: {
+        generation: intent.generation,
+        finalRevision: intent.revision,
+        discontinuousGadgets,
+      },
+    };
+    meta.lastActive = timestamp;
+    this.storage.chatMeta.put(meta);
+    this.recomputeHasProposedChanges(chatId, meta);
+
+    this.storage.chatArtifactAccepts.put({
+      ...intent,
+      state: "finalized",
+      acceptedHead,
+    });
+
+    if (intent.isFirstChange && commits.length > 0 && quickModel) {
+      this.generateGadgetTitle(chatId, quickModel, intent.author);
+    }
+    this.recordGadgetAnalytics({
+      event_name: "gadget_interaction",
+      user_id: intent.clientUserId,
+      chat_id: chatId,
+      interaction_type: "code_merged",
+    });
+    await this.workspaceCodeRepository.completeAcceptedChatFork(
+      String(chatId),
+      intent.epoch,
+      acceptedHead,
+    );
+    this.storage.chatArtifactAccepts.delete(chatId);
+    return {outcome: "merged"};
+  }
+
 
   // The body of Overseer.mergeChanges(), running under the chat's operation lock (callers
   // hold withChatLock). `clientUserId` feeds analytics only.
   async mergeChanges(chatId: number, userMeta: UserChatContext, clientUserId: string)
                      : Promise<MergeChangesResult> {
+    const pendingAccept = this.storage.chatArtifactAccepts.get(chatId);
+    if (pendingAccept !== undefined) {
+      if (pendingAccept.state === "finalized") {
+        await this.workspaceCodeRepository.completeAcceptedChatFork(
+          String(chatId),
+          pendingAccept.epoch,
+          pendingAccept.acceptedHead,
+        );
+        this.storage.chatArtifactAccepts.delete(chatId);
+        return {outcome: "merged"};
+      }
+      const accepted = await this.workspaceCodeRepository.acceptChatFork(
+        String(chatId),
+        pendingAccept.epoch,
+      );
+      if (accepted.status === "stale") {
+        await this.workspaceCodeRepository.discardChatFork(String(chatId), pendingAccept.epoch);
+        this.storage.chatArtifactAccepts.delete(chatId);
+        return {outcome: "stale"};
+      }
+      return this.#finishArtifactAccept(pendingAccept, accepted.head, userMeta.quickModel);
+    }
     let meta = this.assertChatNotActive(chatId);
 
     // Always merge *everything* the chat proposes: sweep live change rows into a "changes" message
@@ -3602,143 +3792,31 @@ class OverseerImpl implements AgentHooks {
       throw new Error("The chat's code is being actively edited; please retry.");
     }
 
+    const intent: ChatArtifactAcceptIntent = {
+      chatId,
+      epoch: forkEpoch,
+      generation: generationToken,
+      revision: revisionToken,
+      sequenceToken,
+      mergeThrough,
+      isFirstChange,
+      author: userMeta.profile,
+      clientUserId,
+      state: "accepting",
+      gadgets: toCommit.map(({record, baseHead}) => ({
+        gadgetId: record.id,
+        ...(baseHead === undefined ? {} : {baseHead}),
+      })),
+    };
+    this.storage.chatArtifactAccepts.put(intent);
+
     const accepted = await this.workspaceCodeRepository.acceptChatFork(forkChatId, forkEpoch);
     if (accepted.status === "stale") {
       await this.workspaceCodeRepository.discardChatFork(forkChatId, forkEpoch);
+      this.storage.chatArtifactAccepts.delete(chatId);
       return {outcome: "stale"};
     }
-    let commits: {gadgetId: WorkpieceId, commitId: string}[] = toCommit.map(({ record }) => ({
-      gadgetId: record.id,
-      commitId: accepted.head,
-    }));
-
-    // Promote provisional gadgets whose creation is covered by this merge: accepting the chat's
-    // changes through `mergeThrough` makes them permanent workspace members. Each covered
-    // creation sits on an unmerged, unreverted "changes" message at `pending.sequence` (a
-    // merged one's gadget is already promoted, and a reverted one's is excluded here exactly as
-    // the toCommit loop excluded it), and is in `commits`, so every promoted gadget gets a head
-    // in the fast-forward step below -- possibly an empty tree.
-    for (let gadget of this.listPendingGadgets(chatId)) {
-      if (gadget.pending!.sequence !== undefined && gadget.pending!.sequence <= mergeThrough &&
-          !revertedStamp(gadget.pending)) {
-        delete gadget.pending;
-        this.storage.gadgets.put(gadget);
-      }
-    }
-
-    // Likewise promote provisional binding edges covered by this merge; this is also the moment
-    // an edge becomes visible to mainline loads and the derived workspace default binding list.
-    // (Reverted additions only survive on a reverted creation's record -- the revert deletes
-    // covered edges synchronously otherwise -- but exclude them the same way for coherence.)
-    for (let gadget of this.storage.gadgets.list()) {
-      let promoted = false;
-      for (let edge of Object.values(gadget.bindings)) {
-        if (edge.pending?.chatId === chatId && edge.pending.sequence !== undefined &&
-            edge.pending.sequence <= mergeThrough && !revertedStamp(edge.pending)) {
-          delete edge.pending;
-          promoted = true;
-        }
-      }
-      if (promoted) {
-        this.storage.gadgets.put(gadget);
-      }
-    }
-
-    // Fast-forward each committed gadget's head.
-    for (let {gadgetId, commitId} of commits) {
-      let record = this.storage.gadgets.get(gadgetId)!;
-      record.commitId = commitId;
-      this.storage.gadgets.put(record);
-    }
-
-    // Bump the loader-cache counter so cached workers reload with the new heads (and promoted
-    // records) visible.
-    this.bumpVersion();
-    let timestamp = this.getChatTimestamp();
-
-    let mergeSequence = this.nextChatSequence(chatId);
-    this.storage.chats.put({
-      chatId,
-      sequence: mergeSequence,
-      timestamp,
-      author: userMeta.profile,
-
-      type: "merge",
-      mergeThrough,
-      commits,
-      // The merge closes the chat's epoch (see the reset below); content reconstruction
-      // restarts here. Historical (pre-git) merges lack this, which is how replay tells them
-      // apart.
-      epochBoundary: true,
-    });
-
-    // The boundary map for the straggler bridge: per gadget, the commit whose tree equals the
-    // chat's content at this reset. A committed gadget's is the commit just written; an
-    // uncommitted pin had no net change relative to its mergedCommit (that's why it wasn't
-    // committed), so its content equals head exactly when mergedCommit == head -- otherwise the
-    // reset visibly changes the gadget's content (the pin evaporates and the chat snaps to a
-    // head it never merged), making it bridge-ineligible and reported in
-    // `prior.discontinuousGadgets` so clients rebuild it from head.
-    let boundaries: ChatChangeBoundaryRecord["boundaries"] =
-        commits.map(({gadgetId, commitId}) => ({gadgetId, commitId}));
-    let committedIds = new Set(commits.map(commit => commit.gadgetId));
-    let discontinuousGadgets: WorkpieceId[] = [];
-    for (let pin of freshCodeBase.pins) {
-      if (committedIds.has(pin.gadgetId)) continue;
-      let head = this.storage.gadgets.get(pin.gadgetId)?.commitId;
-      if (head !== undefined && head === pin.mergedCommit) {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: head});
-      } else {
-        boundaries.push({gadgetId: pin.gadgetId, commitId: null});
-        discontinuousGadgets.push(pin.gadgetId);
-      }
-    }
-
-    // Close the epoch: everything the chat proposed now lives in commits, so the chat's code
-    // base resets to empty -- every pin evaporates, the change stream restarts at revision 0 under
-    // a new generation, and subsequent edits re-pin lazily against the new heads. The bump is
-    // content-preserving: the closed generation's rows are retired (not deleted) as the
-    // transform window, the boundary record above opens the straggler bridge, and `prior` tells
-    // clients how to hand off (see ChatCodeBase.prior). The reset lands on the freshly-read
-    // meta so concurrent changes to other fields (e.g. a title rename during the awaits)
-    // survive.
-    this.#retireChatChanges(this.listLiveChatChanges(chatId, generationToken));
-    this.#pruneRetiredChatChanges(chatId);
-    this.storage.chatChangeBoundaries.put(
-        {chatId, generation: generationToken, finalRevision: revisionToken, boundaries});
-    this.#chatContentCache.delete(chatId);
-    freshMeta.codeBase = {
-      pins: [],
-      generation: generationToken + 1,
-      revision: 0,
-      epoch: mergeSequence,
-      prior: {generation: generationToken, finalRevision: revisionToken, discontinuousGadgets},
-    };
-    freshMeta.lastActive = timestamp;
-    this.storage.chatMeta.put(freshMeta);
-    this.recomputeHasProposedChanges(chatId, freshMeta);
-
-    // Maybe generate gadget title if this was the first accepted code. (A merge covering only
-    // binding additions to existing gadgets doesn't count: it creates no commits, so the first
-    // merge with code -- including an accepted creation's empty first commit -- still sees
-    // isFirstChange and generates the title then.)
-    if (isFirstChange && commits.length > 0 && userMeta.quickModel) {
-      this.generateGadgetTitle(chatId, userMeta.quickModel, userMeta.profile);
-    }
-    this.recordGadgetAnalytics({
-      event_name: "gadget_interaction",
-      user_id: clientUserId,
-      chat_id: chatId,
-      interaction_type: "code_merged",
-    });
-
-    await this.workspaceCodeRepository.completeAcceptedChatFork(
-      forkChatId,
-      forkEpoch,
-      accepted.head,
-    );
-
-    return {outcome: "merged"};
+    return this.#finishArtifactAccept(intent, accepted.head, userMeta.quickModel);
   }
 
   // The body of Overseer.revertChanges(), running under the chat's operation lock (callers
@@ -3804,7 +3882,7 @@ class OverseerImpl implements AgentHooks {
       // recorded. Outstanding drafts are still strictly newer than every message -- inside the
       // reverted range by definition -- so they are discarded exactly as a draft discard would
       // (unlogged pins die with them, generation bump); with no drafts this is a full no-op.
-      this.discardChatDraftChanges(chatId);
+      await this.discardChatDraftChanges(chatId);
       return;
     }
 
@@ -3883,16 +3961,19 @@ class OverseerImpl implements AgentHooks {
     // reconcilePendingGadgets run reaps. This one does exactly that (the records' creations are
     // now marked reverted), keeping the deletion path single.
     await this.reconcilePendingGadgets(chatId);
+    const codeBaseAfterRevert = this.chatCodeBase(this.getChatMetaOrThrow(chatId));
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBaseAfterRevert.epoch ?? 0,
+    );
   }
 
   // The body of Overseer.discardChatDraftChanges().
-  discardChatDraftChanges(chatId: number): void {
+  async discardChatDraftChanges(chatId: number): Promise<void> {
     let meta = this.assertChatNotActive(chatId);
     let codeBase = this.chatCodeBase(meta);
     let rows = this.listLiveChatChanges(chatId, codeBase.generation);
-    if (rows.length === 0) {
-      return;
-    }
+    const forkEpoch = codeBase.epoch ?? 0;
 
     // The second row-discarding path (revertChanges is the other), with the same treatment:
     // meta pins those rows established but never declared in a materialized message die with
@@ -3903,18 +3984,33 @@ class OverseerImpl implements AgentHooks {
     // erased base. (The per-client dedupe records survive -- see submitCodeChange: a straggling
     // retry of an erased row is still acknowledged with its recorded landing spot instead of
     // being applied twice.)
-    let declared = this.declaredPinGadgets(chatId);
-    codeBase.pins = codeBase.pins.filter(pin => declared.has(pin.gadgetId));
-    this.deleteAllChatChanges(chatId);
-    codeBase.generation += 1;
-    codeBase.revision = 0;
-    delete codeBase.prior;
-    meta.codeBase = codeBase;
+    if (rows.length > 0) {
+      let declared = this.declaredPinGadgets(chatId);
+      codeBase.pins = codeBase.pins.filter(pin => declared.has(pin.gadgetId));
+      this.deleteAllChatChanges(chatId);
+      codeBase.generation += 1;
+      codeBase.revision = 0;
+      delete codeBase.prior;
+      meta.codeBase = codeBase;
 
-    meta.lastActive = this.getChatTimestamp();
-    this.storage.chatMeta.put(meta);
-    this.recomputeHasProposedChanges(chatId, meta);
-    this.proposedChangesChanged(chatId);
+      meta.lastActive = this.getChatTimestamp();
+      this.storage.chatMeta.put(meta);
+      this.recomputeHasProposedChanges(chatId, meta);
+      this.proposedChangesChanged(chatId);
+    }
+    await this.workspaceCodeRepository.discardChatFork(String(chatId), forkEpoch);
+  }
+
+  async prepareChatDeletion(chatId: number): Promise<void> {
+    const meta = this.getChatMetaOrThrow(chatId);
+    if (this.storage.chatArtifactAccepts.get(chatId) !== undefined) {
+      throw new Error("Chat changes are being accepted; please retry.");
+    }
+    const codeBase = this.chatCodeBase(meta);
+    await this.workspaceCodeRepository.discardChatFork(
+      String(chatId),
+      codeBase.epoch ?? 0,
+    );
   }
 
 
@@ -5078,6 +5174,9 @@ class OverseerImpl implements AgentHooks {
 
   assertChatNotActive(chatId: number, allowMessagePreparation = false): AiChatMetadata {
     let meta = this.getChatMetaOrThrow(chatId);
+    if (this.storage.chatArtifactAccepts.get(chatId) !== undefined) {
+      throw new Error("Chat changes are being accepted; please retry.");
+    }
     if (meta.activeAgent || !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
       throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
     }
@@ -10181,6 +10280,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async deleteChat(chatId: number): Promise<void> {
+    await this.impl.withChatLock(chatId, () => this.#deleteChat(chatId));
+  }
+
+  async #deleteChat(chatId: number): Promise<void> {
+    await this.impl.prepareChatDeletion(chatId);
     let startedAt = Date.now();
     let response = this.impl.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
     if (response?.status === "waiting") {
@@ -10216,6 +10320,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // The chat's change stream: rows (retired included), the straggler-bridge boundary, and the
     // per-client dedupe records (which live exactly as long as the chat -- see submitCodeChange).
     this.impl.deleteAllChatChanges(chatId);
+    this.impl.storage.chatArtifactAccepts.delete(chatId);
     for (let record of Array.from(this.impl.storage.chatChangeClients.list(
         {prefix: `${keyString(chatId)}.`}))) {
       this.impl.storage.chatChangeClients.delete(
