@@ -137,6 +137,8 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
   readonly initialized: string[] = [];
   readonly promotions: Array<{ canonical: string; fork: string; expectedHead: string }> = [];
   readonly destroyed: string[] = [];
+  readonly prepared: string[] = [];
+  readonly checkpoints: string[] = [];
   promotionError: Error | undefined;
   beforePromotion: (() => void) | undefined;
 
@@ -182,6 +184,16 @@ class FakeGitRuntime implements WorkspaceArtifactGitRuntime {
   async destroy(sandboxId: string): Promise<void> {
     this.destroyed.push(sandboxId);
   }
+
+  prepareChat(request: { sandboxId: string }): Promise<void> {
+    this.prepared.push(request.sandboxId);
+    return Promise.resolve();
+  }
+
+  checkpointChat(request: { sandboxId: string }): Promise<string> {
+    this.checkpoints.push(request.sandboxId);
+    return Promise.resolve(CHECKPOINT_HEAD);
+  }
 }
 
 function fixture(): {
@@ -196,7 +208,11 @@ function fixture(): {
 
 function withLifecycle<T>(
   name: string,
-  run: (lifecycle: WorkspaceArtifactLifecycle, fixtures: ReturnType<typeof fixture>) => Promise<T>,
+  run: (
+    lifecycle: WorkspaceArtifactLifecycle,
+    fixtures: ReturnType<typeof fixture>,
+    state: DurableObjectState,
+  ) => Promise<T>,
 ): Promise<T> {
   const fixtures = fixture();
   return runInDurableObject(
@@ -207,7 +223,7 @@ function withLifecycle<T>(
       artifacts: fixtures.artifacts,
       reader: fixtures.reader,
       gitRuntime: fixtures.runtime,
-    }), fixtures),
+    }), fixtures, state),
   );
 }
 
@@ -237,6 +253,24 @@ describe("WorkspaceArtifactLifecycle", () => {
       expect(first.repositoryName).toMatch(/^workspace-[0-9a-f]{24}-chat-[0-9a-f]{24}-e3$/);
       expect(fixtures.artifacts.forks).toBe(1);
       expect(JSON.stringify(first)).not.toContain("secret");
+    });
+  });
+
+  it("prepares and checkpoints the chat working copy with ephemeral credentials", async () => {
+    await withLifecycle("working-copy", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.prepareChatWorkingCopy("chat-one", 1);
+
+      expect(fixtures.runtime.prepared).toEqual([fork.sandboxId]);
+      await expect(lifecycle.checkpointChatWorkingCopy("chat-one", 1, {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Update notes")).resolves.toEqual({
+        ...fork,
+        latestHead: CHECKPOINT_HEAD,
+      });
+      expect(fixtures.runtime.checkpoints).toEqual([fork.sandboxId]);
+      expect((await fixtures.artifacts.get(fork.repositoryName)).tokens.size).toBe(0);
     });
   });
 
@@ -301,6 +335,27 @@ describe("WorkspaceArtifactLifecycle", () => {
         baselineHead: fork.baselineHead,
         latestHead: CHECKPOINT_HEAD,
       });
+    });
+  });
+
+  it("finishes an accepted promotion after a Durable Object reset", async () => {
+    await withLifecycle("accept-recovery", async (lifecycle, fixtures, state) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      fixtures.reader.heads.set(canonical.repositoryName, CHECKPOINT_HEAD);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+      state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks
+        SET state = 'accepting', latest_head = ?
+        WHERE chat_id = ? AND epoch = ?
+      `, CHECKPOINT_HEAD, "chat-one", 1);
+
+      await expect(lifecycle.acceptChatFork("chat-one", 1)).resolves.toEqual({
+        status: "merged",
+        head: CHECKPOINT_HEAD,
+      });
+      expect(fixtures.runtime.promotions).toEqual([]);
+      expect(fixtures.artifacts.deleted).toContain(fork.repositoryName);
     });
   });
 
@@ -386,7 +441,21 @@ describe("CloudflareWorkspaceArtifactReader", () => {
 class FakeSandbox implements WorkspaceArtifactSandbox {
   readonly commands: string[][] = [];
   readonly files = new Map<string, string>();
+  readonly gitAuth: Array<Record<string, { token: string; type: "bearer" }>> = [];
   destroyed = false;
+  repositoryExists = false;
+  status = "";
+  head = INITIAL_HEAD;
+
+  async registerGitAuthInterceptor(params: {
+    hosts: Record<string, { token: string; type: "bearer" }>;
+  }): Promise<void> {
+    this.gitAuth.push(params.hosts);
+  }
+
+  exists(_path: string): Promise<{ exists: boolean }> {
+    return Promise.resolve({ exists: this.repositoryExists });
+  }
 
   async exec(command: string[]): Promise<{
     output(): Promise<{
@@ -398,7 +467,10 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
     }>;
   }> {
     this.commands.push(command);
-    const stdout = command.includes("rev-parse") ? `${CHECKPOINT_HEAD}\n` : "";
+    if (command.includes("commit")) this.head = CHECKPOINT_HEAD;
+    const stdout = command.includes("rev-parse")
+      ? `${this.head}\n`
+      : command.includes("status") ? this.status : "";
     return {
       output: () => Promise.resolve({
         stdout,
@@ -420,14 +492,16 @@ class FakeSandbox implements WorkspaceArtifactSandbox {
 }
 
 describe("SandboxWorkspaceArtifactGitRuntime", () => {
-  it("initializes an empty repository without putting its token in the remote", async () => {
+  it("initializes an empty repository through Sandbox's Git auth interceptor", async () => {
     const sandbox = new FakeSandbox();
+    sandbox.head = CHECKPOINT_HEAD;
     const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
 
     await expect(runtime.initialize({
       repositoryName: "workspace-123",
       remote: "https://artifacts.example/workspace-123.git",
       token: "one-use-secret",
+      defaultBranch: "main",
       index: new TextEncoder().encode("{\"version\":1}\n"),
     })).resolves.toBe(CHECKPOINT_HEAD);
 
@@ -435,14 +509,14 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       .toBe("{\"version\":1}\n");
     expect(sandbox.commands[0]).toEqual([
       "git",
-      "-c",
-      "http.extraHeader=Authorization: Bearer one-use-secret",
       "clone",
       "https://artifacts.example/workspace-123.git",
       "/workspace/repo",
     ]);
-    expect(sandbox.commands.find(command => command.includes("push")))
-      .toContain("http.extraHeader=Authorization: Bearer one-use-secret");
+    expect(sandbox.gitAuth).toEqual([{
+      "artifacts.example": { token: "one-use-secret", type: "bearer" },
+    }]);
+    expect(sandbox.commands.flat()).not.toContain("one-use-secret");
     expect(sandbox.commands.flat().filter(argument => argument.startsWith("https://")))
       .toEqual([
         "https://artifacts.example/workspace-123.git",
@@ -453,6 +527,7 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
 
   it("promotes from a clean trusted sandbox with separate fork and canonical credentials", async () => {
     const sandbox = new FakeSandbox();
+    sandbox.head = CHECKPOINT_HEAD;
     const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
 
     await expect(runtime.promote({
@@ -463,13 +538,62 @@ describe("SandboxWorkspaceArtifactGitRuntime", () => {
       forkRemote: "https://artifacts.example/fork.git",
       forkToken: "fork-secret",
       expectedCanonicalHead: INITIAL_HEAD,
+      canonicalDefaultBranch: "main",
     })).resolves.toBe(CHECKPOINT_HEAD);
 
-    expect(sandbox.commands[0]).toContain("http.extraHeader=Authorization: Bearer fork-secret");
+    expect(sandbox.gitAuth).toEqual([
+      { "artifacts.example": { token: "fork-secret", type: "bearer" } },
+      { "artifacts.example": { token: "canonical-secret", type: "bearer" } },
+    ]);
+    expect(sandbox.commands.flat()).not.toContain("fork-secret");
+    expect(sandbox.commands.flat()).not.toContain("canonical-secret");
     expect(sandbox.commands.find(command => command.includes("--is-ancestor")))
       .toContain(INITIAL_HEAD);
+    expect(sandbox.commands.find(command => command.includes("set-url")))
+      .toContain("https://artifacts.example/canonical.git");
     expect(sandbox.commands.find(command => command.includes("push")))
-      .toContain("http.extraHeader=Authorization: Bearer canonical-secret");
+      .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
     expect(sandbox.destroyed).toBe(true);
+  });
+
+  it("lazily clones a chat fork and removes its Git credential", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.head = CHECKPOINT_HEAD;
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await runtime.prepareChat({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      expectedHead: CHECKPOINT_HEAD,
+    });
+
+    expect(sandbox.commands[0]).toEqual([
+      "git", "clone", "https://artifacts.example/fork.git", "/workspace/repo",
+    ]);
+    expect(sandbox.gitAuth.at(-1)).toEqual({});
+    expect(sandbox.destroyed).toBe(false);
+  });
+
+  it("checkpoints chat changes with an expected-head push and removes its credential", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.repositoryExists = true;
+    sandbox.status = " M notes.txt\n";
+    const runtime = new SandboxWorkspaceArtifactGitRuntime(() => sandbox);
+
+    await expect(runtime.checkpointChat({
+      sandboxId: "chat-sandbox",
+      remote: "https://artifacts.example/fork.git",
+      token: "fork-write-secret",
+      defaultBranch: "main",
+      expectedHead: INITIAL_HEAD,
+      actor: { id: "user:aleksey", name: "Aleksey" },
+      message: "Update notes",
+    })).resolves.toBe(CHECKPOINT_HEAD);
+
+    expect(sandbox.commands.find(command => command.includes("push")))
+      .toContain(`--force-with-lease=refs/heads/main:${INITIAL_HEAD}`);
+    expect(sandbox.gitAuth.at(-1)).toEqual({});
+    expect(sandbox.destroyed).toBe(false);
   });
 });

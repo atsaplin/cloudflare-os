@@ -1,3 +1,4 @@
+import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 import {
   WORKSPACE_INDEX_PATH,
   createEmptyWorkspaceIndex,
@@ -152,8 +153,30 @@ export class CloudflareWorkspaceArtifactReader implements WorkspaceArtifactReade
       }
       if (length > maximumBytes) throw new Error("Artifacts file exceeds the read bound.");
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > maximumBytes) throw new Error("Artifacts file exceeds the read bound.");
+    if (response.body === null) return new Uint8Array();
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        length += value.byteLength;
+        if (length > maximumBytes) {
+          await reader.cancel("Artifacts file exceeds the read bound.");
+          throw new Error("Artifacts file exceeds the read bound.");
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
     return bytes;
   }
 }
@@ -164,6 +187,7 @@ export interface WorkspaceArtifactGitRuntime {
     repositoryName: string;
     remote: string;
     token: string;
+    defaultBranch: string;
     index: Uint8Array;
   }): Promise<string>;
   promote(request: {
@@ -174,12 +198,32 @@ export interface WorkspaceArtifactGitRuntime {
     forkRemote: string;
     forkToken: string;
     expectedCanonicalHead: string;
+    canonicalDefaultBranch: string;
+  }): Promise<string>;
+  prepareChat(request: {
+    sandboxId: string;
+    remote: string;
+    token: string;
+    expectedHead: string;
+  }): Promise<void>;
+  checkpointChat(request: {
+    sandboxId: string;
+    remote: string;
+    token: string;
+    defaultBranch: string;
+    expectedHead: string;
+    actor: WorkspaceActor;
+    message: string;
   }): Promise<string>;
   destroy(sandboxId: string): Promise<void>;
 }
 
 /** Minimal Sandbox client used by trusted repository Git operations. */
 export interface WorkspaceArtifactSandbox {
+  registerGitAuthInterceptor(params: {
+    hosts: Record<string, { token: string; type: "bearer" }>;
+  }): Promise<void>;
+  exists(path: string): Promise<{ exists: boolean }>;
   exec(command: string[], options?: {
     cwd?: string;
     env?: Record<string, string>;
@@ -258,6 +302,30 @@ export interface WorkspaceArtifactLifecycleOptions {
   gitRuntime: WorkspaceArtifactGitRuntime;
 }
 
+/** Builds the production lifecycle from the Workshop Worker's native Cloudflare bindings. */
+export function createWorkspaceArtifactLifecycle(
+  state: DurableObjectState,
+  env: Cloudflare.Env,
+  workspaceId: string,
+): WorkspaceArtifactLifecycle {
+  const reader = new CloudflareWorkspaceArtifactReader({
+    artifacts: env.ARTIFACTS,
+    accountId: env.ARTIFACTS_ACCOUNT_ID,
+    namespace: env.ARTIFACTS_NAMESPACE,
+    apiToken: env.ARTIFACTS_API_TOKEN,
+  });
+  const runtime = new SandboxWorkspaceArtifactGitRuntime(
+    sandboxId => getSandbox<Sandbox>(env.Sandbox, sandboxId),
+  );
+  return new WorkspaceArtifactLifecycle({
+    state,
+    workspaceId,
+    artifacts: env.ARTIFACTS,
+    reader,
+    gitRuntime: runtime,
+  });
+}
+
 function isArtifactsError(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
@@ -267,9 +335,21 @@ function requireOid(value: string, label: string): string {
   return value;
 }
 
-function gitAuthorization(token: string): string {
-  if (!token || /[\r\n]/.test(token)) throw new Error("Artifacts Git token is invalid.");
-  return `http.extraHeader=Authorization: Bearer ${token}`;
+function artifactRemoteHost(remote: string): string {
+  const url = new URL(remote);
+  if (url.protocol !== "https:" || !url.hostname || url.username || url.password) {
+    throw new Error("Artifacts Git remote is invalid.");
+  }
+  return url.host;
+}
+
+function requireBranch(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(value) || value.includes("..") ||
+      value.includes("//") || value.includes("@{") || value.endsWith("/") ||
+      value.endsWith(".") || value.endsWith(".lock")) {
+    throw new Error("Artifacts default branch is invalid.");
+  }
+  return value;
 }
 
 function noop(): void {}
@@ -298,13 +378,16 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     repositoryName: string;
     remote: string;
     token: string;
+    defaultBranch: string;
     index: Uint8Array;
   }): Promise<string> {
     const sandbox = this.#sandbox(`workspace-initialize-${request.repositoryName}`);
     const directory = "/workspace/repo";
-    const header = gitAuthorization(request.token);
     try {
-      await this.#run(sandbox, ["git", "-c", header, "clone", request.remote, directory]);
+      await sandbox.registerGitAuthInterceptor({
+        hosts: { [artifactRemoteHost(request.remote)]: { token: request.token, type: "bearer" } },
+      });
+      await this.#run(sandbox, ["git", "clone", request.remote, directory]);
       await this.#run(sandbox, ["mkdir", "-p", `${directory}/.workspace`]);
       await sandbox.writeFile(
         `${directory}/${WORKSPACE_INDEX_PATH}`,
@@ -318,8 +401,7 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
         "commit", "-m", "Initialize workspace",
       ]);
       await this.#run(sandbox, [
-        "git", "-C", directory, "-c", header,
-        "push", request.remote, "HEAD:main",
+        "git", "-C", directory, "push", request.remote, `HEAD:${request.defaultBranch}`,
       ]);
       return requireOid(
         (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
@@ -330,7 +412,7 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     }
   }
 
-  /** Promotes a chat fork through a clean Sandbox without exposing canonical credentials to it. */
+  /** Promotes a chat fork through a clean Sandbox that is never exposed to an agent. */
   async promote(request: {
     canonicalRepositoryName: string;
     canonicalRemote: string;
@@ -339,22 +421,38 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     forkRemote: string;
     forkToken: string;
     expectedCanonicalHead: string;
+    canonicalDefaultBranch: string;
   }): Promise<string> {
     const sandbox = this.#sandbox(
       `workspace-promote-${request.canonicalRepositoryName}-${request.forkRepositoryName}`,
     );
     const directory = "/workspace/repo";
-    const forkHeader = gitAuthorization(request.forkToken);
-    const canonicalHeader = gitAuthorization(request.canonicalToken);
     try {
-      await this.#run(sandbox, ["git", "-c", forkHeader, "clone", request.forkRemote, directory]);
+      await sandbox.registerGitAuthInterceptor({
+        hosts: { [artifactRemoteHost(request.forkRemote)]: {
+          token: request.forkToken,
+          type: "bearer",
+        } },
+      });
+      await this.#run(sandbox, ["git", "clone", request.forkRemote, directory]);
       await this.#run(sandbox, [
         "git", "-C", directory, "merge-base", "--is-ancestor",
         requireOid(request.expectedCanonicalHead, "Expected canonical head"), "HEAD",
       ]);
       await this.#run(sandbox, [
-        "git", "-C", directory, "-c", canonicalHeader,
-        "push", request.canonicalRemote, "HEAD:main",
+        "git", "-C", directory, "remote", "set-url", "origin", request.canonicalRemote,
+      ]);
+      await sandbox.registerGitAuthInterceptor({
+        hosts: { [artifactRemoteHost(request.canonicalRemote)]: {
+          token: request.canonicalToken,
+          type: "bearer",
+        } },
+      });
+      await this.#run(sandbox, [
+        "git", "-C", directory, "push", "origin",
+        `--force-with-lease=refs/heads/${request.canonicalDefaultBranch}:` +
+          requireOid(request.expectedCanonicalHead, "Expected canonical head"),
+        `HEAD:refs/heads/${request.canonicalDefaultBranch}`,
       ]);
       return requireOid(
         (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
@@ -363,6 +461,93 @@ export class SandboxWorkspaceArtifactGitRuntime implements WorkspaceArtifactGitR
     } finally {
       await sandbox.destroy();
     }
+  }
+
+  /** Lazily materializes one chat fork without leaving its Git credential in the Sandbox. */
+  async prepareChat(request: {
+    sandboxId: string;
+    remote: string;
+    token: string;
+    expectedHead: string;
+  }): Promise<void> {
+    const sandbox = this.#sandbox(request.sandboxId);
+    const directory = "/workspace/repo";
+    if (!(await sandbox.exists(`${directory}/.git`)).exists) {
+      try {
+        await sandbox.registerGitAuthInterceptor({
+          hosts: { [artifactRemoteHost(request.remote)]: {
+            token: request.token,
+            type: "bearer",
+          } },
+        });
+        await this.#run(sandbox, ["git", "clone", request.remote, directory]);
+      } finally {
+        await sandbox.registerGitAuthInterceptor({ hosts: {} });
+      }
+    }
+    const head = requireOid(
+      (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
+      "Chat Sandbox head",
+    );
+    if (head !== requireOid(request.expectedHead, "Expected chat fork head")) {
+      throw new Error("Chat Sandbox does not match its Artifacts fork.");
+    }
+  }
+
+  /** Commits and CAS-pushes the chat Sandbox working tree to its private Artifacts fork. */
+  async checkpointChat(request: {
+    sandboxId: string;
+    remote: string;
+    token: string;
+    defaultBranch: string;
+    expectedHead: string;
+    actor: WorkspaceActor;
+    message: string;
+  }): Promise<string> {
+    const sandbox = this.#sandbox(request.sandboxId);
+    const directory = "/workspace/repo";
+    if (!(await sandbox.exists(`${directory}/.git`)).exists) {
+      throw new Error("Chat Sandbox working copy does not exist.");
+    }
+    const expectedHead = requireOid(request.expectedHead, "Expected chat fork head");
+    const currentHead = requireOid(
+      (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
+      "Chat Sandbox head",
+    );
+    if (currentHead !== expectedHead) throw new Error("Chat Sandbox checkpoint is stale.");
+    await this.#run(sandbox, ["git", "-C", directory, "add", "-A"]);
+    const status = await this.#run(sandbox, ["git", "-C", directory, "status", "--porcelain"]);
+    if (!status) return currentHead;
+    const message = request.message.trim();
+    if (!message) throw new Error("Workspace checkpoint message is required.");
+    if (!request.actor.name.trim()) throw new Error("Workspace checkpoint actor is required.");
+    await this.#run(sandbox, [
+      "git", "-C", directory,
+      "-c", `user.name=${request.actor.name}`,
+      "-c", "user.email=workspace@cloudflare-os.invalid",
+      "commit", "-m", message,
+    ]);
+    const branch = requireBranch(request.defaultBranch);
+    await this.#run(sandbox, ["git", "-C", directory, "remote", "set-url", "origin", request.remote]);
+    try {
+      await sandbox.registerGitAuthInterceptor({
+        hosts: { [artifactRemoteHost(request.remote)]: {
+          token: request.token,
+          type: "bearer",
+        } },
+      });
+      await this.#run(sandbox, [
+        "git", "-C", directory, "push", "origin",
+        `--force-with-lease=refs/heads/${branch}:${expectedHead}`,
+        `HEAD:refs/heads/${branch}`,
+      ]);
+    } finally {
+      await sandbox.registerGitAuthInterceptor({ hosts: {} });
+    }
+    return requireOid(
+      (await this.#run(sandbox, ["git", "-C", directory, "rev-parse", "HEAD"])).trim(),
+      "Chat checkpoint head",
+    );
   }
 
   /** Destroys the chat's disposable Sandbox if it exists. */
@@ -547,7 +732,7 @@ export class WorkspaceArtifactLifecycle {
           actorId: actor.id,
           now: new Date().toISOString(),
         });
-        const minted = initialToken === undefined ? await repo.createToken("write", 60) : undefined;
+        const minted = initialToken === undefined ? await repo.createToken("write", 900) : undefined;
         const token = initialToken ?? minted?.plaintext;
         if (token === undefined) throw new Error("Workspace initialization has no Git token.");
         try {
@@ -555,6 +740,7 @@ export class WorkspaceArtifactLifecycle {
             repositoryName,
             remote: repo.remote,
             token,
+            defaultBranch: repo.defaultBranch,
             index: serializeWorkspaceIndex(index),
           }), "Initialized workspace head");
         } finally {
@@ -651,6 +837,69 @@ export class WorkspaceArtifactLifecycle {
     });
   }
 
+  /** Lazily clones one chat fork into its persistent Sandbox working copy. */
+  async prepareChatWorkingCopy(
+    chatId: string,
+    epoch: number,
+  ): Promise<WorkspaceArtifactChatFork> {
+    await this.ensureChatFork(chatId, epoch);
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
+      const repo = await this.#getReadyRepository(row.repository_name);
+      const token = await repo.createToken("write", 900);
+      try {
+        await this.#gitRuntime.prepareChat({
+          sandboxId: row.sandbox_id,
+          remote: repo.remote,
+          token: token.plaintext,
+          expectedHead: row.latest_head,
+        });
+      } finally {
+        await this.#revokeToken(repo, token.id);
+      }
+      return forkFromRow(row);
+    });
+  }
+
+  /** Commits and pushes one chat Sandbox checkpoint to its private fork. */
+  checkpointChatWorkingCopy(
+    chatId: string,
+    epoch: number,
+    actor: WorkspaceActor,
+    message: string,
+  ): Promise<WorkspaceArtifactChatFork> {
+    return this.#withLock(async () => {
+      const row = this.#forkRow(chatId, epoch);
+      if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
+      const repo = await this.#getReadyRepository(row.repository_name);
+      const token = await repo.createToken("write", 900);
+      let head: string;
+      try {
+        head = requireOid(await this.#gitRuntime.checkpointChat({
+          sandboxId: row.sandbox_id,
+          remote: repo.remote,
+          token: token.plaintext,
+          defaultBranch: repo.defaultBranch,
+          expectedHead: row.latest_head,
+          actor,
+          message,
+        }), "Chat checkpoint head");
+      } finally {
+        await this.#revokeToken(repo, token.id);
+      }
+      this.#state.storage.sql.exec(`
+        UPDATE workspace_artifact_forks SET latest_head = ?
+        WHERE chat_id = ? AND epoch = ? AND state = 'open' AND latest_head = ?
+      `, head, chatId, epoch, row.latest_head);
+      const checkpoint = this.#forkRow(chatId, epoch);
+      if (!checkpoint || checkpoint.state !== "open" || checkpoint.latest_head !== head) {
+        throw new Error("Chat checkpoint metadata did not persist.");
+      }
+      return forkFromRow(checkpoint);
+    });
+  }
+
   /** Accepts one chat fork only when canonical main still matches its recorded baseline. */
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
     return this.#withLock(async () => {
@@ -670,7 +919,28 @@ export class WorkspaceArtifactLifecycle {
       const currentHead = await this.#reader.getHead(canonicalRow.repository_name);
       if (currentHead === undefined) throw new Error("Canonical workspace repository has no head.");
       requireOid(currentHead, "Canonical workspace head");
+      if (row.state === "accepting" && currentHead === row.latest_head) {
+        this.#state.storage.sql.exec(
+          "UPDATE workspace_artifact_repository SET head = ? WHERE singleton = 1",
+          currentHead,
+        );
+        this.#state.storage.sql.exec(`
+          UPDATE workspace_artifact_forks SET state = 'accepted', accepted_head = ?
+          WHERE chat_id = ? AND epoch = ? AND state = 'accepting'
+        `, currentHead, chatId, epoch);
+        const recovered = this.#forkRow(chatId, epoch);
+        if (!recovered || recovered.state !== "accepted") {
+          throw new Error("Accepted chat fork recovery did not persist.");
+        }
+        return this.#finishAcceptedFork(recovered);
+      }
       if (currentHead !== row.baseline_head) {
+        if (row.state === "accepting") {
+          this.#state.storage.sql.exec(`
+            UPDATE workspace_artifact_forks SET state = 'open'
+            WHERE chat_id = ? AND epoch = ? AND state = 'accepting'
+          `, chatId, epoch);
+        }
         return { status: "stale", expectedHead: row.baseline_head, currentHead };
       }
       const forkHead = await this.#reader.getHead(row.repository_name);
@@ -683,10 +953,14 @@ export class WorkspaceArtifactLifecycle {
       `, forkHead, chatId, epoch);
       const canonical = await this.#getReadyRepository(canonicalRow.repository_name);
       const fork = await this.#getReadyRepository(row.repository_name);
-      const [canonicalToken, forkToken] = await Promise.all([
-        canonical.createToken("write", 60),
-        fork.createToken("read", 60),
-      ]);
+      const canonicalToken = await canonical.createToken("write", 900);
+      let forkToken: Awaited<ReturnType<WorkspaceArtifactRepo["createToken"]>>;
+      try {
+        forkToken = await fork.createToken("read", 900);
+      } catch (error) {
+        await this.#revokeToken(canonical, canonicalToken.id);
+        throw error;
+      }
       let acceptedHead: string;
       try {
         try {
@@ -698,6 +972,7 @@ export class WorkspaceArtifactLifecycle {
             forkRemote: fork.remote,
             forkToken: forkToken.plaintext,
             expectedCanonicalHead: row.baseline_head,
+            canonicalDefaultBranch: canonical.defaultBranch,
           }), "Accepted workspace head");
         } catch (error) {
           const recoveredHead = await this.#reader.getHead(canonicalRow.repository_name);

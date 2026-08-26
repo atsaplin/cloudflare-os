@@ -29,6 +29,9 @@ declare global {
       BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots
       WORKSPACE_FILES: R2Bucket;           // Large workspace files and Git objects
       ARTIFACTS: Artifacts;                // Git-backed workspace repositories
+      ARTIFACTS_ACCOUNT_ID: string;        // Account used by bounded Artifacts REST reads
+      ARTIFACTS_NAMESPACE: string;         // Namespace bound as ARTIFACTS
+      ARTIFACTS_API_TOKEN: string;         // Secret with Artifacts read permission
 
       // User avatar storage.
       AVATARS: KVNamespace;                // Workers KV for user avatar images
