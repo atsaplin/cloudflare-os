@@ -72,6 +72,8 @@ import {
 } from "./workspace-artifacts";
 import {
   createArtifactsWorkspaceFiles,
+  type ChatWorkspaceOperation,
+  type ChatWorkspaceOperationResult,
   type WorkspaceFileRepository,
 } from "./artifacts-workspace-files";
 
@@ -758,6 +760,7 @@ type ChatArtifactAcceptBase = {
   isFirstChange: boolean;
   author: AiChatAuthorInfo;
   clientUserId: string;
+  workspaceFilesChanged?: boolean;
   gadgets: {gadgetId: WorkpieceId, baseHead?: string}[];
 };
 
@@ -2906,6 +2909,11 @@ class OverseerImpl implements AgentHooks {
     };
   }
 
+  chatHasProposedCodeChanges(chatId: number, meta: AiChatMetadata): boolean {
+    return this.listLiveChatChanges(chatId, this.chatCodeBase(meta).generation).length > 0 ||
+      this.getProposedChanges(chatId).length > 0;
+  }
+
   recomputeHasProposedChanges(chatId: number,
                               meta?: AiChatMetadata): AiChatMetadata | undefined {
     if (!meta) {
@@ -2917,8 +2925,7 @@ class OverseerImpl implements AgentHooks {
 
     // (Provisional gadget creations need no special accounting here: each is recorded on a
     // "changes" message, which getProposedChanges() already counts.)
-    if (this.listLiveChatChanges(chatId, this.chatCodeBase(meta).generation).length > 0 ||
-        this.getProposedChanges(chatId).length > 0) {
+    if (meta.hasWorkspaceFileChanges || this.chatHasProposedCodeChanges(chatId, meta)) {
       meta.hasProposedChanges = true;
     } else {
       delete meta.hasProposedChanges;
@@ -3053,6 +3060,37 @@ class OverseerImpl implements AgentHooks {
     if (!meta) return [];
     return this.listLiveChatChanges(chatId, this.chatCodeBase(meta).generation)
         .map(row => ({change: row.change, generation: row.generation, revision: row.revision}));
+  }
+
+  async runWorkspaceFileOperation(
+    chatId: number,
+    operationId: string,
+    author: AiChatAuthorInfo,
+    operation: ChatWorkspaceOperation,
+  ): Promise<ChatWorkspaceOperationResult> {
+    const meta = this.getChatMetaOrThrow(chatId);
+    const codeBase = this.chatCodeBase(meta);
+    const result = await this.workspaceRepository.runChatOperation({
+      chatId: String(chatId),
+      epoch: codeBase.epoch ?? 0,
+      operationId,
+      actor: { id: author.id, name: author.name },
+      timestamp: new Date().toISOString(),
+      operation,
+    });
+    if ("changed" in result && result.changed) {
+      const fresh = this.getChatMetaOrThrow(chatId);
+      const freshCodeBase = this.chatCodeBase(fresh);
+      if (freshCodeBase.generation !== codeBase.generation ||
+          (freshCodeBase.epoch ?? 0) !== (codeBase.epoch ?? 0)) {
+        throw new Error("Chat changed during a workspace file operation.");
+      }
+      fresh.hasWorkspaceFileChanges = true;
+      fresh.hasProposedChanges = true;
+      this.storage.chatMeta.put(fresh);
+      this.proposedChangesChanged(chatId);
+    }
+    return result;
   }
 
   async #checkpointAgentChange(
@@ -3508,6 +3546,11 @@ class OverseerImpl implements AgentHooks {
   async updateChatFromMainline(chatId: number, author: AiChatAuthorInfo)
       : Promise<{conflictPaths: string[]}> {
     let meta = this.assertChatNotActive(chatId);
+    if (meta.hasWorkspaceFileChanges) {
+      throw new Error(
+        "Accept or discard this chat's workspace file changes before updating from mainline.",
+      );
+    }
 
     // Live change rows are part of the chat's current content, so materialize them first: the merge
     // must take them as input, and its own row must be recorded after them.
@@ -3722,6 +3765,7 @@ class OverseerImpl implements AgentHooks {
       },
     };
     meta.lastActive = timestamp;
+    delete meta.hasWorkspaceFileChanges;
     this.storage.chatMeta.put(meta);
     this.recomputeHasProposedChanges(chatId, meta);
 
@@ -3770,7 +3814,9 @@ class OverseerImpl implements AgentHooks {
         pendingAccept.epoch,
       );
       if (accepted.status === "stale") {
-        await this.workspaceCodeRepository.discardChatFork(String(chatId), pendingAccept.epoch);
+        if (!pendingAccept.workspaceFilesChanged) {
+          await this.workspaceCodeRepository.discardChatFork(String(chatId), pendingAccept.epoch);
+        }
         this.storage.chatArtifactAccepts.delete(chatId);
         return {outcome: "stale"};
       }
@@ -3790,6 +3836,12 @@ class OverseerImpl implements AgentHooks {
     // not covered by this merge.
     await this.reconcilePendingGadgets(chatId);
 
+    meta = this.assertChatNotActive(chatId);
+    const entryEpoch = this.chatCodeBase(meta).epoch ?? 0;
+    const hasWorkspaceFileChanges = meta.hasWorkspaceFileChanges === true ||
+      await this.workspaceRepository.hasChatFileChanges(String(chatId), entryEpoch);
+    meta = this.assertChatNotActive(chatId);
+
     // Everything read from here through the commit writes must still describe the chat when the
     // mutation tail below runs; the sequence peek and the stream position are the revalidation
     // tokens. The merge covers every message recorded so far, and `mergeThrough` records that
@@ -3801,10 +3853,10 @@ class OverseerImpl implements AgentHooks {
     let revisionToken = entryCodeBase.revision;
 
     // Get the proposed updates for the thread. Each covered gadget creation or binding addition
-    // sits on one of these "changes" messages (see addChatMessages), so an empty list also
-    // means there is nothing to promote.
+    // sits on one of these "changes" messages (see addChatMessages). Ordinary workspace files
+    // live only in the chat's Artifacts fork, so a dirty fork also makes this accept non-empty.
     let updates = this.getProposedChanges(chatId);
-    if (updates.length === 0) {
+    if (updates.length === 0 && !hasWorkspaceFileChanges) {
       // Nothing to merge, so this is a no-op.
       return {outcome: "merged"};
     }
@@ -3934,6 +3986,7 @@ class OverseerImpl implements AgentHooks {
       isFirstChange,
       author: userMeta.profile,
       clientUserId,
+      ...(hasWorkspaceFileChanges ? { workspaceFilesChanged: true } : {}),
       state: "accepting",
       gadgets: toCommit.map(({record, baseHead}) => ({
         gadgetId: record.id,
@@ -3944,7 +3997,9 @@ class OverseerImpl implements AgentHooks {
 
     const accepted = await this.workspaceCodeRepository.acceptChatFork(forkChatId, forkEpoch);
     if (accepted.status === "stale") {
-      await this.workspaceCodeRepository.discardChatFork(forkChatId, forkEpoch);
+      if (!hasWorkspaceFileChanges) {
+        await this.workspaceCodeRepository.discardChatFork(forkChatId, forkEpoch);
+      }
       this.storage.chatArtifactAccepts.delete(chatId);
       return {outcome: "stale"};
     }
@@ -3968,6 +4023,11 @@ class OverseerImpl implements AgentHooks {
     // gate: nothing can interleave between what we examine here, the "changes" messages the
     // revert message will cover, and the mutations recording the revert.
     let meta = this.assertChatNotActive(chatId);
+    if (meta.hasWorkspaceFileChanges && revertFrom !== 0) {
+      throw new Error(
+        "Workspace file changes can only be discarded together with all pending chat changes.",
+      );
+    }
     let messages = [...this.storage.chats.list({prefix: `${keyString(chatId)}.`})];
     let statuses = chatChangeStatuses(messages);
     let stillProposed = (msg: AiChatMessage) =>
@@ -4079,6 +4139,7 @@ class OverseerImpl implements AgentHooks {
 
     meta.lastActive = timestamp;
     this.rollbackChatCompaction(meta, revertFrom);
+    delete meta.hasWorkspaceFileChanges;
     this.storage.chatMeta.put(meta);
     this.recomputeHasProposedChanges(chatId, meta);
     this.proposedChangesChanged(chatId);
@@ -4116,6 +4177,7 @@ class OverseerImpl implements AgentHooks {
     // erased base. (The per-client dedupe records survive -- see submitCodeChange: a straggling
     // retry of an erased row is still acknowledged with its recorded landing spot instead of
     // being applied twice.)
+    const metadataChanged = rows.length > 0 || meta.hasWorkspaceFileChanges === true;
     if (rows.length > 0) {
       let declared = this.declaredPinGadgets(chatId);
       codeBase.pins = codeBase.pins.filter(pin => declared.has(pin.gadgetId));
@@ -4124,7 +4186,9 @@ class OverseerImpl implements AgentHooks {
       codeBase.revision = 0;
       delete codeBase.prior;
       meta.codeBase = codeBase;
-
+    }
+    if (meta.hasWorkspaceFileChanges) delete meta.hasWorkspaceFileChanges;
+    if (metadataChanged) {
       meta.lastActive = this.getChatTimestamp();
       this.storage.chatMeta.put(meta);
       this.recomputeHasProposedChanges(chatId, meta);
@@ -4240,7 +4304,7 @@ class OverseerImpl implements AgentHooks {
       // Check if the requested chat has proposed changes. If not, then we don't want to load the
       // chat-specific facet, we just want to load the main-branch facet.
       let meta = this.storage.chatMeta.get(chatId);
-      if (!meta?.hasProposedChanges) {
+      if (!meta || !this.chatHasProposedCodeChanges(chatId, meta)) {
         chatId = undefined;
       }
     }

@@ -2376,6 +2376,9 @@ export type AiChatMetadata = {
    */
   hasProposedChanges?: boolean;
 
+  /** If true, the current chat epoch's Artifacts fork contains ordinary workspace file edits. */
+  hasWorkspaceFileChanges?: boolean;
+
   /** If this was started from an agent spawner, the spawner's display name. */
   spawnerName?: string;
 
@@ -3038,6 +3041,19 @@ export type AiToolCall = {
    * content, which cannot go stale within an epoch, and carry no stamp.
    */
   observedCommit?: string;
+} | {
+  /** Lists, reads, or changes ordinary files in the chat's private workspace fork. */
+  toolName: "workspaceFiles";
+  input:
+    | { action: "list"; path?: string }
+    | { action: "read"; path: string }
+    | { action: "write"; path: string; content: string; mediaType?: string }
+    | { action: "mkdir"; path: string }
+    | { action: "move"; path: string; destination: string }
+    | { action: "delete"; path: string; recursive?: boolean };
+
+  /** Exact formatted result persisted so history replay never repeats a file mutation. */
+  output?: string;
 } | {
   toolName: "writeFile";
   input: {

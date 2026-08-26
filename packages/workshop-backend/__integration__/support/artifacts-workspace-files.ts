@@ -274,6 +274,19 @@ class LocalArtifacts implements WorkspaceArtifactReader, ArtifactsWorkspaceFileL
     return Promise.resolve(commits);
   }
 
+  readChatCommitLog(
+    chatId: string,
+    epoch: number,
+    oid: string,
+    options?: { depth?: number },
+  ): Promise<CommitInfo[]> {
+    const fork = this.#state.forks.get(forkKey(chatId, epoch));
+    if (!fork || !this.#state.repositories.has(fork.repositoryName)) {
+      throw new Error("Test chat fork does not exist.");
+    }
+    return this.readCommitLog(oid, options);
+  }
+
   getHistory(limit?: number): Promise<CommitInfo[]> {
     const canonical = this.#state.canonical;
     if (!canonical) throw new Error("Test canonical repository does not exist.");

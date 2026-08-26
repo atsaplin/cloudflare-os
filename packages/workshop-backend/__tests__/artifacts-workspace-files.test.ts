@@ -4,6 +4,7 @@ import {
   ArtifactsWorkspaceFiles,
   type ArtifactsWorkspaceFileLifecycle,
   type ArtifactsWorkspaceFileUploadStore,
+  type ChatWorkspaceOperationRequest,
 } from "../src/artifacts-workspace-files";
 import {
   WORKSPACE_INDEX_PATH,
@@ -11,7 +12,10 @@ import {
   createWorkspaceNode,
   serializeWorkspaceIndex,
 } from "../src/workspace-manifest";
-import { MAXIMUM_WORKSPACE_TOTAL_BYTES } from "@gadgets/workshop-shared/api";
+import {
+  MAXIMUM_WORKSPACE_TOTAL_BYTES,
+  WORKSPACE_FILE_ERROR_CODES,
+} from "@gadgets/workshop-shared/api";
 import type {
   WorkspaceArtifactAcceptResult,
   WorkspaceArtifactCanonical,
@@ -54,6 +58,8 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   readonly snapshots = new Map<string, Map<string, Snapshot>>();
   readonly forks = new Map<string, WorkspaceArtifactForkStatus>();
   readonly stagedMutations: WorkspaceArtifactMutation[] = [];
+  readonly commitMessages = new Map<string, string>();
+  readonly commitParents = new Map<string, string>();
   throwBeforeStage = false;
   throwAfterStage = false;
   throwAfterAccept = false;
@@ -166,6 +172,8 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
     };
     this.forks.set(key, fork);
     this.stagedMutations.push(mutation);
+    this.commitMessages.set(head, message);
+    this.commitParents.set(head, existing?.latestHead ?? baselineHead);
     if (this.throwAfterStage) throw new Error("Test lost the staged response.");
     return Promise.resolve(fork);
   }
@@ -212,6 +220,32 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
 
   readCommitLog(): Promise<CommitInfo[]> {
     return Promise.resolve([]);
+  }
+
+  readChatCommitLog(
+    chatId: string,
+    epoch: number,
+    oid: string,
+    options?: { depth?: number },
+  ): Promise<CommitInfo[]> {
+    const fork = this.forks.get(`${chatId}:${epoch}`);
+    if (!fork || !this.snapshots.get(fork.repositoryName)?.has(oid)) {
+      throw new Error("Test chat fork commit is missing.");
+    }
+    const commits: CommitInfo[] = [];
+    let current: string | undefined = oid;
+    while (current !== undefined && commits.length < (options?.depth ?? 50)) {
+      const parent = this.commitParents.get(current);
+      commits.push({
+        oid: current,
+        parents: parent === undefined ? [] : [parent],
+        message: this.commitMessages.get(current) ?? "",
+        author: { name: ACTOR.name, email: "aleksey@example.com" },
+        timestamp: new Date("2026-08-26T00:00:00.000Z"),
+      });
+      current = parent;
+    }
+    return Promise.resolve(commits);
   }
 
   getHistory(): Promise<CommitInfo[]> {
@@ -400,7 +434,7 @@ describe("ArtifactsWorkspaceFiles", () => {
         size: 6,
         mediaType: "text/plain",
       });
-      const request = {
+      const request: ChatWorkspaceOperationRequest = {
         operationId: "00000000-0000-4000-8000-000000000205",
         expectedHead: initial.head,
         actor: ACTOR,
@@ -564,6 +598,207 @@ describe("ArtifactsWorkspaceFiles", () => {
         operationId: "00000000-0000-4000-8000-000000000207",
         changes: [{ kind: "createFolder", clientId: "stale", parent: { nodeId: initial.rootId }, name: "stale" }],
       })).rejects.toBeInstanceOf(WorkspaceRepositoryConflictError);
+    });
+  });
+
+  it("keeps agent workspace mutations in the chat fork until acceptance", async () => {
+    const result = await withFiles("agent-chat-fork", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const folder = await files.runChatOperation({
+        chatId: "42",
+        epoch: 0,
+        operationId: "tool-mkdir",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:00:00.000Z",
+        operation: { kind: "mkdir", path: "notes" },
+      });
+      const written = await files.runChatOperation({
+        chatId: "42",
+        epoch: 0,
+        operationId: "tool-write",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:01:00.000Z",
+        operation: { kind: "write", path: "notes/todo.txt", content: "first" },
+      });
+      const listed = await files.runChatOperation({
+        chatId: "42",
+        epoch: 0,
+        operationId: "tool-list",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:02:00.000Z",
+        operation: { kind: "list", path: "notes" },
+      });
+      const read = await files.runChatOperation({
+        chatId: "42",
+        epoch: 0,
+        operationId: "tool-read",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:03:00.000Z",
+        operation: { kind: "read", path: "notes/todo.txt" },
+      });
+      const canonicalBeforeAccept = await files.list(initial.rootId);
+      const accepted = await artifacts.acceptChatFork("42", 0);
+      return {
+        folder,
+        written,
+        listed,
+        read,
+        canonicalBeforeAccept,
+        accepted,
+        canonicalAfterAccept: await files.list(initial.rootId),
+      };
+    });
+
+    expect(result.folder).toMatchObject({ kind: "mkdir", path: "notes", changed: true });
+    expect(result.written).toMatchObject({
+      kind: "write",
+      path: "notes/todo.txt",
+      changed: true,
+    });
+    expect(result.listed).toMatchObject({
+      kind: "list",
+      path: "notes",
+      entries: [{ kind: "file", path: "notes/todo.txt", size: 5 }],
+    });
+    expect(result.read).toMatchObject({
+      kind: "read",
+      path: "notes/todo.txt",
+      content: "first",
+    });
+    expect(result.canonicalBeforeAccept).toEqual([]);
+    expect(result.accepted.status).toBe("merged");
+    expect(result.canonicalAfterAccept).toEqual([
+      expect.objectContaining({ kind: "folder", path: "notes" }),
+    ]);
+  });
+
+  it("recovers an ambiguous agent workspace checkpoint without applying it twice", async () => {
+    await withFiles("agent-chat-retry", async (files, artifacts) => {
+      await files.initialize(ACTOR);
+      const request = {
+        chatId: "43",
+        epoch: 0,
+        operationId: "tool-create-once",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:10:00.000Z",
+        operation: { kind: "mkdir", path: "once" },
+      };
+
+      artifacts.throwAfterStage = true;
+      await expect(files.runChatOperation(request)).rejects.toThrow("lost the staged response");
+      artifacts.throwAfterStage = false;
+      expect(await files.hasChatFileChanges("43", 0)).toBe(true);
+      const recovered = await files.runChatOperation(request);
+
+      expect(recovered).toMatchObject({ kind: "mkdir", path: "once", changed: true });
+      expect(artifacts.stagedMutations).toHaveLength(1);
+      const listed = await files.runChatOperation({
+        ...request,
+        operationId: "tool-list-after-retry",
+        operation: { kind: "list", path: "/" },
+      });
+      expect(listed).toMatchObject({
+        entries: [expect.objectContaining({ kind: "folder", path: "once" })],
+      });
+    });
+  });
+
+  it("moves and deletes chat workspace nodes by path while preserving their stable IDs", async () => {
+    await withFiles("agent-chat-move-delete", async files => {
+      await files.initialize(ACTOR);
+      const folder = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-folder",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:20:00.000Z",
+        operation: { kind: "mkdir", path: "docs" },
+      });
+      const written = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-file",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:21:00.000Z",
+        operation: { kind: "write", path: "docs/old.txt", content: "content" },
+      });
+      const moved = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-move",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:22:00.000Z",
+        operation: { kind: "move", path: "docs/old.txt", destination: "docs/new.txt" },
+      });
+      const read = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-read-moved",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:23:00.000Z",
+        operation: { kind: "read", path: "docs/new.txt" },
+      });
+      const deleted = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-delete",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:24:00.000Z",
+        operation: { kind: "delete", path: "docs/new.txt" },
+      });
+      const listed = await files.runChatOperation({
+        chatId: "44",
+        epoch: 0,
+        operationId: "tool-list-empty",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:25:00.000Z",
+        operation: { kind: "list", path: "docs" },
+      });
+
+      expect(folder.nodeId).toBeDefined();
+      expect(moved).toMatchObject({
+        kind: "move",
+        path: "docs/new.txt",
+        nodeId: written.nodeId,
+      });
+      expect(read).toMatchObject({ content: "content", node: { id: written.nodeId } });
+      expect(deleted).toMatchObject({ kind: "delete", nodeId: written.nodeId });
+      expect(listed).toMatchObject({ entries: [] });
+    });
+  });
+
+  it("rejects an agent tool-call ID reused with different workspace input", async () => {
+    await withFiles("agent-chat-operation-reuse", async files => {
+      await files.initialize(ACTOR);
+      const request: ChatWorkspaceOperationRequest = {
+        chatId: "45",
+        epoch: 0,
+        operationId: "tool-reused",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:30:00.000Z",
+        operation: { kind: "mkdir", path: "one" },
+      };
+      await files.runChatOperation(request);
+      await files.runChatOperation({
+        ...request,
+        operationId: "tool-after-reused",
+        operation: { kind: "mkdir", path: "after" },
+      });
+      await expectCode(files.runChatOperation({
+        ...request,
+        operation: { kind: "mkdir", path: "two" },
+      }), WORKSPACE_FILE_ERROR_CODES.operationReused);
+    });
+  });
+
+  it("does not report gadget-only fork checkpoints as workspace file changes", async () => {
+    await withFiles("agent-chat-gadget-only", async (files, artifacts) => {
+      await files.initialize(ACTOR);
+      await artifacts.stageChatMutation("46", 0, ACTOR, "Gadget checkpoint", {
+        operations: [{ kind: "write", path: "gadgets/1/index.ts", content: textBytes("export {}") }],
+      });
+
+      expect(await files.hasChatFileChanges("46", 0)).toBe(false);
     });
   });
 });

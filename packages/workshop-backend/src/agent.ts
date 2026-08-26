@@ -1,4 +1,8 @@
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, ChatGadgetPin, ChatCodeBase, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
+import type {
+  ChatWorkspaceOperation,
+  ChatWorkspaceOperationResult,
+} from "./artifacts-workspace-files";
 import { applyCodeChange, replaceSpanChange, type CodeContent, type CodeChange }
   from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
@@ -353,6 +357,13 @@ export interface AgentHooks {
     a: string | undefined,
     b: string | undefined,
   ): Promise<Set<string>>;
+
+  runWorkspaceFileOperation(
+    chatId: number,
+    operationId: string,
+    author: AiChatAuthorInfo,
+    operation: ChatWorkspaceOperation,
+  ): Promise<ChatWorkspaceOperationResult>;
 
   /**
    * Summarize the workspace's gadgets for the system prompt (see AgentGadgetInfo). Gadgets still
@@ -752,6 +763,8 @@ Gadgets execute on a restricted and heavily-sandboxed variant of Cloudflare Work
 You were started programmatically by the Gadget to perform a task. The specific task will be described in the first message in this chat. The message is not directly from the user but rather from an automated system. If you receive any further messages after the first, then these additional messages are directly from a human user making additional requests regarding the task.
 
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
+
+Use \`workspaceFiles\` when the task needs to inspect or change persistent files in the workspace. Those changes remain private to this chat until a user accepts them.
 `.trim();
 
 let READ_FILE_TOOL_DESCRIPTION = `
@@ -776,6 +789,10 @@ Write a complete file, creating it if it doesn't exist, or replacing it if it do
 
 let EDIT_FILE_TOOL_DESCRIPTION = `
 Edit content of a file. If you need to edit multiple places in a file or across multiple files, you should issue multiple tool calls simultaneously, rather than in series.
+`.trim();
+
+let WORKSPACE_FILES_TOOL_DESCRIPTION = `
+List, read, or change ordinary files in this workspace. Paths are workspace-relative. Write creates or replaces a UTF-8 text file, mkdir creates one folder, move preserves the file or folder's stable identity, and delete requires recursive=true for a non-empty folder. Changes remain private to this chat until the user accepts them.
 `.trim();
 
 let WEBFETCH_TOOL_DESCRIPTION = `
@@ -1600,6 +1617,12 @@ export async function runAgent(
                   }
                   break;
                 }
+                case "workspaceFiles":
+                  if (toolCall.output === undefined) {
+                    throw new Error("workspaceFiles tool call in log is missing output");
+                  }
+                  toolOutput = {text: toolCall.output};
+                  break;
                 case "writeFile": {
                   let {workpieceId} =
                       hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(toolCall.input.workpiece));
@@ -2347,6 +2370,89 @@ export async function runAgent(
   });
 
   let tools: Record<string, AgentTool> = {
+    workspaceFiles: defineTool({
+      name: "workspaceFiles",
+      label: "Workspace files",
+      description: WORKSPACE_FILES_TOOL_DESCRIPTION,
+      parameters: Type.Union([
+        Type.Object({
+          action: Type.Literal("list"),
+          path: Type.Optional(Type.String({ description: "Folder path. Defaults to the root." })),
+        }),
+        Type.Object({
+          action: Type.Literal("read"),
+          path: Type.String({ description: "File path to read." }),
+        }),
+        Type.Object({
+          action: Type.Literal("write"),
+          path: Type.String({ description: "File path to create or replace." }),
+          content: Type.String({ description: "Complete UTF-8 text content." }),
+          mediaType: Type.Optional(Type.String({ description: "Optional media type." })),
+        }),
+        Type.Object({
+          action: Type.Literal("mkdir"),
+          path: Type.String({ description: "Folder path to create." }),
+        }),
+        Type.Object({
+          action: Type.Literal("move"),
+          path: Type.String({ description: "Existing file or folder path." }),
+          destination: Type.String({ description: "New file or folder path." }),
+        }),
+        Type.Object({
+          action: Type.Literal("delete"),
+          path: Type.String({ description: "Existing file or folder path." }),
+          recursive: Type.Optional(Type.Boolean({
+            description: "Required to delete a non-empty folder.",
+          })),
+        }),
+      ]),
+      execute: async (toolCallId, input) => {
+        try {
+          let operation: ChatWorkspaceOperation;
+          switch (input.action) {
+            case "list":
+              operation = { kind: "list", path: input.path ?? "/" };
+              break;
+            case "read":
+              operation = { kind: "read", path: input.path };
+              break;
+            case "write":
+              operation = {
+                kind: "write",
+                path: input.path,
+                content: input.content,
+                ...(input.mediaType === undefined ? {} : { mediaType: input.mediaType }),
+              };
+              break;
+            case "mkdir":
+              operation = { kind: "mkdir", path: input.path };
+              break;
+            case "move":
+              operation = { kind: "move", path: input.path, destination: input.destination };
+              break;
+            case "delete":
+              operation = {
+                kind: "delete",
+                path: input.path,
+                ...(input.recursive === undefined ? {} : { recursive: input.recursive }),
+              };
+              break;
+          }
+          const result = await hooks.runWorkspaceFileOperation(
+            chatId,
+            toolCallId,
+            author,
+            operation,
+          );
+          const output = jsonToolResultText(result);
+          return toolResult(output, {output});
+        } catch (error) {
+          toolCallNotes.set(toolCallId, { error: toolErrorText(error) });
+          throw error;
+        }
+      },
+    }),
+
     readFile: defineTool({
       name: "readFile",
       label: "Read file",
@@ -2939,6 +3045,7 @@ export async function runAgent(
     tools = {
       describeBinding: tools.describeBinding,
       executeCode: tools.executeCode,
+      workspaceFiles: tools.workspaceFiles,
       ...(callbackInitiated ? {giveUp: tools.giveUp} : {}),
     };
   }
