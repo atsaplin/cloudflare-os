@@ -66,6 +66,10 @@ import {
   WorkspaceRepositoryConflictError,
   WorkspaceRepositoryExpectedError,
 } from "./workspace-repository";
+import {
+  createArtifactsWorkspaceRepository,
+  type WorkspaceCodeRepository,
+} from "./workspace-artifacts";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -1400,6 +1404,8 @@ class OverseerImpl implements AgentHooks {
   // One instance per DO so isomorphic-git's parse cache is shared.
   readonly gitStore: GitStore;
 
+  workspaceCodeRepository: WorkspaceCodeRepository;
+
   // Durable, versioned files owned by this workspace. The repository facade is the only code that
   // can touch the underlying Shell worktree, Git index, or large-file R2 binding.
   readonly workspaceRepository: WorkspaceRepository;
@@ -1690,6 +1696,11 @@ class OverseerImpl implements AgentHooks {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
+    this.workspaceCodeRepository = createArtifactsWorkspaceRepository(
+      ctx,
+      env,
+      ctx.id.toString(),
+    );
     this.workspaceRepository = new WorkspaceRepository({
       state: ctx,
       bucket: env.WORKSPACE_FILES,
@@ -2430,13 +2441,15 @@ class OverseerImpl implements AgentHooks {
   }
 
   // AgentHooks implementation: read a commit's file map (see GitStore.readCommitFiles).
-  readCommitFiles(oid: string): Promise<Map<string, string>> {
-    return this.gitStore.readCommitFiles(oid);
+  readCommitFiles(gadgetId: WorkpieceId, oid: string): Promise<Map<string, string>> {
+    return this.workspaceCodeRepository.readGadgetFiles(gadgetId, oid);
   }
 
   // AgentHooks implementation: per-file oid diff between two commits (see GitStore.changedPaths).
-  changedPaths(a: string | undefined, b: string | undefined): Promise<Set<string>> {
-    return this.gitStore.changedPaths(a, b);
+  changedPaths(
+      gadgetId: WorkpieceId, a: string | undefined, b: string | undefined)
+      : Promise<Set<string>> {
+    return this.workspaceCodeRepository.changedGadgetPaths(gadgetId, a, b);
   }
 
   // Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live
@@ -2471,7 +2484,7 @@ class OverseerImpl implements AgentHooks {
       if (statuses.get(msg.sequence) === "reverted") continue;
       if (msg.conversionBoundary) content = new Map();
       for (let pin of msg.pins ?? []) {
-        content.set(pin.gadgetId, await this.gitStore.readCommitFiles(pin.baseCommit));
+        content.set(pin.gadgetId, await this.readCommitFiles(pin.gadgetId, pin.baseCommit));
       }
       if (msg.change !== undefined) content = applyCodeChange(content, msg.change);
     }
@@ -2511,7 +2524,7 @@ class OverseerImpl implements AgentHooks {
       // the content before the rows apply. (Rows before the establishing row never touch the
       // gadget, so establishing all of them up front is equivalent to establishing in order.)
       for (let pin of this.undeclaredMetaPins(chatId, meta)) {
-        content.set(pin.gadgetId, await this.gitStore.readCommitFiles(pin.baseCommit));
+        content.set(pin.gadgetId, await this.readCommitFiles(pin.gadgetId, pin.baseCommit));
       }
 
       // Synchronous tail: apply the live rows and revalidate the snapshot.
@@ -2956,7 +2969,7 @@ class OverseerImpl implements AgentHooks {
     // Prefetch (awaits) before the synchronous tail.
     let content = await this.getCurrentChatContent(chatId, meta);
     let baseFiles = pin !== undefined
-        ? await this.gitStore.readCommitFiles(pin.baseCommit) : undefined;
+        ? await this.readCommitFiles(pin.gadgetId, pin.baseCommit) : undefined;
 
     // ---- synchronous tail ----
     let fresh = this.getChatMetaOrThrow(chatId);
@@ -3091,7 +3104,7 @@ class OverseerImpl implements AgentHooks {
           head,
           headParents: head === baseCommit
               ? [] : (await this.gitStore.readCommitLog(head, {depth: 1}))[0].parents,
-          baseFiles: await this.gitStore.readCommitFiles(baseCommit),
+          baseFiles: await this.readCommitFiles(gadgetId, baseCommit),
         });
       };
       for (let decl of submission.pins ?? []) {
@@ -3381,8 +3394,8 @@ class OverseerImpl implements AgentHooks {
       // The chat's last merged commit is the 3-way common ancestor -- explicitly known, so no
       // merge-base discovery. Conflicting hunks keep inline diff3 markers for the user (or
       // their agent) to clean up.
-      let base = await this.gitStore.readCommitFiles(pin.mergedCommit);
-      let head = await this.gitStore.readCommitFiles(record.commitId!);
+      let base = await this.readCommitFiles(pin.gadgetId, pin.mergedCommit);
+      let head = await this.readCommitFiles(record.id, record.commitId!);
       let result = threeWayMerge(base, head, merged.get(pin.gadgetId) ?? new Map(),
           {base: "merged base", ours: "mainline", theirs: "this chat"});
       merged.set(pin.gadgetId, result.files);
@@ -3497,7 +3510,7 @@ class OverseerImpl implements AgentHooks {
     if (isFirstChange) {
       for (let gadget of this.storage.gadgets.list()) {
         if (gadget.commitId !== undefined &&
-            (await this.gitStore.readCommitFiles(gadget.commitId)).size > 0) {
+            (await this.readCommitFiles(gadget.id, gadget.commitId)).size > 0) {
           isFirstChange = false;
           break;
         }
@@ -3527,7 +3540,7 @@ class OverseerImpl implements AgentHooks {
       let files = chatContent.get(record.id) ?? new Map<string, string>();
       let mergedCommit = pins.get(record.id)?.mergedCommit;
       let baseFiles = mergedCommit !== undefined
-          ? await this.gitStore.readCommitFiles(mergedCommit)
+          ? await this.readCommitFiles(record.id, mergedCommit)
           : new Map<string, string>();
       // A record still pending here is a covered creation (uncovered ones were skipped above),
       // and a covered creation always gets its first commit -- an empty tree if the gadget has
@@ -3546,21 +3559,15 @@ class OverseerImpl implements AgentHooks {
       toCommit.push({record, files, baseHead: record.commitId});
     }
 
-    // Write the commits (content-addressed object writes; harmless if the accept below turns out
-    // stale after all).
-    let identity = commitIdentityForAuthor(userMeta.profile);
-    let commits: {gadgetId: WorkpieceId, commitId: string}[] = [];
-    for (let {record, files, baseHead} of toCommit) {
-      commits.push({
-        gadgetId: record.id,
-        commitId: await this.gitStore.writeFilesAsCommit(files, {
-          parents: baseHead !== undefined ? [baseHead] : [],
-          author: identity,
-          message: `Accept changes from chat: ${meta.title}`,
-          timestamp: new Date(),
-        }),
-      });
-    }
+    const forkEpoch = entryCodeBase.epoch ?? 0;
+    const forkChatId = String(chatId);
+    await this.workspaceCodeRepository.stageGadgetFiles(
+      forkChatId,
+      forkEpoch,
+      { id: userMeta.profile.id, name: userMeta.profile.name },
+      `Accept changes from chat: ${meta.title}`,
+      new Map(toCommit.map(({ record, files }) => [record.id, files])),
+    );
 
     // Everything above this point awaited, so the chat and workspace may have moved in the
     // meantime; re-validate before mutating. The chat lock excludes sibling merge/revert/
@@ -3594,6 +3601,16 @@ class OverseerImpl implements AgentHooks {
         freshCodeBase.revision !== revisionToken) {
       throw new Error("The chat's code is being actively edited; please retry.");
     }
+
+    const accepted = await this.workspaceCodeRepository.acceptChatFork(forkChatId, forkEpoch);
+    if (accepted.status === "stale") {
+      await this.workspaceCodeRepository.discardChatFork(forkChatId, forkEpoch);
+      return {outcome: "stale"};
+    }
+    let commits: {gadgetId: WorkpieceId, commitId: string}[] = toCommit.map(({ record }) => ({
+      gadgetId: record.id,
+      commitId: accepted.head,
+    }));
 
     // Promote provisional gadgets whose creation is covered by this merge: accepting the chat's
     // changes through `mergeThrough` makes them permanent workspace members. Each covered
@@ -3714,6 +3731,12 @@ class OverseerImpl implements AgentHooks {
       chat_id: chatId,
       interaction_type: "code_merged",
     });
+
+    await this.workspaceCodeRepository.completeAcceptedChatFork(
+      forkChatId,
+      forkEpoch,
+      accepted.head,
+    );
 
     return {outcome: "merged"};
   }
@@ -3943,7 +3966,7 @@ class OverseerImpl implements AgentHooks {
       } else {
         let commitId = this.storage.gadgets.get(gadgetId)?.commitId;
         files = commitId !== undefined
-            ? await this.gitStore.readCommitFiles(commitId)
+            ? await this.readCommitFiles(gadgetId, commitId)
             : new Map();
       }
 
@@ -4104,7 +4127,7 @@ class OverseerImpl implements AgentHooks {
       return (await this.buildChatContent(chatId!)).get(gadgetId) ?? new Map();
     }
     let commitId = this.storage.gadgets.get(gadgetId)?.commitId;
-    return commitId !== undefined ? await this.gitStore.readCommitFiles(commitId) : new Map();
+    return commitId !== undefined ? await this.readCommitFiles(gadgetId, commitId) : new Map();
   }
 
   async getGadgetUiBundle(gadgetId: WorkpieceId, chatId?: number): Promise<UiBundle | null> {
@@ -8352,6 +8375,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     await this.impl.workspaceRepository.initialize({ id: profileId, name: profileId });
+    await this.impl.workspaceCodeRepository.ensureCanonical({ id: profileId, name: profileId });
 
     if (role === "use") {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
@@ -8424,6 +8448,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     await this.impl.workspaceRepository.initialize({
       id: callerProfile.id,
       name: callerProfile.id,
+    });
+    await this.impl.workspaceCodeRepository.ensureCanonical({
+      id: callerProfile.id,
+      name: callerProfile.name,
     });
 
     // Complete pending registration in the owner's UserDO.
@@ -9359,10 +9387,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   // --- Commit-backed code reads ---
 
-  async getCodeAtCommit(commitId: string): Promise<{files: [path: string, content: string][]}> {
+  async getCodeAtCommit(
+      gadgetId: WorkpieceId, commitId: string)
+      : Promise<{files: [path: string, content: string][]}> {
     // A list of pairs, not a path-keyed object: a file named "__proto__" is a legitimate tree
     // entry, and RPC would drop it from an object (see Overseer.getCodeAtCommit).
-    return {files: [...await this.impl.gitStore.readCommitFiles(validateOid(commitId))]};
+    return {files: [...await this.impl.readCommitFiles(gadgetId, validateOid(commitId))]};
   }
 
   async getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]> {
@@ -10693,7 +10723,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       : Promise<{generation: number, revision: number}> {
     this.#deny();
   }
-  async getCodeAtCommit(_commitId: string): Promise<{files: [path: string, content: string][]}> {
+  async getCodeAtCommit(
+      _gadgetId: WorkpieceId, _commitId: string)
+      : Promise<{files: [path: string, content: string][]}> {
     this.#deny();
   }
   async getCommitLog(_fromCommit: string, _depth?: number): Promise<CommitInfo[]> {

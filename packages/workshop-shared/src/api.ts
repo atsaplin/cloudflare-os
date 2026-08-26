@@ -1833,7 +1833,10 @@ export interface Overseer extends RpcTarget {
    * committed code (outside any chat, or for a gadget the open chat has no pin for) and to fetch
    * the base content of a chat's pins (see ChatCodeBase).
    */
-  getCodeAtCommit(commitId: string): Promise<{files: [path: string, content: string][]}>;
+  getCodeAtCommit(
+    gadgetId: WorkpieceId,
+    commitId: string,
+  ): Promise<{files: [path: string, content: string][]}>;
 
   /**
    * Walk the commit graph from `fromCommit` (that commit first, then its ancestry), returning up

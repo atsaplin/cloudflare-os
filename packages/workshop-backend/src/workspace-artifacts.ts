@@ -1306,14 +1306,61 @@ export interface ArtifactsWorkspaceRepositoryOptions {
   reader: WorkspaceArtifactReader;
 }
 
+export interface WorkspaceCodeRepository {
+  ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical>;
+  readGadgetFiles(gadgetId: number, ref: string): Promise<Map<string, string>>;
+  changedGadgetPaths(
+    gadgetId: number,
+    previousRef: string | undefined,
+    currentRef: string | undefined,
+  ): Promise<Set<string>>;
+  stageGadgetFiles(
+    chatId: string,
+    epoch: number,
+    actor: WorkspaceActor,
+    message: string,
+    gadgets: ReadonlyMap<number, ReadonlyMap<string, string>>,
+  ): Promise<WorkspaceArtifactChatFork>;
+  acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult>;
+  completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void>;
+  discardChatFork(chatId: string, epoch: number): Promise<void>;
+}
+
+export function createArtifactsWorkspaceRepository(
+  state: DurableObjectState,
+  env: Cloudflare.Env,
+  workspaceId: string,
+): ArtifactsWorkspaceRepository {
+  const reader = new CloudflareWorkspaceArtifactReader({
+    artifacts: env.ARTIFACTS,
+    accountId: env.ARTIFACTS_ACCOUNT_ID,
+    namespace: env.ARTIFACTS_NAMESPACE,
+    apiToken: env.ARTIFACTS_API_TOKEN,
+  });
+  const lifecycle = new WorkspaceArtifactLifecycle({
+    state,
+    workspaceId,
+    artifacts: env.ARTIFACTS,
+    reader,
+    gitRuntime: new SandboxWorkspaceArtifactGitRuntime(
+      sandboxId => getSandbox<Sandbox>(env.Sandbox, sandboxId),
+    ),
+  });
+  return new ArtifactsWorkspaceRepository({ lifecycle, reader });
+}
+
 /** Maps workspace-level Artifacts revisions to the gadget source subtrees they contain. */
-export class ArtifactsWorkspaceRepository {
+export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
   readonly #lifecycle: WorkspaceArtifactLifecycle;
   readonly #reader: WorkspaceArtifactReader;
 
   constructor(options: ArtifactsWorkspaceRepositoryOptions) {
     this.#lifecycle = options.lifecycle;
     this.#reader = options.reader;
+  }
+
+  ensureCanonical(actor: WorkspaceActor): Promise<WorkspaceArtifactCanonical> {
+    return this.#lifecycle.ensureCanonical(actor);
   }
 
   async #canonical(): Promise<WorkspaceArtifactCanonical> {
@@ -1345,6 +1392,24 @@ export class ArtifactsWorkspaceRepository {
     return files;
   }
 
+  async changedGadgetPaths(
+    gadgetId: number,
+    previousRef: string | undefined,
+    currentRef: string | undefined,
+  ): Promise<Set<string>> {
+    const [previous, current] = await Promise.all([
+      previousRef === undefined ? new Map<string, string>()
+        : this.readGadgetFiles(gadgetId, previousRef),
+      currentRef === undefined ? new Map<string, string>()
+        : this.readGadgetFiles(gadgetId, currentRef),
+    ]);
+    const changed = new Set<string>();
+    for (const path of new Set([...previous.keys(), ...current.keys()])) {
+      if (previous.get(path) !== current.get(path)) changed.add(path);
+    }
+    return changed;
+  }
+
   stageGadgetFiles(
     chatId: string,
     epoch: number,
@@ -1372,5 +1437,21 @@ export class ArtifactsWorkspaceRepository {
       deletePaths,
       writes,
     });
+  }
+
+  acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
+    return this.#lifecycle.acceptChatFork(chatId, epoch);
+  }
+
+  completeAcceptedChatFork(
+    chatId: string,
+    epoch: number,
+    acceptedHead: string,
+  ): Promise<void> {
+    return this.#lifecycle.completeAcceptedChatFork(chatId, epoch, acceptedHead);
+  }
+
+  discardChatFork(chatId: string, epoch: number): Promise<void> {
+    return this.#lifecycle.discardChatFork(chatId, epoch);
   }
 }

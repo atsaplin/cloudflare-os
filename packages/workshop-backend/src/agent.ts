@@ -341,14 +341,18 @@ export interface AgentHooks {
    * Read a commit's full file map from the workspace's git object store. Commits are immutable,
    * so results are cacheable by oid (and the store's parse cache makes repeats cheap).
    */
-  readCommitFiles(oid: string): Promise<Map<string, string>>;
+  readCommitFiles(gadgetId: WorkpieceId, oid: string): Promise<Map<string, string>>;
 
   /**
    * The set of file paths whose content differs between two commits (either side undefined =
    * empty tree), compared by blob oid without reading content. Drives read-staleness checks:
    * elision of stamped reads and editFile's read-before-edit gate.
    */
-  changedPaths(a: string | undefined, b: string | undefined): Promise<Set<string>>;
+  changedPaths(
+    gadgetId: WorkpieceId,
+    a: string | undefined,
+    b: string | undefined,
+  ): Promise<Set<string>>;
 
   /**
    * Summarize the workspace's gadgets for the system prompt (see AgentGadgetInfo). Gadgets still
@@ -1009,11 +1013,12 @@ export async function runAgent(
 
   // Memoized per-file diff lookups: replay can check many reads stamped at the same commit.
   let changedPathsCache = new Map<string, Promise<Set<string>>>();
-  let changedPaths = (a: string | undefined, b: string | undefined) => {
-    let key = `${a}:${b}`;
+  let changedPaths = (
+      gadgetId: WorkpieceId, a: string | undefined, b: string | undefined) => {
+    let key = `${gadgetId}:${a}:${b}`;
     let cached = changedPathsCache.get(key);
     if (!cached) {
-      cached = hooks.changedPaths(a, b);
+      cached = hooks.changedPaths(gadgetId, a, b);
       changedPathsCache.set(key, cached);
     }
     return cached;
@@ -1227,7 +1232,7 @@ export async function runAgent(
       for (let [filename, observed] of files) {
         let stamp = mergeCommit ?? observed;
         if (stamp === undefined) continue;
-        if ((await changedPaths(stamp, base)).has(filename)) continue;
+        if ((await changedPaths(workpieceId, stamp, base)).has(filename)) continue;
         let target = survivors.get(workpieceId);
         if (target === undefined) survivors.set(workpieceId, target = new Map());
         target.set(filename, stamp);
@@ -1240,7 +1245,7 @@ export async function runAgent(
   // pinned. Idempotent: commits are immutable, so re-establishing the same base is harmless --
   // which is what lets ensureReplayContentForWrite below establish a base *early*.
   let applyReplayedPin = async (pin: ChatGadgetPin) => {
-    let files = await hooks.readCommitFiles(pin.baseCommit);
+    let files = await hooks.readCommitFiles(pin.gadgetId, pin.baseCommit);
     sessionContent = new Map(sessionContent);
     sessionContent.set(pin.gadgetId, files);
     pinnedGadgets.add(pin.gadgetId);
@@ -1548,7 +1553,7 @@ export async function runAgent(
                         resolveToolWorkpieceId(toolCall.input.workpiece));
                     let base = stampedReadBase(workpieceId, msg.sequence);
                     let stale = base === undefined ||
-                        (await changedPaths(toolCall.observedCommit, base))
+                        (await changedPaths(workpieceId, toolCall.observedCommit, base))
                             .has(toolCall.input.filename);
                     if (stale) {
                       toolOutput = {
@@ -1559,7 +1564,8 @@ export async function runAgent(
                         isError: true,
                       };
                     } else {
-                      let value = (await hooks.readCommitFiles(toolCall.observedCommit))
+                      let value = (await hooks.readCommitFiles(
+                          workpieceId, toolCall.observedCommit))
                           .get(toolCall.input.filename);
                       if (value === undefined) {
                         throw new Error("File missing from its observed commit.");
@@ -2148,7 +2154,7 @@ export async function runAgent(
         let files: string[];
         let unpinnedHead = !pinnedGadgets.has(info.id) ? observeHead(info.id) : undefined;
         if (unpinnedHead !== undefined) {
-          files = [...(await hooks.readCommitFiles(unpinnedHead)).keys()];
+          files = [...(await hooks.readCommitFiles(info.id, unpinnedHead)).keys()];
         } else {
           files = [...(sessionContent.get(info.id)?.keys() ?? [])];
         }
@@ -2365,7 +2371,8 @@ export async function runAgent(
           if (!pinnedGadgets.has(resolved.workpieceId)) {
             let head = observeHead(resolved.workpieceId);
             if (head !== undefined) {
-              let fileContent = (await hooks.readCommitFiles(head)).get(filename);
+              let fileContent = (await hooks.readCommitFiles(
+                  resolved.workpieceId, head)).get(filename);
               if (fileContent === undefined) {
                 throw new Error("File does not exist.");
               }
@@ -2410,7 +2417,10 @@ export async function runAgent(
           if (!pinnedGadgets.has(resolved.workpieceId)) {
             let head = hooks.getGadgetHead(resolved.workpieceId);
             if (head !== undefined) {
-              pin = {baseCommit: head, baseFiles: await hooks.readCommitFiles(head)};
+              pin = {
+                baseCommit: head,
+                baseFiles: await hooks.readCommitFiles(resolved.workpieceId, head),
+              };
             }
           }
 
@@ -2471,11 +2481,14 @@ export async function runAgent(
             if (head !== undefined) {
               let observed = readFiles.get(filename);
               if (observed === undefined ||
-                  (await changedPaths(observed, head)).has(filename)) {
+                  (await changedPaths(resolved.workpieceId, observed, head)).has(filename)) {
                 throw new Error("The file's committed content has changed since you read it. " +
                     "Re-read the file and try again.");
               }
-              pin = {baseCommit: head, baseFiles: await hooks.readCommitFiles(head)};
+              pin = {
+                baseCommit: head,
+                baseFiles: await hooks.readCommitFiles(resolved.workpieceId, head),
+              };
             }
           }
 

@@ -19,6 +19,11 @@ export default defineConfig({
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
         },
+        bindings: {
+          ARTIFACTS_ACCOUNT_ID: 'test-account',
+          ARTIFACTS_NAMESPACE: 'test-namespace',
+          ARTIFACTS_API_TOKEN: 'test-token',
+        },
         r2Buckets: ['WORKSPACE_FILES'],
       },
     }),

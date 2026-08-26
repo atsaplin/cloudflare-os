@@ -28,7 +28,7 @@ class TestHarness {
   dirty: boolean[] = []
 
   readonly delegate: ChatOtClientDelegate = {
-    fetchCommitFiles: async (commitId: string) => {
+    fetchCommitFiles: async (_gadgetId: number, commitId: string) => {
       const files = this.commits.get(commitId)
       if (!files) throw new Error(`no such commit: ${commitId}`)
       return files

@@ -8,6 +8,14 @@ import { diffFiles, type CodeContent, type CodeChange }
   from "@gadgets/workshop-shared/code-change";
 import { keyString } from "@gadgets/typed-storage";
 import type { OverseerDurableObject } from "../src/overseer.js";
+import type { GitStore } from "../src/git-store";
+import type { WorkspaceActor } from "../src/workspace-repository";
+import type {
+  WorkspaceArtifactAcceptResult,
+  WorkspaceArtifactCanonical,
+  WorkspaceArtifactChatFork,
+  WorkspaceCodeRepository,
+} from "../src/workspace-artifacts";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -28,10 +36,115 @@ const USER_META = { profile: USER };
 const USER_DO_ID = "alice-user-do";
 
 let doCounter = 0;
+
+class TestWorkspaceCodeRepository implements WorkspaceCodeRepository {
+  readonly staged: Array<{chatId: string; epoch: number; gadgetIds: number[]}> = [];
+  readonly accepted: Array<{chatId: string; epoch: number}> = [];
+  readonly completed: Array<{chatId: string; epoch: number; head: string}> = [];
+  readonly #gitStore: GitStore;
+  readonly #gadgetHead: (gadgetId: number) => string | undefined;
+  readonly #forkHeads = new Map<string, string>();
+
+  constructor(gitStore: GitStore, gadgetHead: (gadgetId: number) => string | undefined) {
+    this.#gitStore = gitStore;
+    this.#gadgetHead = gadgetHead;
+  }
+
+  ensureCanonical(): Promise<WorkspaceArtifactCanonical> {
+    return Promise.resolve({
+      repositoryName: "test-workspace",
+      remote: "https://artifacts.test/workspace.git",
+      defaultBranch: "main",
+      head: "0".repeat(40),
+      rootId: "root",
+    });
+  }
+
+  async readGadgetFiles(gadgetId: number, ref: string): Promise<Map<string, string>> {
+    const files = await this.#gitStore.readCommitFiles(ref);
+    const prefix = `.workspace/gadgets/${gadgetId}/`;
+    const scoped = [...files].filter(([path]) => path.startsWith(prefix));
+    return scoped.length === 0 ? files
+      : new Map(scoped.map(([path, content]) => [path.slice(prefix.length), content]));
+  }
+
+  async changedGadgetPaths(
+      gadgetId: number, previousRef: string | undefined, currentRef: string | undefined)
+      : Promise<Set<string>> {
+    const [previous, current] = await Promise.all([
+      previousRef === undefined ? new Map<string, string>()
+        : this.readGadgetFiles(gadgetId, previousRef),
+      currentRef === undefined ? new Map<string, string>()
+        : this.readGadgetFiles(gadgetId, currentRef),
+    ]);
+    const changed = new Set<string>();
+    for (const path of new Set([...previous.keys(), ...current.keys()])) {
+      if (previous.get(path) !== current.get(path)) changed.add(path);
+    }
+    return changed;
+  }
+
+  async stageGadgetFiles(
+      chatId: string, epoch: number, actor: WorkspaceActor, message: string,
+      gadgets: ReadonlyMap<number, ReadonlyMap<string, string>>)
+      : Promise<WorkspaceArtifactChatFork> {
+    this.staged.push({ chatId, epoch, gadgetIds: [...gadgets.keys()] });
+    const files = new Map<string, string>();
+    for (const [gadgetId, gadgetFiles] of gadgets) {
+      for (const [path, content] of gadgetFiles) {
+        files.set(`.workspace/gadgets/${gadgetId}/${path}`, content);
+      }
+    }
+    const parents = [...new Set([...gadgets.keys()]
+      .map(gadgetId => this.#gadgetHead(gadgetId))
+      .filter((head): head is string => head !== undefined))];
+    const head = await this.#gitStore.writeFilesAsCommit(files, {
+      parents,
+      author: { name: actor.name, email: "workspace@test.invalid" },
+      message,
+      timestamp: new Date(1700000000_000),
+    });
+    this.#forkHeads.set(`${chatId}:${epoch}`, head);
+    return {
+      chatId,
+      epoch,
+      repositoryName: `test-${chatId}-${epoch}`,
+      remote: "https://artifacts.test/fork.git",
+      defaultBranch: "main",
+      baselineHead: parents[0] ?? "0".repeat(40),
+      latestHead: head,
+      sandboxId: `sandbox-${chatId}-${epoch}`,
+    };
+  }
+
+  acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult> {
+    this.accepted.push({ chatId, epoch });
+    const head = this.#forkHeads.get(`${chatId}:${epoch}`);
+    if (head === undefined) throw new Error("Test chat fork is missing.");
+    return Promise.resolve({ status: "merged", head });
+  }
+
+  completeAcceptedChatFork(chatId: string, epoch: number, head: string): Promise<void> {
+    this.completed.push({ chatId, epoch, head });
+    this.#forkHeads.delete(`${chatId}:${epoch}`);
+    return Promise.resolve();
+  }
+
+  discardChatFork(chatId: string, epoch: number): Promise<void> {
+    this.#forkHeads.delete(`${chatId}:${epoch}`);
+    return Promise.resolve();
+  }
+}
+
 async function withImpl(fn: (impl: any) => Promise<void>): Promise<void> {
   let stub = env.TEST_OVERSEER.getByName(`chat-changes-${++doCounter}`);
   await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
-    await fn((instance as unknown as { impl: any }).impl);
+    const impl = (instance as unknown as { impl: any }).impl;
+    impl.workspaceCodeRepository = new TestWorkspaceCodeRepository(
+      impl.gitStore,
+      (gadgetId: number) => impl.storage.gadgets.get(gadgetId)?.commitId,
+    );
+    await fn(impl);
   });
 }
 
@@ -438,9 +551,13 @@ describe("mergeChanges", () => {
 
     let head = impl.storage.gadgets.get(1)!.commitId!;
     expect(head).not.toBe(c1);
-    expect(await impl.gitStore.readCommitFiles(head))
+    expect(await impl.readCommitFiles(1, head))
         .toEqual(new Map([["a.txt", "one\nedited\n"]]));
     expect((await impl.gitStore.readCommitLog(head, { depth: 1 }))[0].parents).toEqual([c1]);
+    const repository: TestWorkspaceCodeRepository = impl.workspaceCodeRepository;
+    expect(repository.staged).toEqual([{ chatId: "1", epoch: 0, gadgetIds: [1] }]);
+    expect(repository.accepted).toEqual([{ chatId: "1", epoch: 0 }]);
+    expect(repository.completed).toEqual([{ chatId: "1", epoch: 0, head }]);
 
     let merges = chatMessages(impl, 1).filter(msg => msg.type === "merge");
     expect(merges).toHaveLength(1);
@@ -528,7 +645,7 @@ describe("mergeChanges", () => {
     expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
         .toEqual({ outcome: "merged" });
     let head = impl.storage.gadgets.get(1)!.commitId!;
-    expect(await impl.gitStore.readCommitFiles(head))
+    expect(await impl.readCommitFiles(1, head))
         .toEqual(new Map([["a.txt", "late\none\nfirst\n"]]));
   }));
 });
@@ -1040,7 +1157,7 @@ describe("updateChatFromMainline", () => {
     expect(await impl.mergeChanges(1, USER_META, "user-do-id"))
         .toEqual({ outcome: "merged" });
     let head = impl.storage.gadgets.get(1)!.commitId!;
-    expect(await impl.gitStore.readCommitFiles(head)).toEqual(new Map([
+    expect(await impl.readCommitFiles(1, head)).toEqual(new Map([
       ["a.txt", "chat\n"],
       ["b.txt", "mainline\n"],
     ]));

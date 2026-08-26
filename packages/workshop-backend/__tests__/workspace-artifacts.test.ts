@@ -138,6 +138,7 @@ class FakeArtifacts implements WorkspaceArtifactControlPlane {
 class FakeReader implements WorkspaceArtifactReader {
   readonly heads = new Map<string, string>();
   readonly files = new Map<string, Uint8Array>();
+  readonly listedFiles = new Map<string, string[]>();
   readonly listErrors = new Map<string, Error>();
   readonly listed: string[] = [];
 
@@ -145,11 +146,11 @@ class FakeReader implements WorkspaceArtifactReader {
     return Promise.resolve(this.heads.get(repoName));
   }
 
-  listFiles(repoName: string): Promise<string[]> {
+  listFiles(repoName: string, ref: string): Promise<string[]> {
     this.listed.push(repoName);
     const error = this.listErrors.get(repoName);
     if (error) return Promise.reject(error);
-    return Promise.resolve([]);
+    return Promise.resolve(this.listedFiles.get(`${repoName}:${ref}`) ?? []);
   }
 
   readFile(repoName: string, ref: string, path: string): Promise<Uint8Array> {
@@ -522,6 +523,45 @@ describe("ArtifactsWorkspaceRepository", () => {
           },
         ],
       }]);
+    });
+  });
+
+  it("compares one gadget subtree across workspace revisions", async () => {
+    await withLifecycle("gadget-diff", async (lifecycle, { reader }) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "alice", name: "Alice" });
+      const repository = new ArtifactsWorkspaceRepository({ lifecycle, reader });
+      const previous = "3".repeat(40);
+      const current = "4".repeat(40);
+      reader.listedFiles.set(`${canonical.repositoryName}:${previous}`, [
+        ".workspace/gadgets/7/client.js",
+        ".workspace/gadgets/7/removed.txt",
+        ".workspace/gadgets/8/server.js",
+      ]);
+      reader.listedFiles.set(`${canonical.repositoryName}:${current}`, [
+        ".workspace/gadgets/7/client.js",
+        ".workspace/gadgets/7/added.txt",
+        ".workspace/gadgets/8/server.js",
+      ]);
+      reader.files.set(
+        `${canonical.repositoryName}:${previous}:.workspace/gadgets/7/client.js`,
+        new TextEncoder().encode("same"),
+      );
+      reader.files.set(
+        `${canonical.repositoryName}:${previous}:.workspace/gadgets/7/removed.txt`,
+        new TextEncoder().encode("gone"),
+      );
+      reader.files.set(
+        `${canonical.repositoryName}:${current}:.workspace/gadgets/7/client.js`,
+        new TextEncoder().encode("same"),
+      );
+      reader.files.set(
+        `${canonical.repositoryName}:${current}:.workspace/gadgets/7/added.txt`,
+        new TextEncoder().encode("new"),
+      );
+
+      await expect(repository.changedGadgetPaths(7, previous, current)).resolves.toEqual(
+        new Set(["added.txt", "removed.txt"]),
+      );
     });
   });
 });

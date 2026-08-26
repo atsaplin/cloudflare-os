@@ -69,7 +69,10 @@ export interface RemoteFileEvent {
 /** How the client reaches the world. All callbacks may be invoked from async continuations. */
 export interface ChatOtClientDelegate {
   /** Read a commit's flattened file map (Overseer.getCodeAtCommit, cacheable by oid). */
-  fetchCommitFiles(commitId: string): Promise<ReadonlyMap<string, string>>
+  fetchCommitFiles(
+    gadgetId: WorkpieceId,
+    commitId: string,
+  ): Promise<ReadonlyMap<string, string>>
   /** Overseer.submitCodeChange for this chat. */
   submitCodeChange(submission: CodeChangeSubmission)
       : Promise<{ generation: number; revision: number }>
@@ -430,7 +433,7 @@ export class ChatOtClient {
           return false
         }
         // The fetch awaits; the synchronous tail below revalidates the stream position.
-        seeds.set(gadgetId, await this.#delegate.fetchCommitFiles(pin.baseCommit))
+        seeds.set(gadgetId, await this.#delegate.fetchCommitFiles(gadgetId, pin.baseCommit))
       } else if (this.#localSeeds.has(gadgetId)) {
         // Our own declaration's echo can arrive before the metadata that mirrors the pin; the
         // local seed is byte-identical to the declared base by construction.
@@ -646,7 +649,8 @@ export class ChatOtClient {
     const bases = new Map<WorkpieceId, ReadonlyMap<string, string>>()
     try {
       await Promise.all(codeBase.pins.map(async pin => {
-        bases.set(pin.gadgetId, await this.#delegate.fetchCommitFiles(pin.baseCommit))
+        bases.set(pin.gadgetId,
+          await this.#delegate.fetchCommitFiles(pin.gadgetId, pin.baseCommit))
       }))
     } catch (err) {
       if (!this.#disposed && !this.#fatal) {

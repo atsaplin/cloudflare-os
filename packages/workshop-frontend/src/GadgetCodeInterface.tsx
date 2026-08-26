@@ -77,14 +77,15 @@ const NO_PENDING_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 const commitFilesCache = new Map<string, Promise<ReadonlyMap<string, string>>>()
 
 function fetchCommitFiles(
-  overseer: RpcStub<Overseer>, commitId: string,
+  overseer: RpcStub<Overseer>, gadgetId: WorkpieceId, commitId: string,
 ): Promise<ReadonlyMap<string, string>> {
-  let cached = commitFilesCache.get(commitId)
+  const cacheKey = `${gadgetId}:${commitId}`
+  let cached = commitFilesCache.get(cacheKey)
   if (!cached) {
-    cached = overseer.getCodeAtCommit(commitId).then(
+    cached = overseer.getCodeAtCommit(gadgetId, commitId).then(
       ({ files }) => new Map(files) as ReadonlyMap<string, string>)
-    cached.catch(() => commitFilesCache.delete(commitId))
-    commitFilesCache.set(commitId, cached)
+    cached.catch(() => commitFilesCache.delete(cacheKey))
+    commitFilesCache.set(cacheKey, cached)
   }
   return cached
 }
@@ -201,7 +202,7 @@ export default function GadgetCodeInterface({
     setHeadLoadFailed(false)
     if (headCommitId === undefined) return
     let cancelled = false
-    fetchCommitFiles(overseer, headCommitId)
+    fetchCommitFiles(overseer, workpieceId, headCommitId)
       .then(files => {
         if (!cancelled) setHeadFilesState({ commitId: headCommitId, files })
       })
@@ -212,7 +213,7 @@ export default function GadgetCodeInterface({
         setHeadLoadFailed(true)
       })
     return () => { cancelled = true }
-  }, [headCommitId, overseer, headRetryToken])
+  }, [headCommitId, overseer, workpieceId, headRetryToken])
 
   // The committed files currently applicable: an absent head reads as an empty committed file
   // set (the gadget is still pending in a chat); null while the head's tree is still loading.
@@ -278,7 +279,8 @@ export default function GadgetCodeInterface({
     }
     const chatId = selectedChatId
     const client = new ChatOtClient({
-      fetchCommitFiles: commitId => fetchCommitFiles(currentOverseerRef.current, commitId),
+      fetchCommitFiles: (gadgetId, commitId) =>
+        fetchCommitFiles(currentOverseerRef.current, gadgetId, commitId),
       submitCodeChange: submission =>
         currentOverseerRef.current.submitCodeChange(chatId, submission),
       isTransientError: isTransientRpcError,
