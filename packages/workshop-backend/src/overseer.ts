@@ -3138,8 +3138,8 @@ class OverseerImpl implements AgentHooks {
       let prefetchPin = async (gadgetId: WorkpieceId, baseCommit: string) => {
         if (pinData.has(`${gadgetId}:${baseCommit}`)) return;
         let record = this.storage.gadgets.get(gadgetId);
-        let head = record?.commitId;
-        if (head === undefined) return;  // validated (and rejected) in the sync tail
+        if (record?.commitId === undefined) return;  // validated (and rejected) in the sync tail
+        let head = record.commitId;
         pinData.set(`${gadgetId}:${baseCommit}`, {
           head,
           previousHead: record.previousCommitId,
