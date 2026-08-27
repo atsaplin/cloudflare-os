@@ -10,6 +10,10 @@ const EXPECTED_RPC_ERROR_CODES = new Set([
   "WORKSPACE_FILE_INVALID_REQUEST",
   "WORKSPACE_FILE_UPLOAD_UNAVAILABLE",
 ]);
+const EXPECTED_RPC_ERROR_MESSAGES = new Set([
+  "Only the workspace owner can delete it.",
+  "You can only remove users that you added.",
+]);
 
 export default defineConfig({
   esbuild: {
@@ -46,6 +50,7 @@ export default defineConfig({
     onUnhandledError(error) {
       const code = "code" in error ? error.code : undefined;
       if (typeof code === "string" && EXPECTED_RPC_ERROR_CODES.has(code)) return false;
+      if (error.message && EXPECTED_RPC_ERROR_MESSAGES.has(error.message)) return false;
       // The reset-recovery tests abort every Durable Object mid-session; capabilities that were
       // held across the abort (e.g. the fire-and-forget AdminSettings install kicked off by the
       // fetch handler) reject on their own schedule, independent of any awaited call.

@@ -1528,8 +1528,11 @@ export type WorkspaceRights = readonly WorkspaceRight[];
 
 /** Returns the workspace rights for a recognized workspace role, defaulting to deny. */
 export function workspaceRightsForRole(role: unknown): WorkspaceRights {
-  if (role === "owner" || role === "build") {
+  if (role === "owner") {
     return ["read", "write", "execute", "manage"];
+  }
+  if (role === "build") {
+    return ["read", "write", "execute"];
   }
   return [];
 }

@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, FileRef, WriteTarget, WorkspaceFileMutationRequest, WorkspaceFileMutationResponse, WorkspaceFileNode, WorkspaceFileRevision, WorkspaceFileUpload, WorkspaceFileUploadRequest, workspaceRightsForRole, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, createWorkspaceFileError, WORKSPACE_FILE_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, FileRef, WriteTarget, WorkspaceAccessRole, WorkspaceFileMutationRequest, WorkspaceFileMutationResponse, WorkspaceFileNode, WorkspaceFileRevision, WorkspaceFileUpload, WorkspaceFileUploadRequest, workspaceRightsForRole, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, createWorkspaceFileError, WORKSPACE_FILE_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, composeCodeChange, diffFiles, transformCodeChange,
   validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -8690,7 +8690,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       })();
     }
 
-    const workspaceRole = isOwner ? "owner" : role;
+    const workspaceRole: WorkspaceAccessRole = isOwner ? "owner" : role;
     if (!workspaceRightsForRole(workspaceRole).includes("read")) {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
@@ -8698,7 +8698,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     return new OverseerClientInterface(
-        this.impl, profileId, userId, isOwner, notifyClosed.dup(),
+        this.impl, profileId, userId, workspaceRole, notifyClosed.dup(),
         ensureCapsules);
   }
 
@@ -9368,7 +9368,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   constructor(private impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
-              private isOwner: boolean,
+              private workspaceRole: WorkspaceAccessRole,
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
               // this so ambient providers are attached when possible.
@@ -9406,7 +9406,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   // Per-session caller identity for the SharingManager.
   #sharingCaller(): SharingCaller {
-    return { profileId: this.clientProfileId, isOwner: this.isOwner };
+    return { profileId: this.clientProfileId, isOwner: this.#canManageWorkspace() };
+  }
+
+  #isWorkspaceOwner(): boolean {
+    return this.workspaceRole === "owner";
+  }
+
+  #canManageWorkspace(): boolean {
+    return workspaceRightsForRole(this.workspaceRole).includes("manage");
   }
 
   async #getClientProfile(): Promise<AiChatAuthorInfo> {
@@ -9478,7 +9486,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       role: "build",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
-    if (!this.isOwner) {
+    if (!this.#isWorkspaceOwner()) {
       result.owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
     }
     return result;
@@ -9569,7 +9577,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     // For collaborators, include owner info.
-    if (!this.isOwner) {
+    if (!this.#isWorkspaceOwner()) {
       metadata.owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
     }
 
@@ -9698,7 +9706,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async deleteSelf(): Promise<void> {
-    if (!this.isOwner) {
+    if (!this.#canManageWorkspace()) {
       throw new Error("Only the workspace owner can delete it.");
     }
     let startedAt = Date.now();

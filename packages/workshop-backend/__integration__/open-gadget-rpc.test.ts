@@ -321,6 +321,29 @@ describe("workspace filesystem initialization", () => {
     expect(getWorkspaceFileErrorCode(error)).toBe(WORKSPACE_FILE_ERROR_CODES.accessDenied);
   });
 
+  it("lets build collaborators use files without owner management rights", async () => {
+    using publicApi = await connect();
+    const owner = await createAccount(publicApi, "workspacebuildowner");
+    const builder = await createAccount(publicApi, "workspacebuilder");
+    const peer = await createAccount(publicApi, "workspacebuildpeer");
+    using ownerApi = await publicApi.authenticate(owner.token);
+    using builderApi = await publicApi.authenticate(builder.token);
+    using workspace = await ownerApi.newGadget();
+    const metadata = await workspace.getMetadata();
+    await workspace.addCollaborator(builder.username, "build");
+    const addedPeer = await workspace.addCollaborator(peer.username, "use");
+    if (!addedPeer) throw new Error("Expected the peer account to exist.");
+
+    using builderWorkspace = builderApi.openGadget(metadata.id);
+    expect((await builderWorkspace.getWorkspaceRevision({ kind: "accepted" })).workspaceId)
+      .toBe(metadata.id);
+    expect((await rejection(builderWorkspace.removeCollaborator(addedPeer.profile.id, []))).message)
+      .toBe("You can only remove users that you added.");
+    expect((await rejection(builderWorkspace.deleteSelf())).message)
+      .toBe("Only the workspace owner can delete it.");
+    expect((await workspace.getMetadata()).id).toBe(metadata.id);
+  });
+
   it("keeps chat-target mutations isolated and validates chat epochs through RPC", async () => {
     using publicApi = await connect();
     const account = await createAccount(publicApi, "workspacefilechat");

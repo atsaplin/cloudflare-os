@@ -120,7 +120,7 @@ describe("workspace public contracts", () => {
     const roles: WorkspaceAccessRole[] = ["owner", "build", "use"];
     expect(roles).toEqual(["owner", "build", "use"]);
     expect(workspaceRightsForRole("owner")).toEqual(["read", "write", "execute", "manage"]);
-    expect(workspaceRightsForRole("build")).toEqual(["read", "write", "execute", "manage"]);
+    expect(workspaceRightsForRole("build")).toEqual(["read", "write", "execute"]);
     expect(workspaceRightsForRole("use")).toEqual([]);
     expect(workspaceRightsForRole("admin")).toEqual([]);
   });
