@@ -36,6 +36,13 @@ describe('classifyWorkspaceFile', () => {
     )).toEqual({ kind: 'text', text: 'FROM node:24\n' })
   })
 
+  it('opens unknown valid UTF-8 as plain text despite an unfamiliar media type', () => {
+    expect(classifyWorkspaceFile(
+      file('custom.data', 'application/x-custom'),
+      new TextEncoder().encode('plain text'),
+    )).toEqual({ kind: 'text', text: 'plain text' })
+  })
+
   it('opens SVG source as text even though its media type is image', () => {
     expect(classifyWorkspaceFile(
       file('icon.svg', 'image/svg+xml'),

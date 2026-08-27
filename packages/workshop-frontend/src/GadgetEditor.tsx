@@ -631,6 +631,10 @@ export default function GadgetEditor() {
   // ── code / chat state ────────────────────────────────────────────────────────
   const [uiReloadTrigger, setUiReloadTrigger] = useState(0)
   const [autoApproveReloadTrigger, setAutoApproveReloadTrigger] = useState(0)
+  const [workspaceFilesRefreshToken, setWorkspaceFilesRefreshToken] = useState(0)
+  const invalidateWorkspaceFiles = useCallback(() => {
+    setWorkspaceFilesRefreshToken(token => token + 1)
+  }, [])
   // The selected chat's code-branch snapshot (see ChatCodeChanges in ChatInterface): its code
   // base and the current epoch's recorded changes, plumbed from the chat subscription into the
   // code view, which layers them over the per-pin commit-derived doc base.
@@ -1772,6 +1776,7 @@ export default function GadgetEditor() {
                   onAutoApproveChange={() => setAutoApproveReloadTrigger(t => t + 1)}
                   onHasAnyCodeChange={setHasAnyProposedChanges}
                   onSelectedChatHasProposedChangesChange={setSelectedChatHasProposedChanges}
+                  onWorkspaceFilesInvalidated={invalidateWorkspaceFiles}
                   onOpenGadget={handleSelectWorkpiece}
                   outputOfWorkpiece={outputOfWorkpiece}
                 />
@@ -2004,6 +2009,7 @@ export default function GadgetEditor() {
               <WorkspaceFilesPanel
                 overseer={overseer.stub}
                 target={workspaceFileTarget}
+                refreshToken={workspaceFilesRefreshToken}
                 selectedNodeId={selectedFileId}
                 selectedRevision={selectedFileRevision}
                 onSelectionChange={handleWorkspaceFileSelection}

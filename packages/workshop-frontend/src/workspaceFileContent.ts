@@ -60,8 +60,6 @@ export function classifyWorkspaceFile(
 
   const preview = binaryPreview(mediaType)
   if (preview) return { kind: 'binary', preview }
-  if (text !== undefined && (mediaType === undefined || mediaType === 'application/octet-stream')) {
-    return { kind: 'text', text }
-  }
+  if (text !== undefined) return { kind: 'text', text }
   return { kind: 'binary', preview: 'download' }
 }

@@ -6,6 +6,8 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import {
+  createWorkspaceFileError,
+  WORKSPACE_FILE_ERROR_CODES,
   type Overseer,
   type WorkspaceFileNode,
 } from '@gadgets/workshop-shared/api'
@@ -16,6 +18,15 @@ function revision(head: string) {
   return {
     workspaceId: WORKSPACE_ID,
     revision: { kind: 'accepted' as const, commit: head },
+    head,
+    rootId: 'root',
+  }
+}
+
+function chatRevision(head: string) {
+  return {
+    workspaceId: WORKSPACE_ID,
+    revision: { kind: 'chat' as const, chatId: 0, epoch: 0, commit: head },
     head,
     rootId: 'root',
   }
@@ -98,6 +109,64 @@ function node(overrides: Partial<WorkspaceFileNode>): WorkspaceFileNode {
 }
 
 describe('WorkspaceFilesPanel', () => {
+  it('reloads the same chat target after a command closes its pending fork', async () => {
+    const initial = chatRevision('a'.repeat(40))
+    const reset = chatRevision('b'.repeat(40))
+    const target = { kind: 'chat' as const, chatId: 0, epoch: 0 }
+    const file = node({ id: 'file', name: 'discarded.txt', path: 'discarded.txt' })
+    const getWorkspaceRevision = vi.fn<Overseer['getWorkspaceRevision']>()
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(reset)
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([file])
+      .mockResolvedValueOnce([])
+    const getWorkspaceNode = vi.fn<Overseer['getWorkspaceNode']>(async request => {
+      if (request.revision.commit === initial.head) return file
+      throw createWorkspaceFileError(WORKSPACE_FILE_ERROR_CODES.invalidRequest)
+    })
+    const onSelectionChange = vi.fn<(
+      nodeId: string | undefined,
+      revision: string | undefined,
+    ) => void>()
+    const overseer = {
+      getWorkspaceRevision,
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      getWorkspaceNode,
+    } as unknown as RpcStub<Overseer>
+
+    await act(async () => root.render(
+      <WorkspaceFilesPanel
+        overseer={overseer}
+        target={target}
+        selectedNodeId="file"
+        refreshToken={0}
+        onSelectionChange={onSelectionChange}
+      />,
+    ))
+    await act(async () => {})
+    expect(container.textContent).toContain('Open discarded.txt')
+
+    await act(async () => root.render(
+      <WorkspaceFilesPanel
+        overseer={overseer}
+        target={target}
+        selectedNodeId="file"
+        refreshToken={1}
+        onSelectionChange={onSelectionChange}
+      />,
+    ))
+    await act(async () => {})
+
+    expect(getWorkspaceRevision).toHaveBeenCalledTimes(2)
+    expect(listWorkspaceChildren).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      revision: expect.objectContaining({ commit: reset.head }),
+    }))
+    expect(container.textContent).toContain('This folder is empty.')
+    expect(container.querySelector('[data-testid="workspace-file-editor"]')).toBeNull()
+    expect(onSelectionChange).toHaveBeenCalledWith(undefined, undefined)
+  })
+
   it('moves a file by dragging its stable node onto a folder', async () => {
     const documents = node({ id: 'docs', kind: 'folder', name: 'Documents', size: 0 })
     const report = node({ id: 'report', name: 'report.txt', path: 'report.txt' })

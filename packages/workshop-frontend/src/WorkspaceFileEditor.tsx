@@ -99,11 +99,17 @@ function useLoadedFile(
 ): { loaded: LoadedFile | null; error: string | null } {
   const [loaded, setLoaded] = useState<LoadedFile | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const loadedCurrentNodeIdRef = useRef<string | null>(null)
   const commit = selectedCommit ?? revision.head
 
   useEffect(() => {
     let cancelled = false
-    setLoaded(null)
+    const preserveCurrentFile = selectedCommit === undefined &&
+      loadedCurrentNodeIdRef.current === node.id
+    if (!preserveCurrentFile) {
+      loadedCurrentNodeIdRef.current = null
+      setLoaded(null)
+    }
     setError(null)
     const reference = referenceAt(revision, node.id, commit)
     const selectedHistory = history.find(item => item.oid === commit)
@@ -113,6 +119,7 @@ function useLoadedFile(
       readTextIfPresent(overseer, revision, node.id, selectedHistory?.parents[0]),
     ]).then(([selectedNode, bytes, parentText]) => {
       if (cancelled) return
+      loadedCurrentNodeIdRef.current = selectedCommit === undefined ? selectedNode.id : null
       setLoaded({
         node: selectedNode,
         bytes,
@@ -347,6 +354,7 @@ export default function WorkspaceFileEditor({
 
   useEffect(() => {
     if (loaded?.content.kind !== 'text') return
+    if (selectedCommit === undefined && loaded.commit !== revision.head) return
     const identity = `${loaded.node.id}:${selectedCommit ?? 'current'}`
     const preserveDirtyBuffer = editorIdentityRef.current === identity &&
       dirtyRef.current && selectedCommit === undefined

@@ -23,6 +23,7 @@ import WorkspaceFileEditor from './WorkspaceFileEditor'
 interface WorkspaceFilesPanelProps {
   overseer: RpcStub<Overseer>
   target?: WriteTarget | null
+  refreshToken?: number
   selectedNodeId?: string
   selectedRevision?: string
   onSelectionChange?(nodeId: string | undefined, revision: string | undefined): void
@@ -76,6 +77,7 @@ async function stageUploadChange(
 export default function WorkspaceFilesPanel({
   overseer,
   target,
+  refreshToken = 0,
   selectedNodeId,
   selectedRevision,
   onSelectionChange,
@@ -180,7 +182,7 @@ export default function WorkspaceFilesPanel({
         if (!cancelled) setLoading(false)
       })
     return () => { cancelled = true }
-  }, [activeTarget, folderReference, loadAttempt, overseer])
+  }, [activeTarget, folderReference, loadAttempt, overseer, refreshToken])
 
   useEffect(() => {
     if (!selectedNodeId) return
