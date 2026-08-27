@@ -639,6 +639,58 @@ describe("chat workspace files", () => {
     });
   }));
 
+  it("serializes workspace mutations with chat epoch transitions", () =>
+    withImpl(async impl => {
+      addChat(impl, 1);
+      let releaseMutation: (() => void) | undefined;
+      const mutationCanFinish = new Promise<void>(resolve => {
+        releaseMutation = resolve;
+      });
+      let mutationStarted: (() => void) | undefined;
+      const mutationDidStart = new Promise<void>(resolve => {
+        mutationStarted = resolve;
+      });
+      impl.workspaceRepository.runChatOperation = async () => {
+        mutationStarted?.();
+        await mutationCanFinish;
+        return {
+          kind: "mkdir",
+          head: "a".repeat(40),
+          path: "notes",
+          changed: true,
+          nodeId: "00000000-0000-4000-8000-000000000401",
+        };
+      };
+
+      const mutation = impl.runWorkspaceFileOperation(
+        1,
+        "tool-workspace",
+        AGENT,
+        { kind: "mkdir", path: "notes" },
+      );
+      await mutationDidStart;
+
+      let transitionEntered = false;
+      let transitionSawPending = false;
+      const transition = impl.withChatLock(1, async () => {
+        transitionEntered = true;
+        const meta = impl.storage.chatMeta.get(1)!;
+        transitionSawPending = meta.hasWorkspaceFileChanges === true &&
+          meta.hasProposedChanges === true;
+        meta.codeBase = { ...impl.chatCodeBase(meta), epoch: 99 };
+        impl.storage.chatMeta.put(meta);
+      });
+      await Promise.resolve();
+      const enteredBeforeCommitFinished = transitionEntered;
+      releaseMutation?.();
+
+      const [mutationResult, transitionResult] = await Promise.allSettled([mutation, transition]);
+      expect(mutationResult.status).toBe("fulfilled");
+      expect(transitionResult.status).toBe("fulfilled");
+      expect(enteredBeforeCommitFinished).toBe(false);
+      expect(transitionSawPending).toBe(true);
+    }));
+
   it("accepts a workspace-only fork and clears the pending projection", () =>
     withImpl(async impl => {
       addChat(impl, 1);

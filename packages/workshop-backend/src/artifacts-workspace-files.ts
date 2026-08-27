@@ -149,6 +149,7 @@ export interface WorkspaceFileRepository {
   getTargetRevision(target: WriteTarget): Promise<WorkspaceRevision>;
   list(folderId: string): Promise<WorkspaceRepositoryNode[]>;
   listFileRef(reference: FileRef): Promise<WorkspaceRepositoryNode[]>;
+  getFileRef(reference: FileRef): Promise<WorkspaceRepositoryNode>;
   readFileStream(nodeId: string): Promise<ReadableStream<Uint8Array>>;
   readFileRef(reference: FileRef): Promise<Uint8Array>;
   readFileRefStream(reference: FileRef): Promise<ReadableStream<Uint8Array>>;
@@ -1406,6 +1407,10 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       }
       return listWorkspaceChildren(revision.index, node.id);
     });
+  }
+
+  getFileRef(reference: FileRef): Promise<WorkspaceRepositoryNode> {
+    return this.#withLock(async () => (await this.#resolveNodeRef(reference)).node);
   }
 
   async readFile(nodeId: string): Promise<Uint8Array> {

@@ -15,9 +15,9 @@ import { codeEditorTheme, monoFont } from './components/codeTheme'
 import { getLanguage } from './getLanguage'
 import { useTheme } from './ThemeContext'
 
-// The code view's plain editor: CodeMirror 6, either read-only (the committed head view) or
-// bound to the chat's OT client through an EditSession. In-chat diff presentation lives in
-// CodeDiffEditor, which reuses this module's session wiring.
+// The code view's plain editor: CodeMirror 6, read-only, controlled, or bound to the chat's OT
+// client through an EditSession. In-chat diff presentation lives in CodeDiffEditor, which reuses
+// this module's session wiring.
 
 /**
  * An editable file's connection to the chat's OT client (see GadgetCodeInterface): the editor
@@ -34,12 +34,16 @@ export interface EditSession {
   subscribeRemote(cb: (change: FileChange) => void): () => void
 }
 
-interface CodeEditorProps {
+export interface CodeEditorProps {
   filename: string | null
-  /** The file's text when no session applies (read-only views). Ignored when session is set. */
+  /** The file's text when no session applies. Ignored when session is set. */
   text?: string | null
   /** Editable OT-bound session; absent = read-only text view. */
   session?: EditSession
+  /** Called with the complete text after a local edit when no session applies. */
+  onTextChange?: (text: string) => void
+  /** Called when the user presses Mod-s. */
+  onSave?: () => void
   readOnly?: boolean
   height?: string | number
 }
@@ -59,6 +63,17 @@ export function sessionChangeListener(getSession: () => EditSession | undefined)
     if (update.transactions.every(tr => tr.annotation(remoteChange) !== true)) {
       getSession()?.applyLocal(
         { edit: update.changes.toJSON() as TextChange }, update.state.doc.toString())
+    }
+  })
+}
+
+function controlledChangeListener(
+  getOnTextChange: () => ((text: string) => void) | undefined,
+): Extension {
+  return EditorView.updateListener.of(update => {
+    if (!update.docChanged) return
+    if (update.transactions.every(tr => tr.annotation(remoteChange) !== true)) {
+      getOnTextChange()?.(update.state.doc.toString())
     }
   })
 }
@@ -105,7 +120,7 @@ export function setDocText(view: EditorView, text: string) {
 }
 
 export default function CodeEditor({
-  filename, text = null, session, readOnly = false, height = '100%',
+  filename, text = null, session, onTextChange, onSave, readOnly = false, height = '100%',
 }: CodeEditorProps) {
   const { resolvedThemeMode } = useTheme()
   const hostRef = useRef<HTMLDivElement | null>(null)
@@ -114,12 +129,20 @@ export default function CodeEditor({
   const readOnlyCompartment = useRef(new Compartment())
   const sessionRef = useRef(session)
   sessionRef.current = session
+  const textRef = useRef(text)
+  textRef.current = text
+  const onTextChangeRef = useRef(onTextChange)
+  onTextChangeRef.current = onTextChange
+  const onSaveRef = useRef(onSave)
+  onSaveRef.current = onSave
 
   const sessionKey = session?.key
   const themeModeRef = useRef(resolvedThemeMode)
   themeModeRef.current = resolvedThemeMode
   const readOnlyRef = useRef(readOnly)
   readOnlyRef.current = readOnly
+  const controlled = onTextChange !== undefined
+  const saveEnabled = onSave !== undefined
 
   // (Re)build the editor whenever the document's identity changes: the file, the session (or
   // its key -- a chat switch or client rebuild), or the absence of one.
@@ -127,7 +150,8 @@ export default function CodeEditor({
     const host = hostRef.current
     if (!host || filename === null) return
 
-    const doc = session ? (session.getText() ?? '') : (text ?? '')
+    const currentSession = sessionRef.current
+    const doc = currentSession ? (currentSession.getText() ?? '') : (textRef.current ?? '')
     const extensions: Extension[] = [
       // Split documents only on "\n" so CR and CRLF sequences survive the round trip: the OT
       // stream's changes are offsets into the exact stored text, and CodeMirror's default splitter
@@ -152,13 +176,26 @@ export default function CodeEditor({
                  indentWithTab]),
       themeCompartment.current.of(codeEditorTheme(themeModeRef.current)),
       readOnlyCompartment.current.of([
-        EditorState.readOnly.of(readOnlyRef.current || !session),
-        EditorView.editable.of(!readOnlyRef.current && !!session),
+        EditorState.readOnly.of(readOnlyRef.current || (!currentSession && !controlled)),
+        EditorView.editable.of(!readOnlyRef.current && (!!currentSession || controlled)),
       ]),
       getLanguage(filename),
     ]
-    if (session) {
+    if (saveEnabled) {
+      extensions.push(keymap.of([{
+        key: 'Mod-s',
+        run: () => {
+          if (!readOnlyRef.current && (sessionRef.current || onTextChangeRef.current)) {
+            onSaveRef.current?.()
+          }
+          return true
+        },
+      }]))
+    }
+    if (currentSession) {
       extensions.push(sessionChangeListener(() => sessionRef.current))
+    } else if (controlled) {
+      extensions.push(controlledChangeListener(() => onTextChangeRef.current))
     }
 
     const view = new EditorView({
@@ -167,25 +204,21 @@ export default function CodeEditor({
     })
     viewRef.current = view
 
-    const unsubscribe = session ? connectSessionRemote(view, session) : undefined
+    const unsubscribe = currentSession ? connectSessionRemote(view, currentSession) : undefined
 
     return () => {
       unsubscribe?.()
       view.destroy()
       viewRef.current = null
     }
-    // `session` object identity may change per render; sessionKey captures the real identity.
-    // Likewise `text` only matters at build time in session mode; in read-only mode the sync
-    // effect below tracks it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filename, sessionKey, session === undefined])
+  }, [filename, sessionKey, controlled, saveEnabled])
 
-  // Read-only views track the text prop in place (no state rebuild, keeps scroll position).
+  // Text-only views track the text prop in place, which keeps scroll position.
   useEffect(() => {
     const view = viewRef.current
-    if (!view || session !== undefined) return
+    if (!view || sessionRef.current !== undefined) return
     setDocText(view, text ?? '')
-  }, [text, session])
+  }, [text, sessionKey])
 
   // Theme and read-only flips reconfigure in place.
   useEffect(() => {
@@ -196,11 +229,11 @@ export default function CodeEditor({
   useEffect(() => {
     viewRef.current?.dispatch({
       effects: readOnlyCompartment.current.reconfigure([
-        EditorState.readOnly.of(readOnly || !session),
-        EditorView.editable.of(!readOnly && !!session),
+        EditorState.readOnly.of(readOnly || (sessionKey === undefined && !controlled)),
+        EditorView.editable.of(!readOnly && (sessionKey !== undefined || controlled)),
       ]),
     })
-  }, [readOnly, session === undefined])
+  }, [readOnly, sessionKey, controlled])
 
   if (!filename) {
     return (

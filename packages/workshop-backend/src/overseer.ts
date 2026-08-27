@@ -3088,29 +3088,47 @@ class OverseerImpl implements AgentHooks {
     author: AiChatAuthorInfo,
     operation: ChatWorkspaceOperation,
   ): Promise<ChatWorkspaceOperationResult> {
-    const meta = this.getChatMetaOrThrow(chatId);
-    const codeBase = this.chatCodeBase(meta);
-    const result = await this.workspaceRepository.runChatOperation({
-      chatId: String(chatId),
-      epoch: codeBase.epoch ?? 0,
-      operationId,
-      actor: { id: author.id, name: author.name },
-      timestamp: new Date().toISOString(),
-      operation,
+    return this.runChatWorkspaceFileMutation(chatId, undefined, async epoch => {
+      const result = await this.workspaceRepository.runChatOperation({
+        chatId: String(chatId),
+        epoch,
+        operationId,
+        actor: { id: author.id, name: author.name },
+        timestamp: new Date().toISOString(),
+        operation,
+      });
+      return { result, changed: "changed" in result && result.changed };
     });
-    if ("changed" in result && result.changed) {
-      const fresh = this.getChatMetaOrThrow(chatId);
-      const freshCodeBase = this.chatCodeBase(fresh);
-      if (freshCodeBase.generation !== codeBase.generation ||
-          (freshCodeBase.epoch ?? 0) !== (codeBase.epoch ?? 0)) {
-        throw new Error("Chat changed during a workspace file operation.");
+  }
+
+  async runChatWorkspaceFileMutation<T>(
+    chatId: number,
+    expectedEpoch: number | undefined,
+    operation: (epoch: number) => Promise<{ result: T; changed: boolean }>,
+  ): Promise<T> {
+    return this.withChatLock(chatId, async () => {
+      const epoch = this.chatCodeBase(this.getChatMetaOrThrow(chatId)).epoch ?? 0;
+      if (expectedEpoch !== undefined && epoch !== expectedEpoch) {
+        throw new WorkspaceRepositoryExpectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          `Workspace chat ${chatId} is at epoch ${epoch}, not ${expectedEpoch}.`,
+        );
       }
-      fresh.hasWorkspaceFileChanges = true;
-      fresh.hasProposedChanges = true;
-      this.storage.chatMeta.put(fresh);
-      this.proposedChangesChanged(chatId);
+      const { result, changed } = await operation(epoch);
+      if (changed) this.markChatWorkspaceFilesChanged(chatId, epoch);
+      return result;
+    });
+  }
+
+  markChatWorkspaceFilesChanged(chatId: number, expectedEpoch: number): void {
+    const fresh = this.getChatMetaOrThrow(chatId);
+    if ((this.chatCodeBase(fresh).epoch ?? 0) !== expectedEpoch) {
+      throw new Error("Chat changed during a workspace file operation.");
     }
-    return result;
+    fresh.hasWorkspaceFileChanges = true;
+    fresh.hasProposedChanges = true;
+    this.storage.chatMeta.put(fresh);
+    this.proposedChangesChanged(chatId);
   }
 
   async #checkpointAgentChange(
@@ -9513,6 +9531,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }));
   }
 
+  async getWorkspaceNode(reference: FileRef): Promise<WorkspaceFileNode> {
+    this.#requireWorkspaceFileReference(reference);
+    await this.#ensureWorkspaceRepository();
+    const node = await this.impl.workspaceRepository.getFileRef(reference);
+    return {
+      ...node,
+      createdAt: new Date(node.createdAt),
+      updatedAt: new Date(node.updatedAt),
+    };
+  }
+
   async readWorkspaceFile(file: FileRef): Promise<ReadableStream<Uint8Array>> {
     this.#requireWorkspaceFileReference(file);
     await this.#ensureWorkspaceRepository();
@@ -9542,12 +9571,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     const target = this.#parseWorkspaceTarget(request.target);
     const profile = await this.#getClientProfile();
     try {
-      return await this.impl.workspaceRepository.applyStaged({
-        ...request,
-        target,
-        actor: { id: profile.id, name: profile.name },
-        timestamp: new Date().toISOString(),
-      });
+      const apply = () => this.impl.workspaceRepository.applyStaged({
+          ...request,
+          target,
+          actor: { id: profile.id, name: profile.name },
+          timestamp: new Date().toISOString(),
+        });
+      if (target.kind !== "chat") return await apply();
+      return await this.impl.runChatWorkspaceFileMutation(
+        target.chatId,
+        target.epoch,
+        async () => {
+          const result = await apply();
+          return { result, changed: result.outcome === "applied" };
+        },
+      );
     } catch (error) {
       if (error instanceof WorkspaceRepositoryConflictError) {
         return {
@@ -11083,6 +11121,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#denyWorkspaceFiles();
   }
   async listWorkspaceChildren(_folder: FileRef): Promise<WorkspaceFileNode[]> {
+    this.#denyWorkspaceFiles();
+  }
+  async getWorkspaceNode(_reference: FileRef): Promise<WorkspaceFileNode> {
     this.#denyWorkspaceFiles();
   }
   async readWorkspaceFile(_file: FileRef): Promise<ReadableStream<Uint8Array>> {

@@ -39,6 +39,7 @@ export function getLanguage(filename: string): Extension {
     case 'css':
       return css()
     case 'md':
+    case 'mdx':
       return markdown()
     case 'py':
       return python()

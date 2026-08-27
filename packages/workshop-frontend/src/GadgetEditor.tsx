@@ -30,6 +30,7 @@ import {
   WorkpieceId,
   WorkpieceSummary,
   BlueprintOutput,
+  WriteTarget,
   WorkpiecesSubscriber,
 } from '@gadgets/workshop-shared/api'
 import ObserverConfigModal from './ObserverConfigModal'
@@ -444,8 +445,17 @@ export default function GadgetEditor() {
   const navigate = useNavigate()
   const { authenticatedApi } = useAuthenticatedApi()
 
-  const { chat: chatParam, w: workpieceParam } = useSearch({ strict: false }) as
-    { chat?: number; w?: number }
+  const {
+    chat: chatParam,
+    w: workpieceParam,
+    file: selectedFileId,
+    revision: selectedFileRevision,
+  } = useSearch({ strict: false }) as {
+    chat?: number
+    w?: number
+    file?: string
+    revision?: string
+  }
   const urlChatId = chatParam !== undefined ? chatParam : null
   const urlWorkpieceId = workpieceParam !== undefined ? workpieceParam : null
 
@@ -659,6 +669,17 @@ export default function GadgetEditor() {
   // not caught up yet. As soon as merged code exists, dropping back to the chat
   // list should become possible.
   const effectiveSelectedChatId = selectedChatId ?? (pinInitialChatSelection ? 0 : null)
+  const workspaceFileChatId = chatChanges?.chatId
+  const workspaceFileEpoch = chatChanges?.codeBase?.epoch ?? 0
+  const workspaceFileTarget = useMemo<WriteTarget | null>(() => {
+    if (effectiveSelectedChatId === null) return { kind: 'accepted' }
+    if (workspaceFileChatId !== effectiveSelectedChatId) return null
+    return {
+      kind: 'chat',
+      chatId: effectiveSelectedChatId,
+      epoch: workspaceFileEpoch,
+    }
+  }, [effectiveSelectedChatId, workspaceFileChatId, workspaceFileEpoch])
 
   // ── workpiece selection ──────────────────────────────────────────────────────
   const allGadgets = useMemo(() => {
@@ -1045,6 +1066,26 @@ export default function GadgetEditor() {
   }, [id, selectedGadgetId, setWorkspaceVisibility, workspaceView?.mode])
 
   useEffect(() => {
+    if (!selectedFileId || workspaceView?.mode === 'files') return
+    handleTabSelect('files')
+  }, [handleTabSelect, selectedFileId, workspaceView?.mode])
+
+  const handleWorkspaceFileSelection = useCallback((
+    nodeId: string | undefined,
+    revision: string | undefined,
+  ): void => {
+    navigate({
+      to: '/workspace/$id',
+      params: { id: id! },
+      search: (previous: Record<string, unknown>) => ({
+        ...previous,
+        file: nodeId,
+        revision,
+      }),
+    })
+  }, [id, navigate])
+
+  useEffect(() => {
     setChatChanges(undefined)
     setLiveRows(undefined)
     setStreamingActiveFileState(null)
@@ -1089,6 +1130,7 @@ export default function GadgetEditor() {
         search: (prev: Record<string, unknown>) => ({
           ...prev,
           chat: chatId !== null ? chatId : undefined,
+          revision: undefined,
           w: leavingPendingApp
             ? undefined
             : typeof prev.w === 'number' ? prev.w : undefined,
@@ -1959,7 +2001,13 @@ export default function GadgetEditor() {
             </div>
 
             <div className={activeTab === 'files' ? 'h-full' : 'hidden'}>
-              <WorkspaceFilesPanel overseer={overseer.stub} />
+              <WorkspaceFilesPanel
+                overseer={overseer.stub}
+                target={workspaceFileTarget}
+                selectedNodeId={selectedFileId}
+                selectedRevision={selectedFileRevision}
+                onSelectionChange={handleWorkspaceFileSelection}
+              />
             </div>
 
             </div>

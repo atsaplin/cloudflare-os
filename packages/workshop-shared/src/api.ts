@@ -1812,6 +1812,9 @@ export interface Overseer extends RpcTarget {
   /** List direct children of one stable folder at its immutable accepted or chat revision. */
   listWorkspaceChildren(folder: FileRef): Promise<WorkspaceFileNode[]>;
 
+  /** Resolve one stable node at its immutable accepted or chat revision. */
+  getWorkspaceNode(reference: FileRef): Promise<WorkspaceFileNode>;
+
   /** Stream bytes for one stable file at its immutable accepted or chat revision. */
   readWorkspaceFile(file: FileRef): Promise<ReadableStream<Uint8Array>>;
 

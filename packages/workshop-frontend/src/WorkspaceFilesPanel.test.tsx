@@ -34,10 +34,18 @@ vi.mock('@cloudflare/kumo', () => ({
   useKumoToastManager: () => toastManager,
 }))
 const toastManager = { add: toast }
+type SaveStreamToFile = typeof import('./fileTransfers').saveStreamToFile
 
 vi.mock('./components/DeleteConfirmationDialog', () => ({
-  default: () => null,
+  default: ({ open, onConfirm }: { open: boolean; onConfirm: () => void }) => (
+    open ? <button onClick={onConfirm}>Confirm delete</button> : null
+  ),
 }))
+
+const { saveStreamToFile } = vi.hoisted(() => ({
+  saveStreamToFile: vi.fn<SaveStreamToFile>(),
+}))
+vi.mock('./fileTransfers', () => ({ saveStreamToFile }))
 
 vi.mock('./components/WorkshopControls', () => ({
   WorkshopButton: ({ children, ...props }: React.ComponentProps<'button'>) => (
@@ -49,6 +57,12 @@ vi.mock('./components/WorkshopControls', () => ({
   WorkshopInput: (props: React.ComponentProps<'input'>) => <input {...props} />,
 }))
 
+vi.mock('./WorkspaceFileEditor', () => ({
+  default: ({ node: file }: { node: WorkspaceFileNode }) => (
+    <div data-testid="workspace-file-editor">Open {file.name}</div>
+  ),
+}))
+
 import WorkspaceFilesPanel from './WorkspaceFilesPanel'
 
 let container: HTMLDivElement
@@ -56,6 +70,7 @@ let root: Root
 
 beforeEach(() => {
   toast.mockReset()
+  saveStreamToFile.mockReset()
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -83,6 +98,210 @@ function node(overrides: Partial<WorkspaceFileNode>): WorkspaceFileNode {
 }
 
 describe('WorkspaceFilesPanel', () => {
+  it('moves a file by dragging its stable node onto a folder', async () => {
+    const documents = node({ id: 'docs', kind: 'folder', name: 'Documents', size: 0 })
+    const report = node({ id: 'report', name: 'report.txt', path: 'report.txt' })
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([documents, report])
+      .mockResolvedValueOnce([documents])
+    const applyWorkspaceMutation = vi.fn<Overseer['applyWorkspaceMutation']>(async request => ({
+      ...revision('b'.repeat(40)),
+      outcome: 'applied',
+      operationId: request.operationId,
+      target: request.target,
+      created: {},
+    }))
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      applyWorkspaceMutation,
+    } as unknown as RpcStub<Overseer>
+
+    await act(async () => root.render(<WorkspaceFilesPanel overseer={overseer} />))
+    await act(async () => {})
+
+    const values = new Map<string, string>()
+    const dataTransfer = {
+      files: [] as unknown as FileList,
+      getData: (type: string) => values.get(type) ?? '',
+      setData: (type: string, value: string) => values.set(type, value),
+    }
+    const rows = Array.from(container.querySelectorAll<HTMLElement>('[role="listitem"]'))
+    const reportRow = rows.find(row => row.textContent?.includes('report.txt'))!
+    const documentsRow = rows.find(row => row.textContent?.includes('Documents'))!
+    const dragStart = new Event('dragstart', { bubbles: true })
+    Object.defineProperty(dragStart, 'dataTransfer', { value: dataTransfer })
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: dataTransfer })
+    await act(async () => {
+      reportRow.dispatchEvent(dragStart)
+      documentsRow.dispatchEvent(drop)
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+
+    expect(applyWorkspaceMutation).toHaveBeenCalledWith(expect.objectContaining({
+      changes: [{
+        kind: 'move',
+        nodeId: 'report',
+        parent: { nodeId: 'docs' },
+        name: 'report.txt',
+      }],
+    }))
+  })
+
+  it('creates folders, downloads files, and deletes files through authoritative mutations', async () => {
+    const documents = node({ id: 'docs', kind: 'folder', name: 'Documents', size: 0 })
+    const report = node({ id: 'report', name: 'report.txt', mediaType: 'text/plain' })
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([report])
+      .mockResolvedValueOnce([documents, report])
+      .mockResolvedValueOnce([documents])
+    let mutation = 0
+    const applyWorkspaceMutation = vi.fn<Overseer['applyWorkspaceMutation']>(async request => {
+      mutation += 1
+      const created: Record<string, string> = mutation === 1 ? { folder: 'docs' } : {}
+      return {
+        ...revision(String.fromCharCode(97 + mutation).repeat(40)),
+        outcome: 'applied',
+        operationId: request.operationId,
+        target: request.target,
+        created,
+      }
+    })
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      readWorkspaceFile: vi.fn<Overseer['readWorkspaceFile']>(async () => new Blob(['report']).stream()),
+      applyWorkspaceMutation,
+    } as unknown as RpcStub<Overseer>
+
+    await act(async () => root.render(<WorkspaceFilesPanel overseer={overseer} />))
+    await act(async () => {})
+
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'New folder')?.click()
+    })
+    const input = container.querySelector<HTMLInputElement>('[aria-label="New folder name"]')!
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    await act(async () => {
+      setter?.call(input, 'Documents')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'Create')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+    expect(applyWorkspaceMutation).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      changes: [{
+        kind: 'createFolder',
+        clientId: 'folder',
+        parent: { nodeId: 'root' },
+        name: 'Documents',
+      }],
+    }))
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Download report.txt"]')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+    expect(saveStreamToFile).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Delete report.txt"]')?.click()
+    })
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'Confirm delete')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+    expect(applyWorkspaceMutation).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      changes: [{ kind: 'delete', nodeId: 'report', recursive: false }],
+    }))
+  })
+
+  it('restores a stable file selection and creates an empty text file', async () => {
+    const notes = node({
+      id: 'notes',
+      name: 'notes.md',
+      path: 'notes.md',
+      mediaType: 'text/markdown',
+    })
+    const created = node({ id: 'created', name: 'new.md', path: 'new.md' })
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([notes])
+      .mockResolvedValueOnce([notes, created])
+    const stageWorkspaceFileUpload = vi.fn<Overseer['stageWorkspaceFileUpload']>(async request => {
+      expect(request.size).toBe(0)
+      expect(await new Response(request.content).text()).toBe('')
+      return {
+        uploadId: '00000000-0000-4000-8000-000000000092',
+        size: 0,
+        mediaType: 'text/plain',
+        expiresAt: new Date('2026-08-28T00:00:00.000Z'),
+      }
+    })
+    const applyWorkspaceMutation = vi.fn<Overseer['applyWorkspaceMutation']>(async request => ({
+      ...revision('b'.repeat(40)),
+      outcome: 'applied',
+      operationId: request.operationId,
+      target: request.target,
+      created: { file: 'created' },
+    }))
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      getWorkspaceNode: vi.fn<Overseer['getWorkspaceNode']>(async () => notes),
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      stageWorkspaceFileUpload,
+      applyWorkspaceMutation,
+    } as unknown as RpcStub<Overseer>
+    const onSelectionChange = vi.fn<(
+      nodeId: string | undefined,
+      revision: string | undefined,
+    ) => void>()
+
+    await act(async () => root.render(
+      <WorkspaceFilesPanel
+        overseer={overseer}
+        selectedNodeId="notes"
+        onSelectionChange={onSelectionChange}
+      />,
+    ))
+    await act(async () => {})
+
+    expect(container.textContent).toContain('Open notes.md')
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'New file')?.click()
+    })
+    const input = container.querySelector<HTMLInputElement>('[aria-label="New file name"]')!
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    await act(async () => {
+      setter?.call(input, 'new.md')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'Create')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+
+    expect(applyWorkspaceMutation).toHaveBeenCalledWith(expect.objectContaining({
+      changes: [{
+        kind: 'createFile',
+        clientId: 'file',
+        parent: { nodeId: 'root' },
+        name: 'new.md',
+        uploadId: '00000000-0000-4000-8000-000000000092',
+      }],
+    }))
+    expect(onSelectionChange).toHaveBeenCalledWith('created', undefined)
+  })
+
   it('navigates folders and uploads arbitrary files larger than one megabyte', async () => {
     const rootNodes = [
       node({ id: 'docs', kind: 'folder', name: 'Documents', path: 'Documents', size: 0 }),
@@ -221,10 +440,74 @@ describe('WorkspaceFilesPanel', () => {
     }))
   })
 
+  it('uploads dropped files into the folder receiving the drop', async () => {
+    const documents = node({ id: 'docs', kind: 'folder', name: 'Documents', size: 0 })
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([documents])
+      .mockResolvedValueOnce([])
+    const stageWorkspaceFileUpload = vi.fn<Overseer['stageWorkspaceFileUpload']>(async request => ({
+      uploadId: '00000000-0000-4000-8000-000000000094',
+      size: request.size,
+      mediaType: request.mediaType,
+      expiresAt: new Date('2026-08-28T00:00:00.000Z'),
+    }))
+    const applyWorkspaceMutation = vi.fn<Overseer['applyWorkspaceMutation']>(async request => ({
+      ...revision('b'.repeat(40)),
+      outcome: 'applied',
+      operationId: request.operationId,
+      target: request.target,
+      created: {},
+    }))
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      stageWorkspaceFileUpload,
+      applyWorkspaceMutation,
+    } as unknown as RpcStub<Overseer>
+
+    await act(async () => root.render(<WorkspaceFilesPanel overseer={overseer} />))
+    await act(async () => {})
+
+    const values = new Map<string, string>()
+    const file = new File(['contents'], 'dropped.txt', { type: 'text/plain' })
+    Object.defineProperty(file, 'stream', {
+      value: () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('contents'))
+          controller.close()
+        },
+      }),
+    })
+    const dataTransfer = {
+      files: [file] as unknown as FileList,
+      getData: (type: string) => values.get(type) ?? '',
+      setData: (type: string, value: string) => values.set(type, value),
+    }
+    const documentsRow = Array.from(container.querySelectorAll<HTMLElement>('[role="listitem"]'))
+      .find(row => row.textContent?.includes('Documents'))!
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: dataTransfer })
+    await act(async () => {
+      documentsRow.dispatchEvent(drop)
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+
+    expect(applyWorkspaceMutation).toHaveBeenCalledWith(expect.objectContaining({
+      changes: [{
+        kind: 'createFile',
+        clientId: 'upload-0',
+        parent: { nodeId: 'docs' },
+        name: 'dropped.txt',
+        uploadId: '00000000-0000-4000-8000-000000000094',
+      }],
+    }))
+  })
+
   it('offers a retry when the initial workspace load fails', async () => {
     const getWorkspaceRevision = vi.fn<Overseer['getWorkspaceRevision']>()
       .mockRejectedValueOnce(new Error('temporary failure'))
-      .mockResolvedValueOnce(revision('a'.repeat(40)))
+      .mockResolvedValue(revision('a'.repeat(40)))
     const overseer = {
       getWorkspaceRevision,
       listWorkspaceChildren: vi.fn<Overseer['listWorkspaceChildren']>(async () => []),
@@ -244,6 +527,12 @@ describe('WorkspaceFilesPanel', () => {
 
     expect(getWorkspaceRevision).toHaveBeenCalledTimes(2)
     expect(container.textContent).toContain('This folder is empty.')
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Refresh workspace files"]')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+    expect(getWorkspaceRevision).toHaveBeenCalledTimes(3)
   })
 
   it('renames a file and clears the pending rename when navigating', async () => {
@@ -313,6 +602,87 @@ describe('WorkspaceFilesPanel', () => {
     })
 
     expect(container.querySelector('input[aria-label="Rename renamed.bin"]')).toBeNull()
+  })
+
+  it('refreshes the selected file metadata after renaming it', async () => {
+    const original = node({ id: 'file', name: 'notes.txt', path: 'notes.txt', mediaType: 'text/plain' })
+    const renamed = node({ id: 'file', name: 'notes.ts', path: 'notes.ts', mediaType: 'text/typescript' })
+    const listWorkspaceChildren = vi.fn<Overseer['listWorkspaceChildren']>()
+      .mockResolvedValueOnce([original])
+      .mockResolvedValueOnce([renamed])
+    const getWorkspaceNode = vi.fn<Overseer['getWorkspaceNode']>(async () => renamed)
+    const applyWorkspaceMutation = vi.fn<Overseer['applyWorkspaceMutation']>(async request => ({
+      ...revision('b'.repeat(40)),
+      outcome: 'applied',
+      operationId: request.operationId,
+      target: request.target,
+      created: {},
+    }))
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      getWorkspaceNode,
+      listWorkspaceChildren,
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      applyWorkspaceMutation,
+    } as unknown as RpcStub<Overseer>
+
+    await act(async () => root.render(<WorkspaceFilesPanel overseer={overseer} />))
+    await act(async () => {})
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent?.includes('notes.txt'))?.click()
+    })
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Rename notes.txt"]')?.click()
+    })
+    const input = container.querySelector<HTMLInputElement>('[aria-label="Rename notes.txt"]')!
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    await act(async () => {
+      valueSetter?.call(input, 'notes.ts')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => {
+      Array.from(container.querySelectorAll('button')).find(button => button.textContent === 'Save')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+
+    expect(getWorkspaceNode).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: 'file',
+      revision: expect.objectContaining({ commit: 'b'.repeat(40) }),
+    }))
+    expect(container.textContent).toContain('Open notes.ts')
+  })
+
+  it('downloads the selected immutable revision', async () => {
+    const selected = 'c'.repeat(40)
+    const file = node({ id: 'file', name: 'notes.txt', mediaType: 'text/plain' })
+    const readWorkspaceFile = vi.fn<Overseer['readWorkspaceFile']>(async () => (
+      new ReadableStream({ start(controller) { controller.close() } })
+    ))
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision('a'.repeat(40))),
+      getWorkspaceNode: vi.fn<Overseer['getWorkspaceNode']>(async () => file),
+      listWorkspaceChildren: vi.fn<Overseer['listWorkspaceChildren']>(async () => [file]),
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      readWorkspaceFile,
+    } as unknown as RpcStub<Overseer>
+    saveStreamToFile.mockImplementation(async (
+      read: () => Promise<ReadableStream<Uint8Array>>,
+    ) => { await read() })
+
+    await act(async () => root.render(
+      <WorkspaceFilesPanel overseer={overseer} selectedNodeId="file" selectedRevision={selected} />,
+    ))
+    await act(async () => {})
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Download notes.txt"]')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+
+    expect(readWorkspaceFile).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: 'file',
+      revision: { kind: 'accepted', commit: selected },
+    }))
   })
 
   it('refreshes accepted files after a stale mutation conflict', async () => {
