@@ -3,7 +3,6 @@ import {
   type WorkspaceFileMutation,
   type WorkspaceFileNodeReference,
   type WorkspaceGrant,
-  type WorkspaceRight,
 } from "@gadgets/workshop-shared/api";
 import {
   getWorkspaceNode,
@@ -25,7 +24,6 @@ export type WorkspaceSubtreeAccessRequest = {
   grant: WorkspaceGrant;
   sourceWorkspaceId: string;
   targetWorkspaceId: string;
-  right: WorkspaceRight;
   operation: WorkspaceSubtreeOperation;
 };
 
@@ -47,7 +45,7 @@ function requireGrant(
   grant: WorkspaceGrant,
   sourceWorkspaceId: string,
   targetWorkspaceId: string,
-  right: WorkspaceRight,
+  requiredPermission: WorkspaceGrant["permission"],
 ): void {
   requireWorkspaceId(sourceWorkspaceId, "Source workspace");
   requireWorkspaceId(targetWorkspaceId, "Target workspace");
@@ -62,11 +60,10 @@ function requireGrant(
   if (grant.targetWorkspaceId !== targetWorkspaceId) {
     deny("Grant target workspace does not match the operation target workspace.");
   }
-  if (right !== "read" && right !== "write") invalid("Workspace right is invalid.");
   if (grant.permission !== "read" && grant.permission !== "write") {
     invalid("Workspace grant permission is invalid.");
   }
-  if (grant.permission === "read" && right !== "read") {
+  if (grant.permission === "read" && requiredPermission === "write") {
     deny("Workspace grant does not provide the requested right.");
   }
 }
@@ -158,7 +155,7 @@ export function requireWorkspaceSubtreeAccess(
     request.grant,
     request.sourceWorkspaceId,
     request.targetWorkspaceId,
-    request.right,
+    request.operation.kind === "mutation" ? "write" : "read",
   );
   const root = requireNode(request.index, request.grant.rootNodeId);
   if (root.kind !== "folder") invalid("Workspace grant root must be a folder.");

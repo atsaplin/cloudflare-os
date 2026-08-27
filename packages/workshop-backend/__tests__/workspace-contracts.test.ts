@@ -5,7 +5,6 @@ import {
   type WorkspaceAccessRole,
   type WorkspaceFileMutation,
   type WorkspaceGrant,
-  type WorkspaceRight,
   type WriteTarget,
   workspaceRightsForRole,
 } from "@gadgets/workshop-shared/api";
@@ -84,7 +83,6 @@ const grant: WorkspaceGrant = {
 
 function access(
   index: WorkspaceIndexV1,
-  right: WorkspaceRight,
   operation: WorkspaceSubtreeOperation,
   override: Partial<WorkspaceGrant> = {},
 ): void {
@@ -92,7 +90,6 @@ function access(
     index,
     sourceWorkspaceId: SOURCE_WORKSPACE_ID,
     targetWorkspaceId: TARGET_WORKSPACE_ID,
-    right,
     grant: { ...grant, ...override },
     operation,
   });
@@ -145,27 +142,34 @@ describe("workspace public contracts", () => {
 describe("workspace subtree access", () => {
   it("allows reads inside the granted subtree and rejects escapes", () => {
     const index = workspaceIndex();
-    expect(() => access(index, "read", { kind: "read", nodeId: FILE_ID })).not.toThrow();
-    expect(() => access(index, "read", { kind: "list", nodeId: DOCS_ID })).not.toThrow();
+    expect(() => access(index, { kind: "read", nodeId: FILE_ID })).not.toThrow();
+    expect(() => access(index, { kind: "list", nodeId: DOCS_ID })).not.toThrow();
     try {
-      access(index, "read", { kind: "read", nodeId: OUTSIDE_ID });
+      access(index, { kind: "read", nodeId: OUTSIDE_ID });
       throw new Error("Expected subtree access to be denied.");
     } catch (error) {
       expect(error).toMatchObject({ code: WORKSPACE_FILE_ERROR_CODES.accessDenied });
     }
   });
 
-  it("validates grant source, target, and right before reading", () => {
+  it("validates grant source and target before reading", () => {
     const index = workspaceIndex();
-    expect(() => access(index, "read", { kind: "read", nodeId: FILE_ID }, {
+    expect(() => access(index, { kind: "read", nodeId: FILE_ID }, {
       sourceWorkspaceId: TARGET_WORKSPACE_ID,
     })).toThrow(/source workspace/);
-    expect(() => access(index, "read", { kind: "read", nodeId: FILE_ID }, {
+    expect(() => access(index, { kind: "read", nodeId: FILE_ID }, {
       targetWorkspaceId: SOURCE_WORKSPACE_ID,
     })).toThrow(/target workspace/);
-    expect(() => access(index, "write", { kind: "read", nodeId: FILE_ID }, {
-      permission: "read",
-    })).toThrow(/right/);
+  });
+
+  it("rejects mutations through a read-only subtree grant", () => {
+    const index = workspaceIndex();
+    expect(() => access(index, mutation({
+      kind: "createFolder",
+      clientId: "forbidden-folder",
+      parent: { nodeId: DOCS_ID },
+      name: "forbidden",
+    }), { permission: "read" })).toThrow(/right/);
   });
 
   it("checks every mutation kind against the granted subtree", () => {
@@ -194,7 +198,7 @@ describe("workspace subtree access", () => {
       mutation({ kind: "delete", nodeId: FILE_ID }),
     ];
     for (const operation of changes) {
-      expect(() => access(index, "write", operation)).not.toThrow();
+      expect(() => access(index, operation)).not.toThrow();
     }
   });
 
@@ -225,7 +229,7 @@ describe("workspace subtree access", () => {
       mutation({ kind: "delete", nodeId: OUTSIDE_ID }),
     ];
     for (const operation of escaped) {
-      expect(() => access(index, "write", operation)).toThrow(/subtree/);
+      expect(() => access(index, operation)).toThrow(/subtree/);
     }
   });
 
@@ -255,8 +259,8 @@ describe("workspace subtree access", () => {
         },
       ],
     };
-    expect(() => access(index, "write", operation)).not.toThrow();
-    expect(() => access(index, "write", {
+    expect(() => access(index, operation)).not.toThrow();
+    expect(() => access(index, {
       kind: "mutation",
       changes: [{
         kind: "move",
