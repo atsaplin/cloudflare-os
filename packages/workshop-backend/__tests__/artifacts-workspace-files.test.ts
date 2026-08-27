@@ -60,6 +60,7 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   readonly stagedMutations: WorkspaceArtifactMutation[] = [];
   readonly commitMessages = new Map<string, string>();
   readonly commitParents = new Map<string, string>();
+  readChatCommitLogCalls = 0;
   throwBeforeStage = false;
   throwAfterStage = false;
   throwAfterAccept = false;
@@ -230,6 +231,7 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
     oid: string,
     options?: { depth?: number },
   ): Promise<CommitInfo[]> {
+    this.readChatCommitLogCalls += 1;
     const fork = this.forks.get(`${chatId}:${epoch}`);
     if (!fork || !this.snapshots.get(fork.repositoryName)?.has(oid)) {
       throw new Error("Test chat fork commit is missing.");
@@ -336,11 +338,45 @@ function expectCode(operation: Promise<unknown>, code: string): Promise<void> {
   );
 }
 
-async function withFiles<T>(name: string, run: (files: ArtifactsWorkspaceFiles, artifacts: InMemoryArtifacts, uploads: InMemoryUploads) => Promise<T>): Promise<T> {
-  return runInDurableObject(env.TEST_OVERSEER.getByName(`artifacts-workspace-files:${name}`), (_instance, state) => {
+function createChatOperationReceiptTable(state: DurableObjectState): void {
+  state.storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS workspace_artifact_chat_operation_receipts (
+      chat_id TEXT NOT NULL,
+      epoch INTEGER NOT NULL,
+      operation_id TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      repository_name TEXT NOT NULL,
+      result_kind TEXT NOT NULL CHECK (result_kind IN ('list', 'read', 'write', 'mkdir', 'move', 'delete')),
+      result_head TEXT NOT NULL,
+      result_path TEXT NOT NULL,
+      result_changed INTEGER CHECK (result_changed IS NULL OR result_changed IN (0, 1)),
+      result_node_id TEXT,
+      PRIMARY KEY (chat_id, epoch, operation_id)
+    )
+  `);
+}
+
+async function withFiles<T>(
+  name: string,
+  run: (
+    files: ArtifactsWorkspaceFiles,
+    artifacts: InMemoryArtifacts,
+    uploads: InMemoryUploads,
+    state: DurableObjectState,
+  ) => Promise<T>,
+): Promise<T> {
+  const id = env.TEST_OVERSEER.getByName(`artifacts-workspace-files:${name}`);
+  return runInDurableObject(id, (_instance, state) => {
     const artifacts = new InMemoryArtifacts();
     const uploads = new InMemoryUploads();
-    return run(new ArtifactsWorkspaceFiles({ state, lifecycle: artifacts, reader: artifacts, uploadStore: uploads }), artifacts, uploads);
+    createChatOperationReceiptTable(state);
+    const files = new ArtifactsWorkspaceFiles({
+      state,
+      lifecycle: artifacts,
+      reader: artifacts,
+      uploadStore: uploads,
+    });
+    return run(files, artifacts, uploads, state);
   });
 }
 
@@ -826,8 +862,8 @@ describe("ArtifactsWorkspaceFiles", () => {
     });
   });
 
-  it("recovers agent operations older than one commit-log page", async () => {
-    await withFiles("agent-chat-operation-old-retry", async (files, artifacts) => {
+  it("recovers a lost receipt from the operation commit after later fork changes and pagination", async () => {
+    await withFiles("agent-chat-operation-old-retry", async (files, artifacts, _uploads, state) => {
       await files.initialize(ACTOR);
       const request: ChatWorkspaceOperationRequest = {
         chatId: "45-old",
@@ -838,8 +874,109 @@ describe("ArtifactsWorkspaceFiles", () => {
         operation: { kind: "mkdir", path: "old" },
       };
       const original = await files.runChatOperation(request);
+      await files.runChatOperation({
+        chatId: "45-old",
+        epoch: 0,
+        operationId: "tool-move-after",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:31:00.000Z",
+        operation: { kind: "move", path: "old", destination: "renamed" },
+      });
+      state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        request.chatId,
+        request.epoch,
+      );
       for (let index = 0; index < 101; index += 1) {
         await artifacts.stageChatMutation("45-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
+          operations: [{
+            kind: "write",
+            path: `gadgets/${index}/index.ts`,
+            content: textBytes("export {}"),
+          }],
+        });
+      }
+
+      const recovered = await files.runChatOperation(request);
+
+      expect(recovered).toEqual(original);
+      expect(recovered).toMatchObject({ nodeId: expect.any(String), head: original.head });
+      expect(artifacts.readChatCommitLogCalls).toBeGreaterThan(1);
+      expect(artifacts.stagedMutations).toHaveLength(103);
+      await expectCode(files.runChatOperation({
+        ...request,
+        operation: { kind: "mkdir", path: "different" },
+      }), WORKSPACE_FILE_ERROR_CODES.operationReused);
+    });
+  });
+
+  it("recovers a lost delete receipt from the operation commit parent after pagination", async () => {
+    await withFiles("agent-chat-delete-operation-old-retry", async (files, artifacts, _uploads, state) => {
+      await files.initialize(ACTOR);
+      const created = await files.runChatOperation({
+        chatId: "49-delete-old",
+        epoch: 0,
+        operationId: "tool-create-delete-target",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:32:00.000Z",
+        operation: { kind: "mkdir", path: "deleted" },
+      });
+      const request: ChatWorkspaceOperationRequest = {
+        chatId: "49-delete-old",
+        epoch: 0,
+        operationId: "tool-delete-old",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:33:00.000Z",
+        operation: { kind: "delete", path: "deleted" },
+      };
+      const original = await files.runChatOperation(request);
+      state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        request.chatId,
+        request.epoch,
+      );
+      for (let index = 0; index < 101; index += 1) {
+        await artifacts.stageChatMutation("49-delete-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
+          operations: [{
+            kind: "write",
+            path: `gadgets/${index}/index.ts`,
+            content: textBytes("export {}"),
+          }],
+        });
+      }
+
+      const recovered = await files.runChatOperation(request);
+
+      expect(original).toMatchObject({
+        kind: "delete",
+        nodeId: created.nodeId,
+      });
+      expect(recovered).toEqual(original);
+      expect(recovered).toMatchObject({ nodeId: created.nodeId, head: original.head });
+      expect(artifacts.readChatCommitLogCalls).toBeGreaterThan(1);
+      expect(artifacts.stagedMutations).toHaveLength(103);
+    });
+  });
+
+  it("replays a chat operation result after more than one commit-log page", async () => {
+    await withFiles("agent-chat-operation-receipt", async (files, artifacts) => {
+      await files.initialize(ACTOR);
+      const request: ChatWorkspaceOperationRequest = {
+        chatId: "47-receipt",
+        epoch: 0,
+        operationId: "tool-list-receipt",
+        actor: ACTOR,
+        timestamp: "2026-08-26T02:40:00.000Z",
+        operation: { kind: "list", path: "/" },
+      };
+      const original = await files.runChatOperation(request);
+      await files.runChatOperation({
+        ...request,
+        operationId: "tool-create-after-list",
+        operation: { kind: "mkdir", path: "later" },
+      });
+      for (let index = 0; index < 101; index += 1) {
+        await artifacts.stageChatMutation("47-receipt", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
             kind: "write",
             path: `gadgets/${index}/index.ts`,
@@ -854,10 +991,35 @@ describe("ArtifactsWorkspaceFiles", () => {
       expect(artifacts.stagedMutations).toHaveLength(102);
       await expectCode(files.runChatOperation({
         ...request,
-        operation: { kind: "mkdir", path: "different" },
+        operation: { kind: "list", path: "later" },
       }), WORKSPACE_FILE_ERROR_CODES.operationReused);
     });
   });
+
+  it.each(["accepting", "accepted", "discarding"] as const)(
+    "does not replay a receipt while the chat fork is %s",
+    async state => {
+      await withFiles(`agent-chat-operation-terminal-${state}`, async (files, artifacts) => {
+        await files.initialize(ACTOR);
+        const request: ChatWorkspaceOperationRequest = {
+          chatId: "48-terminal",
+          epoch: 0,
+          operationId: "tool-terminal",
+          actor: ACTOR,
+          timestamp: "2026-08-26T02:45:00.000Z",
+          operation: { kind: "mkdir", path: "notes" },
+        };
+        const original = await files.runChatOperation(request);
+        const fork = artifacts.forks.get("48-terminal:0");
+        if (!fork) throw new Error("Test chat fork was not created.");
+        fork.state = state;
+
+        await expectCode(files.runChatOperation(request), WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+        expect(artifacts.stagedMutations).toHaveLength(1);
+        expect(original).toMatchObject({ kind: "mkdir", path: "notes", changed: true });
+      });
+    },
+  );
 
   it("finds workspace file changes older than one commit-log page", async () => {
     await withFiles("agent-chat-old-dirty", async (files, artifacts) => {

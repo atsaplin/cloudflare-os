@@ -318,6 +318,19 @@ describe("WorkspaceArtifactLifecycle", () => {
     });
   });
 
+  it("recovers the existing canonical repository after its Durable Object record is lost", async () => {
+    await withLifecycle("initialize-recovery", async (lifecycle, fixtures, state) => {
+      const first = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      state.storage.sql.exec("DELETE FROM workspace_artifact_repository WHERE singleton = 1");
+
+      const second = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+
+      expect(second).toEqual(first);
+      expect(fixtures.artifacts.repos.size).toBe(1);
+      expect(fixtures.runtime.initialized).toEqual([first.repositoryName]);
+    });
+  });
+
   it("creates one durable fork for a writable chat epoch", async () => {
     await withLifecycle("fork", async (lifecycle, fixtures) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
@@ -468,10 +481,16 @@ describe("WorkspaceArtifactLifecycle", () => {
   });
 
   it("deletes every fork Sandbox and repository with the canonical workspace", async () => {
-    await withLifecycle("delete-workspace", async (lifecycle, fixtures) => {
+    await withLifecycle("delete-workspace", async (lifecycle, fixtures, state) => {
       const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
       const first = await lifecycle.ensureChatFork("chat-one", 1);
       const second = await lifecycle.ensureChatFork("chat-two", 1);
+      state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_chat_operation_receipts (
+          chat_id, epoch, operation_id, request_digest, repository_name,
+          result_kind, result_head, result_path, result_changed, result_node_id
+        ) VALUES ('read-only', 0, 'tool-list', 'digest', ?, 'list', ?, '', NULL, NULL)
+      `, canonical.repositoryName, canonical.head);
 
       await lifecycle.deleteWorkspaceRepositories();
 
@@ -483,6 +502,9 @@ describe("WorkspaceArtifactLifecycle", () => {
       ]);
       await expect(lifecycle.getCanonical()).resolves.toBeUndefined();
       await expect(lifecycle.getForkStatus("chat-one", 1)).resolves.toBeUndefined();
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts",
+      )]).toHaveLength(0);
       await expect(lifecycle.deleteWorkspaceRepositories()).resolves.toBeUndefined();
     });
   });
@@ -579,6 +601,131 @@ describe("WorkspaceArtifactLifecycle", () => {
 
       expect(fixtures.artifacts.deleted.filter(name => name === fork.repositoryName)).toHaveLength(1);
       expect(fixtures.runtime.destroyed.filter(id => id === fork.sandboxId)).toHaveLength(1);
+    });
+  });
+
+  it("clears receipt-only epochs when discarding without a fork row", async () => {
+    await withLifecycle("discard-receipt-only", async (lifecycle, _fixtures, state) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_chat_operation_receipts (
+          chat_id, epoch, operation_id, request_digest, repository_name,
+          result_kind, result_head, result_path, result_changed, result_node_id
+        ) VALUES ('chat-only', 0, 'tool-list', 'digest', ?, 'list', ?, '', NULL, NULL)
+      `, canonical.repositoryName, canonical.head);
+
+      await lifecycle.discardChatFork("chat-only", 0);
+
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-only",
+        0,
+      )]).toHaveLength(0);
+    });
+  });
+
+  it("clears receipt-only epochs when completing without a fork row", async () => {
+    await withLifecycle("complete-receipt-only", async (lifecycle, _fixtures, state) => {
+      const canonical = await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_chat_operation_receipts (
+          chat_id, epoch, operation_id, request_digest, repository_name,
+          result_kind, result_head, result_path, result_changed, result_node_id
+        ) VALUES ('chat-only', 0, 'tool-list', 'digest', ?, 'list', ?, '', NULL, NULL)
+      `, canonical.repositoryName, canonical.head);
+
+      await lifecycle.completeAcceptedChatFork("chat-only", 0, canonical.head);
+
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-only",
+        0,
+      )]).toHaveLength(0);
+    });
+  });
+
+  it("retries discard after external cleanup completed before durable cleanup", async () => {
+    await withLifecycle("discard-recovery", async (lifecycle, fixtures, state) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_chat_operation_receipts (
+          chat_id, epoch, operation_id, request_digest, repository_name,
+          result_kind, result_head, result_path, result_changed, result_node_id
+        ) VALUES (?, ?, ?, ?, ?, 'list', ?, '', NULL, NULL)
+      `, fork.chatId, fork.epoch, "tool-list", "digest", fork.repositoryName, fork.latestHead);
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_discard_cleanup
+        BEFORE DELETE ON workspace_artifact_forks
+        BEGIN SELECT RAISE(ABORT, 'durable cleanup failed'); END
+      `);
+
+      await expect(lifecycle.discardChatFork("chat-one", 1))
+        .rejects.toThrow("durable cleanup failed");
+      expect(fixtures.artifacts.deleted).toContain(fork.repositoryName);
+      expect([...state.storage.sql.exec<{ state: string }>(
+        "SELECT state FROM workspace_artifact_forks WHERE chat_id = ? AND epoch = ?",
+        "chat-one",
+        1,
+      )]).toEqual([{ state: "discarding" }]);
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-one",
+        1,
+      )]).toHaveLength(1);
+
+      state.storage.sql.exec("DROP TRIGGER fail_discard_cleanup");
+      await lifecycle.discardChatFork("chat-one", 1);
+
+      expect(await lifecycle.getForkStatus("chat-one", 1)).toBeUndefined();
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-one",
+        1,
+      )]).toHaveLength(0);
+    });
+  });
+
+  it("retries accepted cleanup after external cleanup completed before durable cleanup", async () => {
+    await withLifecycle("complete-recovery", async (lifecycle, fixtures, state) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+      await expect(lifecycle.acceptChatFork("chat-one", 1)).resolves.toEqual({
+        status: "merged",
+        head: CHECKPOINT_HEAD,
+      });
+      state.storage.sql.exec(`
+        INSERT INTO workspace_artifact_chat_operation_receipts (
+          chat_id, epoch, operation_id, request_digest, repository_name,
+          result_kind, result_head, result_path, result_changed, result_node_id
+        ) VALUES (?, ?, ?, ?, ?, 'mkdir', ?, 'notes', 1, ?)
+      `, fork.chatId, fork.epoch, "tool-mkdir", "digest", fork.repositoryName,
+      CHECKPOINT_HEAD, "00000000-0000-4000-8000-000000000101");
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_complete_cleanup
+        BEFORE DELETE ON workspace_artifact_forks
+        BEGIN SELECT RAISE(ABORT, 'durable cleanup failed'); END
+      `);
+
+      await expect(lifecycle.completeAcceptedChatFork("chat-one", 1, CHECKPOINT_HEAD))
+        .rejects.toThrow("durable cleanup failed");
+      expect(await lifecycle.getForkStatus("chat-one", 1)).toMatchObject({ state: "accepted" });
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-one",
+        1,
+      )]).toHaveLength(1);
+
+      state.storage.sql.exec("DROP TRIGGER fail_complete_cleanup");
+      await lifecycle.completeAcceptedChatFork("chat-one", 1, CHECKPOINT_HEAD);
+
+      expect(await lifecycle.getForkStatus("chat-one", 1)).toBeUndefined();
+      expect([...state.storage.sql.exec(
+        "SELECT operation_id FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        "chat-one",
+        1,
+      )]).toHaveLength(0);
     });
   });
 });

@@ -982,6 +982,21 @@ export class WorkspaceArtifactLifecycle {
         PRIMARY KEY (chat_id, epoch)
       )
     `);
+    this.#state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS workspace_artifact_chat_operation_receipts (
+        chat_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        operation_id TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        repository_name TEXT NOT NULL,
+        result_kind TEXT NOT NULL CHECK (result_kind IN ('list', 'read', 'write', 'mkdir', 'move', 'delete')),
+        result_head TEXT NOT NULL,
+        result_path TEXT NOT NULL,
+        result_changed INTEGER CHECK (result_changed IS NULL OR result_changed IN (0, 1)),
+        result_node_id TEXT,
+        PRIMARY KEY (chat_id, epoch, operation_id)
+      )
+    `);
   }
 
   async #withLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -1537,7 +1552,10 @@ export class WorkspaceArtifactLifecycle {
   completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void> {
     return this.#withLock(async () => {
       const row = this.#forkRow(chatId, epoch);
-      if (!row) return;
+      if (!row) {
+        this.#deleteForkState(chatId, epoch);
+        return;
+      }
       const expectedHead = requireOid(acceptedHead, "Accepted workspace head");
       if (row.state !== "accepted" || row.accepted_head !== expectedHead) {
         throw new Error("Chat fork does not match the completed acceptance.");
@@ -1549,18 +1567,32 @@ export class WorkspaceArtifactLifecycle {
   async #cleanupFork(row: ForkRow): Promise<void> {
     await this.#gitRuntime.destroy(row.sandbox_id);
     await this.#artifacts.delete(row.repository_name);
-    this.#state.storage.sql.exec(
-      "DELETE FROM workspace_artifact_forks WHERE chat_id = ? AND epoch = ?",
-      row.chat_id,
-      row.epoch,
-    );
+    this.#deleteForkState(row.chat_id, row.epoch);
+  }
+
+  #deleteForkState(chatId: string, epoch: number): void {
+    this.#state.storage.transactionSync(() => {
+      this.#state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_chat_operation_receipts WHERE chat_id = ? AND epoch = ?",
+        chatId,
+        epoch,
+      );
+      this.#state.storage.sql.exec(
+        "DELETE FROM workspace_artifact_forks WHERE chat_id = ? AND epoch = ?",
+        chatId,
+        epoch,
+      );
+    });
   }
 
   /** Closes a chat fork before deleting its Sandbox and Artifacts repository. */
   discardChatFork(chatId: string, epoch: number): Promise<void> {
     return this.#withLock(async () => {
       const row = this.#forkRow(chatId, epoch);
-      if (!row) return;
+      if (!row) {
+        this.#deleteForkState(chatId, epoch);
+        return;
+      }
       if (row.state === "accepted") throw new Error("An accepted chat fork cannot be discarded.");
       this.#state.storage.sql.exec(`
         UPDATE workspace_artifact_forks SET state = 'discarding'
@@ -1582,11 +1614,13 @@ export class WorkspaceArtifactLifecycle {
       `)];
       for (const fork of forks) await this.#cleanupFork(fork);
       const canonical = this.#canonicalRow();
-      if (!canonical) return;
-      await this.#artifacts.delete(canonical.repository_name);
-      this.#state.storage.sql.exec(
-        "DELETE FROM workspace_artifact_repository WHERE singleton = 1",
-      );
+      if (canonical) await this.#artifacts.delete(canonical.repository_name);
+      this.#state.storage.transactionSync(() => {
+        this.#state.storage.sql.exec("DELETE FROM workspace_artifact_chat_operation_receipts");
+        this.#state.storage.sql.exec(
+          "DELETE FROM workspace_artifact_repository WHERE singleton = 1",
+        );
+      });
     });
   }
 }
