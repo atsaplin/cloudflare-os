@@ -9,9 +9,11 @@
     "build:worker": "node build-browser-runtime.mjs && pnpm exec capnweb-validate build --out .wrangler/validate",
     "build:integration-worker": "node build-browser-runtime.mjs && pnpm exec capnweb-validate build --tsconfig tsconfig.integration-worker.json --out .wrangler/validate-integration",
     "clean": "rm -rf dist",
-    "test:integration": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run --config vitest.integration.config.ts",
-    "test:run": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run && vitest run --config vitest.integration.config.ts",
-    "test:watch": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest",
+    "test:prepare": "pnpm --filter @gadgets/typed-storage build && node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs",
+    "test:contracts": "pnpm run test:prepare && vitest run __tests__/workspace-contracts.test.ts __tests__/workspace-artifacts.test.ts __tests__/artifacts-workspace-files.test.ts",
+    "test:integration": "pnpm run test:prepare && vitest run --config vitest.integration.config.ts",
+    "test:run": "pnpm run test:prepare && vitest run && vitest run --config vitest.integration.config.ts",
+    "test:watch": "pnpm run test:prepare && vitest",
     "import:format-blueprint": "node --experimental-strip-types --no-warnings scripts/import-format-blueprint.mjs"
   },
   "dependencies": {
