@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, WorkspaceFileMutationRequest, WorkspaceFileMutationResult, WorkspaceFileNode, WorkspaceFileRevision, WorkspaceFileUpload, WorkspaceFileUploadRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, createWorkspaceFileError, WORKSPACE_FILE_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, ChatGadgetPin, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitIdentity, CommitInfo, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, FileRef, WriteTarget, WorkspaceAccessRole, WorkspaceFileMutationRequest, WorkspaceFileMutationResponse, WorkspaceFileNode, WorkspaceFileRevision, WorkspaceFileUpload, WorkspaceFileUploadRequest, workspaceRightsForRole, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, createWorkspaceFileError, WORKSPACE_FILE_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
 import { applyCodeChange, changedGadgets, composeCodeChange, diffFiles, transformCodeChange,
   validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
@@ -64,6 +64,8 @@ import {
 import {
   WorkspaceRepositoryConflictError,
   WorkspaceRepositoryExpectedError,
+  parseWriteTarget,
+  requireFileRef,
   type WorkspaceActor,
 } from "./workspace-files";
 import {
@@ -8071,7 +8073,7 @@ class OverseerImpl implements AgentHooks {
   //     since that is all the UI can invoke.
   #inScopeGatekeepers(role: CollaboratorRole): GatekeeperRecord[] {
     let boundIds: Set<WorkpieceId> | undefined;
-    if (role === "use") {
+    if (!workspaceRightsForRole(role).includes("read")) {
       boundIds = new Set();
       for (let gadget of this.storage.gadgets.list()) {
         // Provisional gadgets and binding edges aren't visible to "use" collaborators, so they
@@ -8688,14 +8690,15 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       })();
     }
 
-    if (role === "use") {
+    const workspaceRole: WorkspaceAccessRole = isOwner ? "owner" : role;
+    if (!workspaceRightsForRole(workspaceRole).includes("read")) {
       // "use" collaborators get a restricted capability exposing only the gadget UI.
       return new UseOverseerInterface(
           this.impl, profileId, userId, notifyClosed.dup());
     }
 
     return new OverseerClientInterface(
-        this.impl, profileId, userId, isOwner, notifyClosed.dup(),
+        this.impl, profileId, userId, workspaceRole, notifyClosed.dup(),
         ensureCapsules);
   }
 
@@ -9365,7 +9368,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   constructor(private impl: OverseerImpl,
               private clientProfileId: string,
               private clientUserId: string,
-              private isOwner: boolean,
+              private workspaceRole: WorkspaceAccessRole,
               private notifyClosed: NativeRpcStub<() => void>,
               // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
               // this so ambient providers are attached when possible.
@@ -9403,7 +9406,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   // Per-session caller identity for the SharingManager.
   #sharingCaller(): SharingCaller {
-    return { profileId: this.clientProfileId, isOwner: this.isOwner };
+    return { profileId: this.clientProfileId, isOwner: this.#canManageWorkspace() };
+  }
+
+  #isWorkspaceOwner(): boolean {
+    return this.workspaceRole === "owner";
+  }
+
+  #canManageWorkspace(): boolean {
+    return workspaceRightsForRole(this.workspaceRole).includes("manage");
   }
 
   async #getClientProfile(): Promise<AiChatAuthorInfo> {
@@ -9420,6 +9431,52 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return profilePromise;
   }
 
+  #parseWorkspaceTarget(target: WriteTarget): WriteTarget {
+    const parsed = parseWriteTarget(target);
+    if (parsed.kind !== "chat") return parsed;
+    const meta = this.impl.storage.chatMeta.get(parsed.chatId);
+    if (!meta) {
+      throw new WorkspaceRepositoryExpectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        `Workspace chat ${parsed.chatId} does not exist.`,
+      );
+    }
+    const epoch = this.impl.chatCodeBase(meta).epoch ?? 0;
+    if (epoch !== parsed.epoch) {
+      throw new WorkspaceRepositoryExpectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        `Workspace chat ${parsed.chatId} is at epoch ${epoch}, not ${parsed.epoch}.`,
+      );
+    }
+    return parsed;
+  }
+
+  #requireWorkspaceFileReference(reference: FileRef): void {
+    requireFileRef(reference);
+    if (reference.workspaceId !== this.impl.ctx.id.toString()) {
+      throw new WorkspaceRepositoryExpectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        "Workspace file reference belongs to another workspace.",
+      );
+    }
+    if (reference.revision.kind !== "chat") return;
+    const meta = this.impl.storage.chatMeta.get(reference.revision.chatId);
+    if (!meta) {
+      throw new WorkspaceRepositoryExpectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        `Workspace chat ${reference.revision.chatId} does not exist.`,
+      );
+    }
+    const epoch = this.impl.chatCodeBase(meta).epoch ?? 0;
+    if (epoch !== reference.revision.epoch) {
+      throw new WorkspaceRepositoryExpectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        `Workspace chat ${reference.revision.chatId} is at epoch ${epoch}, not ` +
+          `${reference.revision.epoch}.`,
+      );
+    }
+  }
+
   async getMetadata(): Promise<GadgetMetadata> {
     let result: GadgetMetadata = {
       id: this.impl.ctx.id.toString(),
@@ -9429,7 +9486,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       role: "build",
       defaultGadgetId: this.impl.defaultGadgetId,
     };
-    if (!this.isOwner) {
+    if (!this.#isWorkspaceOwner()) {
       result.owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
     }
     return result;
@@ -9440,28 +9497,32 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.impl.workspaceRepository.initialize({ id: profile.id, name: profile.name });
   }
 
-  async getWorkspaceRevision(): Promise<WorkspaceFileRevision> {
+  async getWorkspaceRevision(target: WriteTarget): Promise<WorkspaceFileRevision> {
+    const parsed = this.#parseWorkspaceTarget(target);
     await this.#ensureWorkspaceRepository();
-    return this.impl.workspaceRepository.getRevision();
+    return this.impl.workspaceRepository.getTargetRevision(parsed);
   }
 
-  async listWorkspaceChildren(folderId: string): Promise<WorkspaceFileNode[]> {
+  async listWorkspaceChildren(folder: FileRef): Promise<WorkspaceFileNode[]> {
+    this.#requireWorkspaceFileReference(folder);
     await this.#ensureWorkspaceRepository();
-    return (await this.impl.workspaceRepository.list(folderId)).map(node => ({
+    return (await this.impl.workspaceRepository.listFileRef(folder)).map(node => ({
       ...node,
       createdAt: new Date(node.createdAt),
       updatedAt: new Date(node.updatedAt),
     }));
   }
 
-  async readWorkspaceFile(fileId: string): Promise<ReadableStream<Uint8Array>> {
+  async readWorkspaceFile(file: FileRef): Promise<ReadableStream<Uint8Array>> {
+    this.#requireWorkspaceFileReference(file);
     await this.#ensureWorkspaceRepository();
-    return this.impl.workspaceRepository.readFileStream(fileId);
+    return this.impl.workspaceRepository.readFileRefStream(file);
   }
 
-  async getWorkspaceHistory(depth = 50): Promise<CommitInfo[]> {
+  async getWorkspaceHistory(target: WriteTarget, depth = 50): Promise<CommitInfo[]> {
+    const parsed = this.#parseWorkspaceTarget(target);
     await this.#ensureWorkspaceRepository();
-    return this.impl.workspaceRepository.getHistory(depth);
+    return this.impl.workspaceRepository.getHistoryAt(parsed, depth);
   }
 
   async stageWorkspaceFileUpload(
@@ -9477,15 +9538,26 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async applyWorkspaceMutation(
-      request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResult> {
+      request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResponse> {
+    const target = this.#parseWorkspaceTarget(request.target);
     const profile = await this.#getClientProfile();
     try {
       return await this.impl.workspaceRepository.applyStaged({
         ...request,
+        target,
         actor: { id: profile.id, name: profile.name },
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
+      if (error instanceof WorkspaceRepositoryConflictError) {
+        return {
+          outcome: "stale",
+          operationId: request.operationId,
+          target,
+          expectedHead: request.expectedHead,
+          currentHead: error.currentHead,
+        };
+      }
       throwWorkspaceFileError(error);
     }
   }
@@ -9505,7 +9577,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     // For collaborators, include owner info.
-    if (!this.isOwner) {
+    if (!this.#isWorkspaceOwner()) {
       metadata.owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
     }
 
@@ -9634,7 +9706,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async deleteSelf(): Promise<void> {
-    if (!this.isOwner) {
+    if (!this.#canManageWorkspace()) {
       throw new Error("Only the workspace owner can delete it.");
     }
     let startedAt = Date.now();
@@ -10930,6 +11002,10 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     throw new Error("Unauthorized: this collaborator only has permission to use the gadget's UI.");
   }
 
+  #denyWorkspaceFiles(): never {
+    throw createWorkspaceFileError(WORKSPACE_FILE_ERROR_CODES.accessDenied);
+  }
+
   // --- Allowed methods ---
 
   async getMetadata(): Promise<GadgetMetadata> {
@@ -11003,17 +11079,25 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   // --- Denied methods (build-only) ---
 
-  async getWorkspaceRevision(): Promise<WorkspaceFileRevision> { this.#deny(); }
-  async listWorkspaceChildren(_folderId: string): Promise<WorkspaceFileNode[]> { this.#deny(); }
-  async readWorkspaceFile(_fileId: string): Promise<ReadableStream<Uint8Array>> { this.#deny(); }
-  async getWorkspaceHistory(_depth?: number): Promise<CommitInfo[]> { this.#deny(); }
+  async getWorkspaceRevision(_target: WriteTarget): Promise<WorkspaceFileRevision> {
+    this.#denyWorkspaceFiles();
+  }
+  async listWorkspaceChildren(_folder: FileRef): Promise<WorkspaceFileNode[]> {
+    this.#denyWorkspaceFiles();
+  }
+  async readWorkspaceFile(_file: FileRef): Promise<ReadableStream<Uint8Array>> {
+    this.#denyWorkspaceFiles();
+  }
+  async getWorkspaceHistory(_target: WriteTarget, _depth?: number): Promise<CommitInfo[]> {
+    this.#denyWorkspaceFiles();
+  }
   async stageWorkspaceFileUpload(
       _request: WorkspaceFileUploadRequest): Promise<WorkspaceFileUpload> {
-    this.#deny();
+    this.#denyWorkspaceFiles();
   }
   async applyWorkspaceMutation(
-      _request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResult> {
-    this.#deny();
+      _request: WorkspaceFileMutationRequest): Promise<WorkspaceFileMutationResponse> {
+    this.#denyWorkspaceFiles();
   }
 
   async setTitle(_title: string): Promise<void> { this.#deny(); }

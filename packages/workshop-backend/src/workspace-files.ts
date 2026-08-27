@@ -1,6 +1,9 @@
 import {
   MAXIMUM_WORKSPACE_FILE_UPLOAD_BYTES,
   WORKSPACE_FILE_ERROR_CODES,
+  type WriteTarget,
+  type FileRef,
+  type WorkspaceFileRevisionRef,
   type WorkspaceFileErrorCode,
 } from "@gadgets/workshop-shared/api";
 import type { WorkspaceNode } from "./workspace-manifest";
@@ -14,6 +17,10 @@ const maximumChanges = 1_000;
 const maximumPendingUploads = 1_000;
 const operationTrailerLabel = "Workspace-Operation:";
 const digestTrailerLabel = "Workspace-Request-Digest:";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export function isWorkspaceUuid(value: unknown): value is string {
   return typeof value === "string" && operationIdPattern.test(value);
@@ -72,13 +79,15 @@ export interface WorkspaceActor {
   name: string;
 }
 
-/** The accepted workspace revision and its stable root identity. */
+/** A workspace revision and its stable root identity. */
 export interface WorkspaceRevision {
+  workspaceId: string;
+  revision: WorkspaceFileRevisionRef;
   head: string;
   rootId: string;
 }
 
-/** A stable workspace node with its current accepted byte size. */
+/** A stable workspace node with its byte size at the selected revision. */
 export interface WorkspaceRepositoryNode extends WorkspaceNode {
   size: number;
 }
@@ -86,7 +95,7 @@ export interface WorkspaceRepositoryNode extends WorkspaceNode {
 /** A stable node or a node created earlier in the same mutation batch. */
 export type WorkspaceNodeReference = { nodeId: string } | { clientId: string };
 
-/** One accepted workspace filesystem change. */
+/** One workspace filesystem change. */
 export type WorkspaceMutation =
   | {
       kind: "createFolder";
@@ -139,6 +148,7 @@ export type StagedWorkspaceMutation =
 export interface StagedWorkspaceMutationRequest {
   operationId: string;
   expectedHead: string;
+  target: WriteTarget;
   actor: WorkspaceActor;
   timestamp: string;
   message: string;
@@ -158,19 +168,22 @@ export interface WorkspaceUpload {
   expiresAt: string;
 }
 
-/** A compare-and-swap mutation of the accepted workspace tree. */
+/** A compare-and-swap mutation of an accepted or chat workspace tree. */
 export interface WorkspaceMutationRequest {
   operationId: string;
   expectedHead: string;
+  target: WriteTarget;
   actor: WorkspaceActor;
   timestamp: string;
   message: string;
   changes: WorkspaceMutation[];
 }
 
-/** The accepted result of one idempotent workspace mutation. */
+/** The applied result of one idempotent workspace mutation. */
 export interface WorkspaceMutationResult extends WorkspaceRevision {
+  outcome: "applied";
   operationId: string;
+  target: WriteTarget;
   created: Record<string, string>;
 }
 
@@ -199,6 +212,79 @@ export function requireTimestamp(timestamp: string): void {
   }
 }
 
+/** Parses the public target that selects an accepted head or chat fork. */
+export function parseWriteTarget(target: WriteTarget): WriteTarget {
+  if (!isRecord(target)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Workspace write targets must identify accepted content or a valid chat fork.",
+    );
+  }
+  if (target.kind === "accepted") return { kind: "accepted" };
+  if (target.kind === "chat" && Number.isSafeInteger(target.chatId) && target.chatId >= 0 &&
+      Number.isSafeInteger(target.epoch) && target.epoch >= 0 && target.epoch <= 1_000_000_000) {
+    return { kind: "chat", chatId: target.chatId, epoch: target.epoch };
+  }
+  expectedError(
+    WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+    "Workspace write targets must identify accepted content or a valid chat fork.",
+  );
+}
+
+/** Validates the public target that selects an accepted head or chat fork. */
+export function requireWriteTarget(target: WriteTarget): void {
+  parseWriteTarget(target);
+}
+
+function requireWorkspaceId(value: unknown, label: string): void {
+  if (typeof value !== "string" || !value || new TextEncoder().encode(value).byteLength > 256 ||
+      /[\r\n]/.test(value)) {
+    expectedError(WORKSPACE_FILE_ERROR_CODES.invalidRequest, `${label} is invalid.`);
+  }
+}
+
+function requireCommit(value: unknown): void {
+  if (typeof value !== "string" || !gitOidPattern.test(value)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Workspace file references must identify a 40-hex Git commit.",
+    );
+  }
+}
+
+/** Validates a stable file reference before it reaches an Artifacts resolver. */
+export function requireFileRef(reference: FileRef): void {
+  if (!isRecord(reference)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Workspace file references must identify one workspace node and revision.",
+    );
+  }
+  requireWorkspaceId(reference.workspaceId, "Workspace file reference workspace");
+  if (typeof reference.nodeId !== "string" || !isWorkspaceUuid(reference.nodeId)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Workspace file references must identify a stable workspace node.",
+    );
+  }
+  const revision = reference.revision;
+  if (!isRecord(revision)) {
+    expectedError(
+      WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+      "Workspace file references must include an accepted or chat revision.",
+    );
+  }
+  requireCommit(revision.commit);
+  if (revision.kind === "accepted") return;
+  if (revision.kind === "chat" && Number.isSafeInteger(revision.chatId) &&
+      revision.chatId >= 0 && Number.isSafeInteger(revision.epoch) && revision.epoch >= 0 &&
+      revision.epoch <= 1_000_000_000) return;
+  expectedError(
+    WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+    "Workspace file references must identify a valid chat revision.",
+  );
+}
+
 export function requireRequest(request: WorkspaceMutationRequest): void {
   if (!operationIdPattern.test(request.operationId)) {
     expectedError(
@@ -212,6 +298,7 @@ export function requireRequest(request: WorkspaceMutationRequest): void {
       "Expected workspace heads must be Git object IDs.",
     );
   }
+  requireWriteTarget(request.target);
   requireActor(request.actor);
   requireTimestamp(request.timestamp);
   if (!request.message.trim() || request.message.length > 1_000) {
@@ -266,6 +353,7 @@ export function requireStagedRequest(request: StagedWorkspaceMutationRequest): v
       "Expected workspace heads must be Git object IDs.",
     );
   }
+  requireWriteTarget(request.target);
   requireActor(request.actor);
   requireTimestamp(request.timestamp);
   if (!request.message.trim() || request.message.length > 1_000) {
@@ -341,6 +429,7 @@ export async function digestRequest(request: WorkspaceMutationRequest): Promise<
   const canonical = JSON.stringify({
     operationId: request.operationId,
     expectedHead: request.expectedHead,
+    target: parseWriteTarget(request.target),
     actorId: request.actor.id,
     message: request.message,
     changes,
@@ -391,6 +480,7 @@ export async function digestStagedRequest(
   return digestBytes(new TextEncoder().encode(JSON.stringify({
     operationId: request.operationId,
     expectedHead: request.expectedHead,
+    target: parseWriteTarget(request.target),
     actorId: request.actor.id,
     message: request.message,
     changes,

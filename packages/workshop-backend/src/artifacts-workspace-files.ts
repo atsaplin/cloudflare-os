@@ -3,6 +3,9 @@ import {
   MAXIMUM_WORKSPACE_TOTAL_BYTES,
   WORKSPACE_FILE_ERROR_CODES,
   type CommitInfo,
+  type FileRef,
+  type WorkspaceFileRevisionRef,
+  type WriteTarget,
 } from "@gadgets/workshop-shared/api";
 import {
   createWorkspaceNode,
@@ -23,10 +26,13 @@ import {
   digestBytes,
   expectedError,
   isWorkspaceUuid,
+  parseWriteTarget,
   recoveryTrailers,
   requireActor,
+  requireFileRef,
   requireRequest,
   requireStagedRequest,
+  requireWriteTarget,
   requireTimestamp,
   type StagedWorkspaceMutationRequest,
   type WorkspaceActor,
@@ -48,6 +54,7 @@ import type {
   WorkspaceArtifactMutationOperation,
   WorkspaceArtifactReader,
 } from "./workspace-artifacts";
+import { WorkspaceArtifactHeadConflictError } from "./workspace-artifacts";
 import { WorkspaceUploadStore as DurableWorkspaceUploadStore } from "./workspace-upload-store";
 
 const maximumHistoryDepth = 100;
@@ -87,6 +94,7 @@ interface WorkspaceReadRevision {
   repositoryName: string;
   head: string;
   baselineHead: string;
+  revision: WorkspaceFileRevisionRef;
   index: WorkspaceIndexV1;
 }
 
@@ -121,6 +129,7 @@ export type ArtifactsWorkspaceFileUploadStore = Pick<DurableWorkspaceUploadStore
 
 export interface ArtifactsWorkspaceFilesOptions {
   state: DurableObjectState;
+  workspaceId: string;
   lifecycle: ArtifactsWorkspaceFileLifecycle;
   reader: WorkspaceArtifactReader;
   uploadStore: ArtifactsWorkspaceFileUploadStore;
@@ -137,9 +146,14 @@ export interface CreateArtifactsWorkspaceFilesOptions {
 export interface WorkspaceFileRepository {
   initialize(actor: WorkspaceActor): Promise<WorkspaceRevision>;
   getRevision(): Promise<WorkspaceRevision>;
+  getTargetRevision(target: WriteTarget): Promise<WorkspaceRevision>;
   list(folderId: string): Promise<WorkspaceRepositoryNode[]>;
+  listFileRef(reference: FileRef): Promise<WorkspaceRepositoryNode[]>;
   readFileStream(nodeId: string): Promise<ReadableStream<Uint8Array>>;
+  readFileRef(reference: FileRef): Promise<Uint8Array>;
+  readFileRefStream(reference: FileRef): Promise<ReadableStream<Uint8Array>>;
   getHistory(limit?: number): Promise<CommitInfo[]>;
+  getHistoryAt(target: WriteTarget, limit?: number): Promise<CommitInfo[]>;
   stageUpload(ownerId: string, request: WorkspaceUploadRequest): Promise<WorkspaceUpload>;
   getNextUploadExpiry(): number | undefined;
   cleanupExpiredUploads(now?: number): Promise<number>;
@@ -196,6 +210,7 @@ export type ArtifactsWorkspaceFilesFactory = (
 let workspaceFilesFactory: ArtifactsWorkspaceFilesFactory = options =>
   new ArtifactsWorkspaceFiles({
     state: options.state,
+    workspaceId: options.workspaceId,
     lifecycle: options.lifecycle,
     reader: options.reader,
     uploadStore: new DurableWorkspaceUploadStore({
@@ -308,16 +323,44 @@ function byteStream(content: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
-function parseCommittedResult(row: OperationRow): WorkspaceMutationResult {
+function workspaceMutationResult(
+  workspaceId: string,
+  operationId: string,
+  target: WriteTarget,
+  head: string,
+  rootId: string,
+  created: Record<string, string>,
+): WorkspaceMutationResult {
+  return {
+    workspaceId,
+    revision: target.kind === "accepted"
+      ? { kind: "accepted", commit: head }
+      : { kind: "chat", chatId: target.chatId, epoch: target.epoch, commit: head },
+    outcome: "applied",
+    operationId,
+    head,
+    rootId,
+    target,
+    created,
+  };
+}
+
+function parseCommittedResult(
+  row: OperationRow,
+  target: WriteTarget,
+  workspaceId: string,
+): WorkspaceMutationResult {
   if (row.status !== "committed" || row.result_head === null || row.result_root_id === null) {
     throw new Error(`Workspace operation ${row.operation_id} is not committed.`);
   }
-  return {
-    operationId: row.operation_id,
-    head: row.result_head,
-    rootId: row.result_root_id,
-    created: parseCreatedMap(row.created_json),
-  };
+  return workspaceMutationResult(
+    workspaceId,
+    row.operation_id,
+    target,
+    row.result_head,
+    row.result_root_id,
+    parseCreatedMap(row.created_json),
+  );
 }
 
 function createIds(request: WorkspaceMutationRequest | StagedWorkspaceMutationRequest): Record<string, string> {
@@ -441,6 +484,7 @@ function workspaceUuidFromDigest(digest: string): string {
 
 export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   readonly #state: DurableObjectState;
+  readonly #workspaceId: string;
   readonly #lifecycle: ArtifactsWorkspaceFileLifecycle;
   readonly #reader: WorkspaceArtifactReader;
   readonly #uploadStore: ArtifactsWorkspaceFileUploadStore;
@@ -448,6 +492,7 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
 
   constructor(options: ArtifactsWorkspaceFilesOptions) {
     this.#state = options.state;
+    this.#workspaceId = options.workspaceId;
     this.#lifecycle = options.lifecycle;
     this.#reader = options.reader;
     this.#uploadStore = options.uploadStore;
@@ -622,11 +667,13 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   async #readWorkspaceRevision(
     repositoryName: string,
     head: string,
+    revision: WorkspaceFileRevisionRef = { kind: "accepted", commit: head },
   ): Promise<WorkspaceReadRevision> {
     return {
       repositoryName,
       head,
       baselineHead: head,
+      revision,
       index: parseWorkspaceIndex(await this.#reader.readFile(
         repositoryName,
         head,
@@ -643,16 +690,26 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
     ));
   }
 
-  async #readChatRevision(chatId: string, epoch: number): Promise<WorkspaceReadRevision> {
+  async #readChatRevision(
+    chatId: string,
+    epoch: number,
+    revisionChatId?: number,
+  ): Promise<WorkspaceReadRevision> {
     const fork = await this.#lifecycle.getForkStatus(chatId, epoch);
     if (fork !== undefined) {
       if (fork.state !== "open") {
-        throw new Error(`Chat workspace fork ${chatId}/${epoch} is ${fork.state}.`);
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          `Chat workspace fork ${chatId}/${epoch} is ${fork.state}.`,
+        );
       }
       return {
         repositoryName: fork.repositoryName,
         head: fork.latestHead,
         baselineHead: fork.baselineHead,
+        revision: revisionChatId === undefined
+          ? { kind: "accepted", commit: fork.latestHead }
+          : { kind: "chat", chatId: revisionChatId, epoch, commit: fork.latestHead },
         index: parseWorkspaceIndex(await this.#reader.readFile(
           fork.repositoryName,
           fork.latestHead,
@@ -665,8 +722,66 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       repositoryName: canonical.repositoryName,
       head: canonical.head,
       baselineHead: canonical.head,
+      revision: { kind: "accepted", commit: canonical.head },
       index: await this.#readIndex(canonical),
     };
+  }
+
+  async #readTargetRevision(target: WriteTarget): Promise<WorkspaceReadRevision> {
+    requireWriteTarget(target);
+    if (target.kind === "accepted") {
+      const canonical = await this.#canonical();
+      return this.#readWorkspaceRevision(canonical.repositoryName, canonical.head);
+    }
+    return this.#readChatRevision(String(target.chatId), target.epoch, target.chatId);
+  }
+
+  async #resolveNodeRef(reference: FileRef): Promise<{
+    revision: WorkspaceReadRevision;
+    node: WorkspaceRepositoryNode;
+  }> {
+    requireFileRef(reference);
+    if (reference.workspaceId !== this.#workspaceId) {
+      expectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        "Workspace file reference belongs to another workspace.",
+      );
+    }
+
+    let revision: WorkspaceReadRevision;
+    if (reference.revision.kind === "accepted") {
+      const canonical = await this.#canonical();
+      revision = await this.#readWorkspaceRevision(
+        canonical.repositoryName,
+        reference.revision.commit,
+        reference.revision,
+      );
+    } else {
+      const fork = await this.#lifecycle.getForkStatus(
+        String(reference.revision.chatId),
+        reference.revision.epoch,
+      );
+      if (fork?.state !== "open") {
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          "Workspace file references to closed chat forks are unavailable.",
+        );
+      }
+      revision = await this.#readWorkspaceRevision(
+        fork.repositoryName,
+        reference.revision.commit,
+        reference.revision,
+      );
+    }
+
+    const node = getWorkspaceNode(revision.index, reference.nodeId);
+    if (!node) {
+      expectedError(
+        WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+        `Workspace node ${reference.nodeId} does not exist at this revision.`,
+      );
+    }
+    return { revision, node };
   }
 
   async #readChatCommitsAfterBaseline(
@@ -827,6 +942,7 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
     const plan = await this.#plan({
       operationId: request.operationId,
       expectedHead: revision.head,
+      target: { kind: "accepted" },
       actor: request.actor,
       timestamp: request.timestamp,
       message: `Workspace ${operation.kind}: ${sourcePath}`,
@@ -976,8 +1092,19 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
 
   async #cleanupUnstagedFork(operationId: string, expectedHead: string): Promise<void> {
     const fork = await this.#lifecycle.getForkStatus(operationForkId(operationId), operationForkEpoch);
-    if (fork?.state === "open" && fork.latestHead === expectedHead) {
+    if (
+      fork?.state === "discarding" ||
+      (fork?.state === "open" && fork.latestHead === expectedHead)
+    ) {
       await this.#lifecycle.discardChatFork(operationForkId(operationId), operationForkEpoch);
+    }
+  }
+
+  async #discardOperationFork(operationId: string): Promise<void> {
+    const forkId = operationForkId(operationId);
+    const fork = await this.#lifecycle.getForkStatus(forkId, operationForkEpoch);
+    if (fork?.state === "open" || fork?.state === "discarding") {
+      await this.#lifecycle.discardChatFork(forkId, operationForkEpoch);
     }
   }
 
@@ -1008,14 +1135,53 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       await this.#lifecycle.discardChatFork(forkId, operationForkEpoch);
       throw new WorkspaceRepositoryConflictError(accepted.expectedHead, accepted.currentHead);
     }
-    const result: WorkspaceMutationResult = {
-      operationId: request.operationId,
-      head: accepted.head,
-      rootId: canonical.rootId,
+    const result = workspaceMutationResult(
+      this.#workspaceId,
+      request.operationId,
+      request.target,
+      accepted.head,
+      canonical.rootId,
       created,
-    };
+    );
     this.#markCommitted(request.operationId, result);
     await this.#lifecycle.completeAcceptedChatFork(forkId, operationForkEpoch, accepted.head);
+    return result;
+  }
+
+  async #finishChatOperation(
+    request: WorkspaceMutationRequest | StagedWorkspaceMutationRequest,
+    revision: WorkspaceReadRevision,
+    created: Record<string, string>,
+    digest: string,
+  ): Promise<WorkspaceMutationResult | undefined> {
+    if (request.target.kind !== "chat") return undefined;
+    const chatId = String(request.target.chatId);
+    const fork = await this.#lifecycle.getForkStatus(chatId, request.target.epoch);
+    if (fork?.state !== "open") return undefined;
+
+    let stagedHead = this.#getOperation(request.operationId)?.staged_head;
+    if (stagedHead === null || stagedHead === undefined) {
+      const commits = await this.#readChatCommitsAfterBaseline(
+        chatId,
+        request.target.epoch,
+        fork.latestHead,
+        fork.baselineHead,
+      );
+      const recovery = commits.find(commit =>
+        commitHasRecoveryTrailers(commit, request.operationId, digest));
+      stagedHead = recovery?.oid;
+      if (stagedHead !== undefined) this.#markStaged(request.operationId, stagedHead);
+    }
+    if (stagedHead === null || stagedHead === undefined) return undefined;
+    const result = workspaceMutationResult(
+      this.#workspaceId,
+      request.operationId,
+      request.target,
+      stagedHead,
+      revision.index.rootId,
+      created,
+    );
+    this.#markCommitted(request.operationId, result);
     return result;
   }
 
@@ -1032,14 +1198,31 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
         `Workspace operation ${request.operationId} was reused with different input.`,
       );
     }
+    if (existing && request.target.kind === "chat") {
+      const fork = await this.#lifecycle.getForkStatus(
+        String(request.target.chatId),
+        request.target.epoch,
+      );
+      if (fork?.state !== "open") {
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          "Workspace operations cannot be replayed after their chat fork closes.",
+        );
+      }
+    }
     if (existing?.status === "committed") {
-      const result = parseCommittedResult(existing);
-      await this.#cleanupCommittedFork(request.operationId, result.head);
+      const result = parseCommittedResult(existing, request.target, this.#workspaceId);
+      if (request.target.kind === "accepted") {
+        await this.#cleanupCommittedFork(request.operationId, result.head);
+      }
       return result;
     }
     if (existing?.status === "stale") {
       if (!existing.stale_current_head) {
         throw new Error(`Workspace operation ${request.operationId} has no stale head.`);
+      }
+      if (request.target.kind === "accepted") {
+        await this.#discardOperationFork(request.operationId);
       }
       throw new WorkspaceRepositoryConflictError(request.expectedHead, existing.stale_current_head);
     }
@@ -1052,28 +1235,59 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       name: existing?.actor_name ?? request.actor.name,
     };
     const operationTimestamp = existing?.operation_timestamp ?? request.timestamp;
-    if (existing) {
+    const targetRevision = await this.#readTargetRevision(request.target);
+    if (existing?.status === "prepared" && request.target.kind === "accepted") {
+      await this.#cleanupUnstagedFork(request.operationId, request.expectedHead);
+    }
+    if (existing && request.target.kind === "accepted") {
       const recovered = await this.#finishAcceptedOperation(request, canonical, created);
       if (recovered) return recovered;
     }
-    const current = await this.#canonical();
-    if (current.head !== request.expectedHead) {
-      this.#markStale(request.operationId, current.head);
-      throw new WorkspaceRepositoryConflictError(request.expectedHead, current.head);
+    if (existing && request.target.kind === "chat") {
+      const recovered = await this.#finishChatOperation(request, targetRevision, created, digest);
+      if (recovered) return recovered;
+    }
+    if (targetRevision.head !== request.expectedHead) {
+      this.#markStale(request.operationId, targetRevision.head);
+      throw new WorkspaceRepositoryConflictError(request.expectedHead, targetRevision.head);
     }
 
     try {
-      const initial = await this.#readIndex(current);
+      const initial = targetRevision.index;
       const resolved = await resolveChanges();
       const planRequest: WorkspaceMutationRequest = {
         operationId: request.operationId,
         expectedHead: request.expectedHead,
+        target: request.target,
         actor: operationActor,
         timestamp: operationTimestamp,
         message: request.message,
         changes: resolved,
       };
       const plan = await this.#plan(planRequest, initial, created);
+      if (request.target.kind === "chat") {
+        const message = `${request.message}\n\n${recoveryTrailers(request.operationId, digest)}`;
+        const stagedFork = await this.#lifecycle.stageChatMutation(
+          String(request.target.chatId),
+          request.target.epoch,
+          operationActor,
+          message,
+          plan.mutation,
+          request.expectedHead,
+        );
+        this.#markStaged(request.operationId, stagedFork.latestHead);
+        const result = workspaceMutationResult(
+          this.#workspaceId,
+          request.operationId,
+          request.target,
+          stagedFork.latestHead,
+          targetRevision.index.rootId,
+          created,
+        );
+        this.#markCommitted(request.operationId, result);
+        return result;
+      }
+
       const forkId = operationForkId(request.operationId);
       const fork = await this.#lifecycle.getForkStatus(forkId, operationForkEpoch);
       let stagedHead = existing?.staged_head;
@@ -1090,6 +1304,7 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
             operationActor,
             request.message,
             plan.mutation,
+            request.expectedHead,
           );
           stagedHead = stagedFork.latestHead;
           this.#markStaged(request.operationId, stagedHead);
@@ -1102,18 +1317,27 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
         await this.#lifecycle.discardChatFork(forkId, operationForkEpoch);
         throw new WorkspaceRepositoryConflictError(accepted.expectedHead, accepted.currentHead);
       }
-      const result: WorkspaceMutationResult = {
-        operationId: request.operationId,
-        head: accepted.head,
-        rootId: canonical.rootId,
+      const result = workspaceMutationResult(
+        this.#workspaceId,
+        request.operationId,
+        request.target,
+        accepted.head,
+        canonical.rootId,
         created,
-      };
+      );
       this.#markCommitted(request.operationId, result);
       await this.#lifecycle.completeAcceptedChatFork(forkId, operationForkEpoch, accepted.head);
       return result;
     } catch (error) {
       const row = this.#getOperation(request.operationId);
-      if (row?.status === "prepared") {
+      if (error instanceof WorkspaceArtifactHeadConflictError) {
+        this.#markStale(request.operationId, error.currentHead);
+        if (request.target.kind === "accepted" && row?.status === "prepared") {
+          await this.#discardOperationFork(request.operationId);
+        }
+        throw new WorkspaceRepositoryConflictError(error.expectedHead, error.currentHead);
+      }
+      if (request.target.kind === "accepted" && row?.status === "prepared") {
         await this.#cleanupUnstagedFork(request.operationId, request.expectedHead);
       }
       throw error;
@@ -1123,7 +1347,12 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   initialize(actor: WorkspaceActor): Promise<WorkspaceRevision> {
     return this.#withLock(async () => {
       const canonical = await this.#lifecycle.ensureCanonical(actor);
-      return { head: canonical.head, rootId: canonical.rootId };
+      return {
+        workspaceId: this.#workspaceId,
+        revision: { kind: "accepted", commit: canonical.head },
+        head: canonical.head,
+        rootId: canonical.rootId,
+      };
     });
   }
 
@@ -1131,7 +1360,24 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
     return this.#withLock(async () => {
       const canonical = await this.#canonical();
       const index = await this.#readIndex(canonical);
-      return { head: canonical.head, rootId: index.rootId };
+      return {
+        workspaceId: this.#workspaceId,
+        revision: { kind: "accepted", commit: canonical.head },
+        head: canonical.head,
+        rootId: index.rootId,
+      };
+    });
+  }
+
+  getTargetRevision(target: WriteTarget): Promise<WorkspaceRevision> {
+    return this.#withLock(async () => {
+      const revision = await this.#readTargetRevision(target);
+      return {
+        workspaceId: this.#workspaceId,
+        revision: revision.revision,
+        head: revision.head,
+        rootId: revision.index.rootId,
+      };
     });
   }
 
@@ -1149,6 +1395,19 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
     });
   }
 
+  listFileRef(reference: FileRef): Promise<WorkspaceRepositoryNode[]> {
+    return this.#withLock(async () => {
+      const { revision, node } = await this.#resolveNodeRef(reference);
+      if (node.kind !== "folder") {
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          `Workspace node ${reference.nodeId} is not a folder.`,
+        );
+      }
+      return listWorkspaceChildren(revision.index, node.id);
+    });
+  }
+
   async readFile(nodeId: string): Promise<Uint8Array> {
     return this.#withLock(async () => {
       const canonical = await this.#canonical();
@@ -1162,6 +1421,23 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
 
   async readFileStream(nodeId: string): Promise<ReadableStream<Uint8Array>> {
     return byteStream(await this.readFile(nodeId));
+  }
+
+  async readFileRef(reference: FileRef): Promise<Uint8Array> {
+    return this.#withLock(async () => {
+      const { revision, node } = await this.#resolveNodeRef(reference);
+      if (node.kind !== "file") {
+        expectedError(
+          WORKSPACE_FILE_ERROR_CODES.invalidRequest,
+          `Workspace node ${reference.nodeId} is not a file.`,
+        );
+      }
+      return this.#reader.readFile(revision.repositoryName, revision.head, node.path);
+    });
+  }
+
+  async readFileRefStream(reference: FileRef): Promise<ReadableStream<Uint8Array>> {
+    return byteStream(await this.readFileRef(reference));
   }
 
   hasChatFileChanges(chatId: string, epoch: number): Promise<boolean> {
@@ -1317,6 +1593,7 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
         request.actor,
         message,
         plan.mutation,
+        revision.head,
       );
       const result: ChatWorkspaceOperationResult = { ...plan.result, head: staged.latestHead };
       this.#insertChatOperationReceipt(request, digest, revision.repositoryName, result);
@@ -1329,6 +1606,27 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
       throw new Error("Workspace history limit must be an integer from 1 to 100.");
     }
     return this.#lifecycle.getHistory(limit);
+  }
+
+  getHistoryAt(target: WriteTarget, limit = 50): Promise<CommitInfo[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > maximumHistoryDepth) {
+      throw new Error("Workspace history limit must be an integer from 1 to 100.");
+    }
+    return this.#withLock(async () => {
+      const revision = await this.#readTargetRevision(target);
+      if (target.kind === "chat") {
+        const fork = await this.#lifecycle.getForkStatus(String(target.chatId), target.epoch);
+        if (fork?.state === "open") {
+          return this.#lifecycle.readChatCommitLog(
+            String(target.chatId),
+            target.epoch,
+            revision.head,
+            { depth: limit },
+          );
+        }
+      }
+      return this.#lifecycle.getHistory(limit);
+    });
   }
 
   readCommitLog(oid: string, options?: { depth?: number }): Promise<CommitInfo[]> {
@@ -1357,22 +1655,24 @@ export class ArtifactsWorkspaceFiles implements WorkspaceFileRepository {
   }
 
   async apply(request: WorkspaceMutationRequest): Promise<WorkspaceMutationResult> {
-    requireRequest(request);
-    const digest = await digestRequest(request);
+    const normalized = { ...request, target: parseWriteTarget(request.target) };
+    requireRequest(normalized);
+    const digest = await digestRequest(normalized);
     return this.#withLock(() => this.#apply(
-      request,
+      normalized,
       digest,
-      () => Promise.resolve(request.changes),
+      () => Promise.resolve(normalized.changes),
     ));
   }
 
   async applyStaged(request: StagedWorkspaceMutationRequest): Promise<WorkspaceMutationResult> {
-    requireStagedRequest(request);
-    const digest = await digestStagedRequest(request);
+    const normalized = { ...request, target: parseWriteTarget(request.target) };
+    requireStagedRequest(normalized);
+    const digest = await digestStagedRequest(normalized);
     return this.#withLock(() => this.#apply(
-      request,
+      normalized,
       digest,
-      () => this.#resolveStagedChanges(request),
+      () => this.#resolveStagedChanges(normalized),
     ));
   }
 }

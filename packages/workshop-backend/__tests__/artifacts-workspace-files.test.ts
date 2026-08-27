@@ -23,6 +23,7 @@ import type {
   WorkspaceArtifactMutation,
   WorkspaceArtifactReader,
 } from "../src/workspace-artifacts";
+import { WorkspaceArtifactHeadConflictError } from "../src/workspace-artifacts";
 import type {
   WorkspaceMutationRequest,
   WorkspaceUpload,
@@ -63,8 +64,10 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   readChatCommitLogCalls = 0;
   throwBeforeStage = false;
   throwAfterStage = false;
+  advanceCanonicalBeforeStage = false;
   throwAfterAccept = false;
   failCleanupOnce = false;
+  failDiscardOnce = false;
   deleted = false;
   initialized = false;
   #counter = 1;
@@ -129,18 +132,69 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
     actor: WorkspaceActor,
     message: string,
     mutation: WorkspaceArtifactMutation,
+    expectedHead: string,
   ): Promise<WorkspaceArtifactForkStatus> {
     void actor;
     void message;
-    if (this.throwBeforeStage) throw new Error("Test failed before staging.");
     const key = `${chatId}:${epoch}`;
+    if (this.advanceCanonicalBeforeStage) {
+      this.advanceCanonicalBeforeStage = false;
+      const previous = this.snapshots.get(this.canonical.repositoryName)?.get(this.canonical.head);
+      if (!previous) throw new Error("Test canonical snapshot is missing.");
+      const advancedHead = nextHead(this.#counter++);
+      this.snapshots.get(this.canonical.repositoryName)?.set(advancedHead, cloneSnapshot(previous));
+      this.canonical.head = advancedHead;
+      const repositoryName = `fork-${chatId}`;
+      this.snapshots.set(repositoryName, new Map([
+        [advancedHead, cloneSnapshot(previous)],
+      ]));
+      this.forks.set(key, {
+        chatId,
+        epoch,
+        repositoryName,
+        remote: `https://artifacts.example/${repositoryName}`,
+        defaultBranch: "main",
+        baselineHead: advancedHead,
+        latestHead: advancedHead,
+        sandboxId: `sandbox-${repositoryName}`,
+        state: "open",
+      });
+    }
     const existing = this.forks.get(key);
+    if (existing && existing.state !== "open") {
+      throw new Error(`Test chat fork is ${existing.state}.`);
+    }
     const baselineHead = existing?.baselineHead ?? this.canonical.head;
     const base = existing === undefined
       ? this.snapshots.get(this.canonical.repositoryName)?.get(baselineHead)
       : this.snapshots.get(existing.repositoryName)?.get(existing.latestHead);
     if (base === undefined) throw new Error("Test snapshot is missing.");
+    if (existing?.latestHead !== undefined && existing.latestHead !== expectedHead) {
+      throw new WorkspaceArtifactHeadConflictError(expectedHead, existing.latestHead);
+    }
+    if (existing === undefined && this.canonical.head !== expectedHead) {
+      throw new WorkspaceArtifactHeadConflictError(expectedHead, this.canonical.head);
+    }
     const repositoryName = existing?.repositoryName ?? `fork-${chatId}`;
+    if (this.throwBeforeStage) {
+      if (existing === undefined) {
+        this.snapshots.set(repositoryName, new Map([
+          [baselineHead, cloneSnapshot(base)],
+        ]));
+        this.forks.set(key, {
+          chatId,
+          epoch,
+          repositoryName,
+          remote: `https://artifacts.example/${repositoryName}`,
+          defaultBranch: "main",
+          baselineHead,
+          latestHead: baselineHead,
+          sandboxId: `sandbox-${repositoryName}`,
+          state: "open",
+        });
+      }
+      throw new Error("Test failed before staging.");
+    }
     const head = nextHead(this.#counter++);
     const snapshot = cloneSnapshot(base);
     for (const operation of mutation.operations) {
@@ -217,6 +271,12 @@ class InMemoryArtifacts implements ArtifactsWorkspaceFileLifecycle, WorkspaceArt
   }
 
   discardChatFork(chatId: string, epoch: number): Promise<void> {
+    if (this.failDiscardOnce) {
+      this.failDiscardOnce = false;
+      const fork = this.forks.get(`${chatId}:${epoch}`);
+      if (fork) fork.state = "discarding";
+      throw new Error("Test lost the discard response.");
+    }
     this.forks.delete(`${chatId}:${epoch}`);
     return Promise.resolve();
   }
@@ -372,6 +432,7 @@ async function withFiles<T>(
     createChatOperationReceiptTable(state);
     const files = new ArtifactsWorkspaceFiles({
       state,
+      workspaceId: "test-workspace",
       lifecycle: artifacts,
       reader: artifacts,
       uploadStore: uploads,
@@ -410,6 +471,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const mutation: WorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000201",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:00:00.000Z",
         message: "Add readme",
@@ -435,12 +497,332 @@ describe("ArtifactsWorkspaceFiles", () => {
     expect(result.history).toEqual([]);
   });
 
+  it("applies chat-target mutations only to the chat fork", async () => {
+    const result = await withFiles("chat-target", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const chatBefore = await files.getTargetRevision({ kind: "chat", chatId: 17, epoch: 0 });
+      const applied = await files.apply({
+        operationId: "00000000-0000-4000-8000-000000000250",
+        expectedHead: initial.head,
+        target: { kind: "chat", chatId: 17, epoch: 0 },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:00:00.000Z",
+        message: "Add chat note",
+        changes: [{
+          kind: "createFile",
+          clientId: "note",
+          parent: { nodeId: initial.rootId },
+          name: "chat.txt",
+          content: textBytes("chat"),
+        }],
+      });
+      const chatRef = {
+        workspaceId: applied.workspaceId,
+        nodeId: applied.created.note,
+        revision: applied.revision,
+      };
+      const chatBytes = await files.readFileRef(chatRef);
+      const chat = await files.getTargetRevision({ kind: "chat", chatId: 17, epoch: 0 });
+      const fork = artifacts.forks.get("17:0");
+      if (!fork) throw new Error("Test chat fork was not created.");
+      const forkSnapshot = { ...fork };
+      fork.state = "discarding";
+      const closedRead = files.readFileRef(chatRef).then(
+        () => "read",
+        error => (error instanceof Error ? error.message : "unknown"),
+      );
+      return {
+        chatBefore,
+        applied,
+        accepted: await files.getRevision(),
+        chat,
+        fork: forkSnapshot,
+        chatBytes,
+        closedRead: await closedRead,
+      };
+    });
+
+    expect(result.chatBefore.revision).toEqual({ kind: "accepted", commit: result.accepted.head });
+    expect(result.applied).toMatchObject({
+      outcome: "applied",
+      target: { kind: "chat", chatId: 17, epoch: 0 },
+      revision: { kind: "chat", chatId: 17, epoch: 0 },
+    });
+    expect(result.applied.head).not.toBe(result.accepted.head);
+    expect(result.chat.head).toBe(result.applied.head);
+    expect(result.fork?.state).toBe("open");
+    expect(result.chatBytes).toEqual(textBytes("chat"));
+    expect(result.closedRead).toMatch(/closed chat forks/);
+  });
+
+  it("recovers and replays a chat-target mutation without applying it twice", async () => {
+    const result = await withFiles("chat-target-retry", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const target = { kind: "chat" as const, chatId: 18, epoch: 0, ignored: true };
+      const request: WorkspaceMutationRequest = {
+        operationId: "00000000-0000-4000-8000-000000000251",
+        expectedHead: initial.head,
+        target,
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:01:00.000Z",
+        message: "Add recoverable chat note",
+        changes: [{
+          kind: "createFile",
+          clientId: "note",
+          parent: { nodeId: initial.rootId },
+          name: "recoverable.txt",
+          content: textBytes("recoverable"),
+        }],
+      };
+
+      artifacts.throwAfterStage = true;
+      await expect(files.apply(request)).rejects.toThrow("lost the staged response");
+      artifacts.throwAfterStage = false;
+
+      const recovered = await files.apply(request);
+      const replayed = await files.apply({
+        ...request,
+        target: { kind: "chat", chatId: 18, epoch: 0 },
+      });
+      return {
+        recovered,
+        replayed,
+        stagedMutationCount: artifacts.stagedMutations.length,
+        accepted: await files.getRevision(),
+      };
+    });
+
+    expect(result.recovered).toEqual(result.replayed);
+    expect(result.recovered).toMatchObject({
+      outcome: "applied",
+      target: { kind: "chat", chatId: 18, epoch: 0 },
+      revision: { kind: "chat", chatId: 18, epoch: 0 },
+    });
+    expect(result.stagedMutationCount).toBe(1);
+    expect(result.accepted.head).toBe(INITIAL_HEAD);
+  });
+
+  it("rejects a committed chat-target replay after its fork is discarded", async () => {
+    await withFiles("chat-target-committed-discard", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const request: WorkspaceMutationRequest = {
+        operationId: "00000000-0000-4000-8000-000000000257",
+        expectedHead: initial.head,
+        target: { kind: "chat", chatId: 19, epoch: 0 },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:01:15.000Z",
+        message: "Create discarded chat folder",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "Discarded",
+        }],
+      };
+      await files.apply(request);
+      await artifacts.discardChatFork("19", 0);
+
+      await expectCode(files.apply(request), WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+      expect(artifacts.stagedMutations).toHaveLength(1);
+      expect(artifacts.forks.size).toBe(0);
+    });
+  });
+
+  it("rejects a prepared chat-target retry after its fork is discarded", async () => {
+    await withFiles("chat-target-prepared-discard", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const request: WorkspaceMutationRequest = {
+        operationId: "00000000-0000-4000-8000-000000000258",
+        expectedHead: initial.head,
+        target: { kind: "chat", chatId: 20, epoch: 0 },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:01:20.000Z",
+        message: "Create lost discarded chat folder",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "Discarded",
+        }],
+      };
+      artifacts.throwAfterStage = true;
+      await expect(files.apply(request)).rejects.toThrow("lost the staged response");
+      artifacts.throwAfterStage = false;
+      await artifacts.discardChatFork("20", 0);
+
+      await expectCode(files.apply(request), WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+      expect(artifacts.stagedMutations).toHaveLength(1);
+      expect(artifacts.forks.size).toBe(0);
+    });
+  });
+
+  it("cleans an accepted operation fork when canonical advances before staging", async () => {
+    const result = await withFiles("accepted-stage-race", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      artifacts.advanceCanonicalBeforeStage = true;
+      const error = await files.apply({
+        operationId: "00000000-0000-4000-8000-000000000255",
+        expectedHead: initial.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:01:30.000Z",
+        message: "Lose accepted stage race",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "Stale",
+        }],
+      }).then(
+        () => undefined,
+        cause => cause,
+      );
+      return { error, forks: [...artifacts.forks.values()] };
+    });
+
+    expect(result.error).toBeInstanceOf(WorkspaceRepositoryConflictError);
+    expect(result.forks).toEqual([]);
+  });
+
+  it("retries accepted CAS-race cleanup after a lost discard response", async () => {
+    const result = await withFiles("accepted-stage-race-cleanup", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const request: WorkspaceMutationRequest = {
+        operationId: "00000000-0000-4000-8000-000000000256",
+        expectedHead: initial.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:01:45.000Z",
+        message: "Recover accepted stage-race cleanup",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "Stale",
+        }],
+      };
+      artifacts.advanceCanonicalBeforeStage = true;
+      artifacts.failDiscardOnce = true;
+      const firstError = await files.apply(request).then(
+        () => undefined,
+        cause => cause,
+      );
+      const retryError = await files.apply(request).then(
+        () => undefined,
+        cause => cause,
+      );
+      return { firstError, retryError, forks: [...artifacts.forks.values()] };
+    });
+
+    expect(result.firstError).toMatchObject({ message: "Test lost the discard response." });
+    expect(result.retryError).toBeInstanceOf(WorkspaceRepositoryConflictError);
+    expect(result.forks).toEqual([]);
+  });
+
+  it("resolves historical FileRefs after rename, move, edit, and deletion", async () => {
+    const result = await withFiles("historical-file-ref", async files => {
+      const initial = await files.initialize(ACTOR);
+      const created = await files.apply({
+        operationId: "00000000-0000-4000-8000-000000000252",
+        expectedHead: initial.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:02:00.000Z",
+        message: "Create historical file",
+        changes: [{
+          kind: "createFile",
+          clientId: "file",
+          parent: { nodeId: initial.rootId },
+          name: "before.txt",
+          content: textBytes("before"),
+        }],
+      });
+      const nodeId = created.created.file;
+      const originalRef = {
+        workspaceId: created.workspaceId,
+        nodeId,
+        revision: created.revision,
+      };
+      const changed = await files.apply({
+        operationId: "00000000-0000-4000-8000-000000000253",
+        expectedHead: created.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:03:00.000Z",
+        message: "Move and edit historical file",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "Documents",
+        }, {
+          kind: "move",
+          nodeId,
+          parent: { clientId: "folder" },
+          name: "after.txt",
+        }, {
+          kind: "replaceFile",
+          nodeId,
+          content: textBytes("after"),
+        }],
+      });
+      const changedRef = {
+        workspaceId: changed.workspaceId,
+        nodeId,
+        revision: changed.revision,
+      };
+      const folderRef = {
+        workspaceId: changed.workspaceId,
+        nodeId: changed.created.folder,
+        revision: changed.revision,
+      };
+      const removed = await files.apply({
+        operationId: "00000000-0000-4000-8000-000000000254",
+        expectedHead: changed.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:04:00.000Z",
+        message: "Delete historical file",
+        changes: [{ kind: "delete", nodeId }],
+      });
+
+      return {
+        nodeId,
+        originalBytes: await files.readFileRef(originalRef),
+        changedBytes: await files.readFileRef(changedRef),
+        changedChildren: await files.listFileRef(folderRef),
+        originalBytesAfterDelete: await files.readFileRef(originalRef),
+        removedRead: await files.readFileRef({
+          workspaceId: removed.workspaceId,
+          nodeId,
+          revision: removed.revision,
+        }).then(
+          () => "read",
+          error => (error instanceof Error ? error.message : "unknown"),
+        ),
+      };
+    });
+
+    expect(result.originalBytes).toEqual(textBytes("before"));
+    expect(result.changedBytes).toEqual(textBytes("after"));
+    expect(result.changedChildren).toEqual([
+      expect.objectContaining({
+        id: result.nodeId,
+        name: "after.txt",
+        path: "Documents/after.txt",
+      }),
+    ]);
+    expect(result.originalBytesAfterDelete).toEqual(textBytes("before"));
+    expect(result.removedRead).toMatch(/does not exist at this revision/);
+  });
+
   it("resolves sequential replace, move, and delete operations", async () => {
     const result = await withFiles("sequential", async files => {
       const initial = await files.initialize(ACTOR);
       const created = await files.apply({
         operationId: "00000000-0000-4000-8000-000000000202",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:00:00.000Z",
         message: "Create file",
@@ -449,6 +831,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const moved = await files.apply({
         operationId: "00000000-0000-4000-8000-000000000203",
         expectedHead: created.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:01:00.000Z",
         message: "Move file",
@@ -460,6 +843,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const deleted = await files.apply({
         operationId: "00000000-0000-4000-8000-000000000204",
         expectedHead: moved.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:02:00.000Z",
         message: "Delete file",
@@ -478,6 +862,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const created = await files.apply({
         operationId: "00000000-0000-4000-8000-000000000208",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:02:00.000Z",
         message: "Create folder",
@@ -486,6 +871,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       await files.apply({
         operationId: "00000000-0000-4000-8000-000000000209",
         expectedHead: created.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:03:00.000Z",
         message: "Move folder",
@@ -505,9 +891,10 @@ describe("ArtifactsWorkspaceFiles", () => {
         size: 6,
         mediaType: "text/plain",
       });
-      const request: ChatWorkspaceOperationRequest = {
+      const request: StagedWorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000205",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:03:00.000Z",
         message: "Add staged file",
@@ -534,6 +921,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const request: WorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000210",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:05:00.000Z",
         message: "Recover staged response",
@@ -555,6 +943,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const request: WorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000214",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:09:00.000Z",
         message: "Recover before stage",
@@ -581,12 +970,44 @@ describe("ArtifactsWorkspaceFiles", () => {
     });
   });
 
+  it("resumes accepted pre-stage cleanup after discard closes the fork", async () => {
+    const result = await withFiles("pre-stage-discard-retry", async (files, artifacts) => {
+      const initial = await files.initialize(ACTOR);
+      const request: WorkspaceMutationRequest = {
+        operationId: "00000000-0000-4000-8000-000000000259",
+        expectedHead: initial.head,
+        target: { kind: "accepted" },
+        actor: ACTOR,
+        timestamp: "2026-08-26T01:05:30.000Z",
+        message: "Recover pre-stage discard",
+        changes: [{
+          kind: "createFolder",
+          clientId: "folder",
+          parent: { nodeId: initial.rootId },
+          name: "folder",
+        }],
+      };
+      artifacts.throwBeforeStage = true;
+      artifacts.failDiscardOnce = true;
+      await expect(files.apply(request)).rejects.toThrow("lost the discard response");
+      const stranded = [...artifacts.forks.values()];
+      artifacts.throwBeforeStage = false;
+      const recovered = await files.apply(request);
+      return { recovered, stranded, forks: artifacts.forks.size };
+    });
+
+    expect(result.stranded).toMatchObject([{ state: "discarding" }]);
+    expect(result.recovered.created.folder).toMatch(/[0-9a-f-]{36}/);
+    expect(result.forks).toBe(0);
+  });
+
   it("retries a committed operation to finish accepted-fork cleanup", async () => {
     const result = await withFiles("accepted-response", async (files, artifacts) => {
       const initial = await files.initialize(ACTOR);
       const request: WorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000211",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:06:00.000Z",
         message: "Recover accepted response",
@@ -607,6 +1028,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const request: WorkspaceMutationRequest = {
         operationId: "00000000-0000-4000-8000-000000000213",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:08:00.000Z",
         message: "Recover accepted response",
@@ -634,6 +1056,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       await expectCode(files.apply({
         operationId: "00000000-0000-4000-8000-000000000212",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:07:00.000Z",
         message: "Exceed quota",
@@ -657,6 +1080,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       const request = {
         operationId: "00000000-0000-4000-8000-000000000206",
         expectedHead: initial.head,
+        target: { kind: "accepted" },
         actor: ACTOR,
         timestamp: "2026-08-26T01:04:00.000Z",
         message: "Create file",
@@ -887,14 +1311,16 @@ describe("ArtifactsWorkspaceFiles", () => {
         request.chatId,
         request.epoch,
       );
+      let expectedHead = (await artifacts.getForkStatus("45-old", 0))!.latestHead;
       for (let index = 0; index < 101; index += 1) {
-        await artifacts.stageChatMutation("45-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
+        const checkpoint = await artifacts.stageChatMutation("45-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
             kind: "write",
             path: `gadgets/${index}/index.ts`,
             content: textBytes("export {}"),
           }],
-        });
+        }, expectedHead);
+        expectedHead = checkpoint.latestHead;
       }
 
       const recovered = await files.runChatOperation(request);
@@ -935,14 +1361,16 @@ describe("ArtifactsWorkspaceFiles", () => {
         request.chatId,
         request.epoch,
       );
+      let expectedHead = (await artifacts.getForkStatus("49-delete-old", 0))!.latestHead;
       for (let index = 0; index < 101; index += 1) {
-        await artifacts.stageChatMutation("49-delete-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
+        const checkpoint = await artifacts.stageChatMutation("49-delete-old", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
             kind: "write",
             path: `gadgets/${index}/index.ts`,
             content: textBytes("export {}"),
           }],
-        });
+        }, expectedHead);
+        expectedHead = checkpoint.latestHead;
       }
 
       const recovered = await files.runChatOperation(request);
@@ -975,14 +1403,16 @@ describe("ArtifactsWorkspaceFiles", () => {
         operationId: "tool-create-after-list",
         operation: { kind: "mkdir", path: "later" },
       });
+      let expectedHead = (await artifacts.getForkStatus("47-receipt", 0))!.latestHead;
       for (let index = 0; index < 101; index += 1) {
-        await artifacts.stageChatMutation("47-receipt", 0, ACTOR, `Gadget checkpoint ${index}`, {
+        const checkpoint = await artifacts.stageChatMutation("47-receipt", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
             kind: "write",
             path: `gadgets/${index}/index.ts`,
             content: textBytes("export {}"),
           }],
-        });
+        }, expectedHead);
+        expectedHead = checkpoint.latestHead;
       }
 
       const recovered = await files.runChatOperation(request);
@@ -1032,14 +1462,16 @@ describe("ArtifactsWorkspaceFiles", () => {
         timestamp: "2026-08-26T02:30:00.000Z",
         operation: { kind: "mkdir", path: "old" },
       });
+      let expectedHead = (await artifacts.getForkStatus("45-dirty", 0))!.latestHead;
       for (let index = 0; index < 101; index += 1) {
-        await artifacts.stageChatMutation("45-dirty", 0, ACTOR, `Gadget checkpoint ${index}`, {
+        const checkpoint = await artifacts.stageChatMutation("45-dirty", 0, ACTOR, `Gadget checkpoint ${index}`, {
           operations: [{
             kind: "write",
             path: `gadgets/${index}/index.ts`,
             content: textBytes("export {}"),
           }],
-        });
+        }, expectedHead);
+        expectedHead = checkpoint.latestHead;
       }
 
       expect(await files.hasChatFileChanges("45-dirty", 0)).toBe(true);
@@ -1051,7 +1483,7 @@ describe("ArtifactsWorkspaceFiles", () => {
       await files.initialize(ACTOR);
       await artifacts.stageChatMutation("46", 0, ACTOR, "Gadget checkpoint", {
         operations: [{ kind: "write", path: "gadgets/1/index.ts", content: textBytes("export {}") }],
-      });
+      }, INITIAL_HEAD);
 
       expect(await files.hasChatFileChanges("46", 0)).toBe(false);
     });

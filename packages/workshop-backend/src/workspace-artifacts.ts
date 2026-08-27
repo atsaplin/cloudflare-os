@@ -448,6 +448,14 @@ export interface WorkspaceArtifactMutation {
   operations: readonly WorkspaceArtifactMutationOperation[];
 }
 
+/** A chat fork changed after a caller captured its planned mutation head. */
+export class WorkspaceArtifactHeadConflictError extends Error {
+  constructor(readonly expectedHead: string, readonly currentHead: string) {
+    super(`Workspace chat fork changed from ${expectedHead} to ${currentHead}.`);
+    this.name = "WorkspaceArtifactHeadConflictError";
+  }
+}
+
 /** Minimal Sandbox client used by trusted repository Git operations. */
 export interface WorkspaceArtifactSandbox {
   exists(path: string): Promise<{ exists: boolean }>;
@@ -1382,12 +1390,17 @@ export class WorkspaceArtifactLifecycle {
     actor: WorkspaceActor,
     message: string,
     mutation: WorkspaceArtifactMutation,
+    expectedHead: string,
   ): Promise<WorkspaceArtifactChatFork> {
     await this.ensureChatFork(chatId, epoch);
     return this.#withLock(async () => {
       let row = this.#forkRow(chatId, epoch);
       if (!row || row.state !== "open") throw new Error("Chat fork is not open.");
       row = await this.#reconcileOpenForkHead(row);
+      requireOid(expectedHead, "Expected chat fork head");
+      if (row.latest_head !== expectedHead) {
+        throw new WorkspaceArtifactHeadConflictError(expectedHead, row.latest_head);
+      }
       const repo = await this.#getReadyRepository(row.repository_name);
       const token = await repo.createToken("write", 900);
       let head: string;
@@ -1641,6 +1654,7 @@ export interface WorkspaceArtifactCodeLifecycle {
     actor: WorkspaceActor,
     message: string,
     mutation: WorkspaceArtifactMutation,
+    expectedHead: string,
   ): Promise<WorkspaceArtifactChatFork>;
   acceptChatFork(chatId: string, epoch: number): Promise<WorkspaceArtifactAcceptResult>;
   completeAcceptedChatFork(chatId: string, epoch: number, acceptedHead: string): Promise<void>;
@@ -1784,7 +1798,7 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
     return changed;
   }
 
-  stageGadgetFiles(
+  async stageGadgetFiles(
     chatId: string,
     epoch: number,
     actor: WorkspaceActor,
@@ -1807,7 +1821,18 @@ export class ArtifactsWorkspaceRepository implements WorkspaceCodeRepository {
         });
       }
     }
-    return this.#lifecycle.stageChatMutation(chatId, epoch, actor, message, { operations });
+    const fork = await this.#lifecycle.getForkStatus(chatId, epoch);
+    const expectedHead = fork?.state === "open"
+      ? fork.latestHead
+      : (await this.#canonical()).head;
+    return this.#lifecycle.stageChatMutation(
+      chatId,
+      epoch,
+      actor,
+      message,
+      { operations },
+      expectedHead,
+    );
   }
 
   async commitGadgetFiles(
