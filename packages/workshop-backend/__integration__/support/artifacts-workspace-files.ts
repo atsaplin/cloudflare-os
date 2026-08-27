@@ -10,7 +10,10 @@ import {
   WORKSPACE_INDEX_PATH,
 } from "../../src/workspace-manifest";
 import { WorkspaceUploadStore } from "../../src/workspace-upload-store";
-import { ArtifactsWorkspaceRepository } from "../../src/workspace-artifacts";
+import {
+  ArtifactsWorkspaceRepository,
+  WorkspaceArtifactHeadConflictError,
+} from "../../src/workspace-artifacts";
 import type {
   WorkspaceArtifactAcceptResult,
   WorkspaceArtifactCanonical,
@@ -186,6 +189,7 @@ class LocalArtifacts implements WorkspaceArtifactReader, ArtifactsWorkspaceFileL
     actor: WorkspaceActor,
     message: string,
     mutation: WorkspaceArtifactMutation,
+    expectedHead: string,
   ): Promise<WorkspaceArtifactChatFork> {
     const canonical = await this.ensureCanonical(actor);
     const key = forkKey(chatId, epoch);
@@ -207,6 +211,9 @@ class LocalArtifacts implements WorkspaceArtifactReader, ArtifactsWorkspaceFileL
       this.#state.repositories.set(repositoryName, { head: canonical.head });
     }
     if (fork.state !== "open") throw new Error("Test Artifacts fork is not open.");
+    if (fork.latestHead !== expectedHead) {
+      throw new WorkspaceArtifactHeadConflictError(expectedHead, fork.latestHead);
+    }
 
     const files = copyFiles(this.#revision(fork.latestHead).files);
     for (const operation of mutation.operations) {
@@ -323,6 +330,7 @@ export function createArtifactsWorkspaceFiles(
   const artifacts = new LocalArtifacts(options.workspaceId);
   return new ArtifactsWorkspaceFiles({
     state: options.state,
+    workspaceId: options.workspaceId,
     lifecycle: artifacts,
     reader: artifacts,
     uploadStore: new WorkspaceUploadStore({

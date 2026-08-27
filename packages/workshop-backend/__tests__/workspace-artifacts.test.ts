@@ -377,7 +377,7 @@ describe("WorkspaceArtifactLifecycle", () => {
           { kind: "delete", path: "old.txt" },
           { kind: "write", path: "new.txt", content: new TextEncoder().encode("new\n") },
         ],
-      });
+      }, INITIAL_HEAD);
 
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.stagedMutations).toEqual([checkpoint.sandboxId]);
@@ -394,10 +394,29 @@ describe("WorkspaceArtifactLifecycle", () => {
       const checkpoint = await lifecycle.stageChatMutation("chat-one", 1, {
         id: "user:aleksey",
         name: "Aleksey",
-      }, "Retry workspace update", { operations: [] });
+      }, "Retry workspace update", { operations: [] }, CHECKPOINT_HEAD);
 
       expect(checkpoint.latestHead).toBe(CHECKPOINT_HEAD);
       expect(fixtures.runtime.mutationExpectedHeads).toEqual([CHECKPOINT_HEAD]);
+    });
+  });
+
+  it("rejects a chat mutation when fork reconciliation advances its planned head", async () => {
+    await withLifecycle("stage-cas", async (lifecycle, fixtures) => {
+      await lifecycle.ensureCanonical({ id: "user:aleksey", name: "Aleksey" });
+      const fork = await lifecycle.ensureChatFork("chat-one", 1);
+      fixtures.reader.heads.set(fork.repositoryName, CHECKPOINT_HEAD);
+
+      await expect(lifecycle.stageChatMutation("chat-one", 1, {
+        id: "user:aleksey",
+        name: "Aleksey",
+      }, "Stale workspace update", { operations: [] }, fork.latestHead))
+        .rejects.toMatchObject({
+          name: "WorkspaceArtifactHeadConflictError",
+          expectedHead: INITIAL_HEAD,
+          currentHead: CHECKPOINT_HEAD,
+        });
+      expect(fixtures.runtime.stagedMutations).toEqual([]);
     });
   });
 

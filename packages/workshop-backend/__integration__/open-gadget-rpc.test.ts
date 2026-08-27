@@ -206,7 +206,7 @@ describe("workspace filesystem initialization", () => {
     using reopened = reauthenticated.openGadget(metadata.id);
     expect((await reopened.getMetadata()).id).toBe(metadata.id);
 
-    const history = await reopened.getWorkspaceHistory(10);
+    const history = await reopened.getWorkspaceHistory({ kind: "accepted" }, 10);
     expect(history).toEqual([
       expect.objectContaining({ message: "Initialize workspace\n" }),
     ]);
@@ -219,10 +219,11 @@ describe("workspace filesystem initialization", () => {
     using workspace = await authenticated.newGadget();
     const metadata = await workspace.getMetadata();
 
-    const initial = await workspace.getWorkspaceRevision();
+    const initial = await workspace.getWorkspaceRevision({ kind: "accepted" });
     const accepted = await workspace.applyWorkspaceMutation({
       operationId: "00000000-0000-4000-8000-000000000070",
       expectedHead: initial.head,
+      target: { kind: "accepted" },
       message: "Create documents folder",
       changes: [{
         kind: "createFolder",
@@ -231,9 +232,14 @@ describe("workspace filesystem initialization", () => {
         name: "Documents",
       }],
     });
+    if (accepted.outcome !== "applied") throw new Error("Initial workspace mutation was stale.");
 
     expect(accepted.head).not.toBe(initial.head);
-    expect(await workspace.listWorkspaceChildren(initial.rootId)).toEqual([
+    expect(await workspace.listWorkspaceChildren({
+      workspaceId: accepted.workspaceId,
+      nodeId: accepted.rootId,
+      revision: accepted.revision,
+    })).toEqual([
       expect.objectContaining({
         id: accepted.created.documents,
         kind: "folder",
@@ -243,7 +249,7 @@ describe("workspace filesystem initialization", () => {
         createdBy: account.username,
       }),
     ]);
-    expect(await workspace.getWorkspaceHistory(10)).toEqual([
+    expect(await workspace.getWorkspaceHistory({ kind: "accepted" }, 10)).toEqual([
       expect.objectContaining({ oid: accepted.head, message: expect.stringContaining(
         "Create documents folder",
       ) }),
@@ -266,6 +272,7 @@ describe("workspace filesystem initialization", () => {
     const archiveRequest = {
       operationId: "00000000-0000-4000-8000-000000000071",
       expectedHead: accepted.head,
+      target: { kind: "accepted" },
       message: "Add project archive",
       changes: [{
         kind: "createFile",
@@ -276,9 +283,14 @@ describe("workspace filesystem initialization", () => {
       }],
     };
     const withArchive = await workspace.applyWorkspaceMutation(archiveRequest);
+    if (withArchive.outcome !== "applied") throw new Error("Archive workspace mutation was stale.");
     expect(await workspace.applyWorkspaceMutation(archiveRequest)).toEqual(withArchive);
     const stored = new Uint8Array(await new Response(
-      await workspace.readWorkspaceFile(withArchive.created.archive),
+      await workspace.readWorkspaceFile({
+        workspaceId: withArchive.workspaceId,
+        nodeId: withArchive.created.archive,
+        revision: withArchive.revision,
+      }),
     ).arrayBuffer());
     expect(stored).toEqual(content);
 
@@ -293,16 +305,81 @@ describe("workspace filesystem initialization", () => {
     expect((await env.WORKSPACE_FILES.list({ prefix: workspacePrefix })).objects).toEqual([]);
   });
 
+  it("denies workspace file rights to use-only collaborators", async () => {
+    using publicApi = await connect();
+    const owner = await createAccount(publicApi, "workspacefileowner");
+    const collaborator = await createAccount(publicApi, "workspacefileuse");
+    using ownerApi = await publicApi.authenticate(owner.token);
+    using collaboratorApi = await publicApi.authenticate(collaborator.token);
+    using workspace = await ownerApi.newGadget();
+    const metadata = await workspace.getMetadata();
+    await workspace.addCollaborator(collaborator.username, "use");
+
+    using restricted = collaboratorApi.openGadget(metadata.id);
+    expect((await restricted.getMetadata()).id).toBe(metadata.id);
+    const error = await rejection(restricted.getWorkspaceRevision({ kind: "accepted" }));
+    expect(getWorkspaceFileErrorCode(error)).toBe(WORKSPACE_FILE_ERROR_CODES.accessDenied);
+  });
+
+  it("keeps chat-target mutations isolated and validates chat epochs through RPC", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "workspacefilechat");
+    using authenticated = await publicApi.authenticate(account.token);
+    using workspace = await authenticated.newGadget();
+    const initial = await workspace.getWorkspaceRevision({ kind: "accepted" });
+    const chatId = await workspace.newChat("Workspace files", null);
+
+    expect(await workspace.getWorkspaceRevision({ kind: "chat", chatId, epoch: 0 }))
+      .toEqual(initial);
+    const applied = await workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000077",
+      expectedHead: initial.head,
+      target: { kind: "chat", chatId, epoch: 0 },
+      message: "Create chat-only folder",
+      changes: [{
+        kind: "createFolder",
+        clientId: "folder",
+        parent: { nodeId: initial.rootId },
+        name: "Chat only",
+      }],
+    });
+    if (applied.outcome !== "applied") throw new Error("Chat workspace mutation was stale.");
+
+    expect(await workspace.getWorkspaceRevision({ kind: "accepted" })).toEqual(initial);
+    expect(await workspace.listWorkspaceChildren({
+      workspaceId: applied.workspaceId,
+      nodeId: applied.rootId,
+      revision: applied.revision,
+    })).toEqual([
+      expect.objectContaining({ id: applied.created.folder, name: "Chat only" }),
+    ]);
+
+    const wrongEpoch = await rejection(workspace.getWorkspaceRevision({
+      kind: "chat",
+      chatId,
+      epoch: 1,
+    }));
+    expect(getWorkspaceFileErrorCode(wrongEpoch)).toBe(WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+
+    const missingChat = await rejection(workspace.getWorkspaceRevision({
+      kind: "chat",
+      chatId: 999_999,
+      epoch: 0,
+    }));
+    expect(getWorkspaceFileErrorCode(missingChat)).toBe(WORKSPACE_FILE_ERROR_CODES.invalidRequest);
+  });
+
   it("preserves typed workspace file failures across the RPC boundary", async () => {
     using publicApi = await connect();
     const account = await createAccount(publicApi, "workspacefileerrors");
     using authenticated = await publicApi.authenticate(account.token);
     using workspace = await authenticated.newGadget();
 
-    const initial = await workspace.getWorkspaceRevision();
+    const initial = await workspace.getWorkspaceRevision({ kind: "accepted" });
     const accepted = await workspace.applyWorkspaceMutation({
       operationId: "00000000-0000-4000-8000-000000000072",
       expectedHead: initial.head,
+      target: { kind: "accepted" },
       message: "Create Documents",
       changes: [{
         kind: "createFolder",
@@ -311,10 +388,12 @@ describe("workspace filesystem initialization", () => {
         name: "Documents",
       }],
     });
+    if (accepted.outcome !== "applied") throw new Error("Initial workspace mutation was stale.");
 
-    const conflict = await rejection(workspace.applyWorkspaceMutation({
+    const conflict = await workspace.applyWorkspaceMutation({
       operationId: "00000000-0000-4000-8000-000000000073",
       expectedHead: initial.head,
+      target: { kind: "accepted" },
       message: "Create stale folder",
       changes: [{
         kind: "createFolder",
@@ -322,13 +401,17 @@ describe("workspace filesystem initialization", () => {
         parent: { nodeId: initial.rootId },
         name: "Stale",
       }],
-    }));
-    expect(getWorkspaceFileErrorCode(conflict)).toBe(WORKSPACE_FILE_ERROR_CODES.conflict);
-    expect(conflict).toMatchObject({ currentHead: accepted.head });
+    });
+    expect(conflict).toMatchObject({
+      outcome: "stale",
+      expectedHead: initial.head,
+      currentHead: accepted.head,
+    });
 
     const missingUpload = await rejection(workspace.applyWorkspaceMutation({
       operationId: "00000000-0000-4000-8000-000000000074",
       expectedHead: accepted.head,
+      target: { kind: "accepted" },
       message: "Use missing upload",
       changes: [{
         kind: "createFile",
@@ -345,6 +428,7 @@ describe("workspace filesystem initialization", () => {
     const invalidRequest = await rejection(workspace.applyWorkspaceMutation({
       operationId: "not-an-operation-id",
       expectedHead: accepted.head,
+      target: { kind: "accepted" },
       message: "Invalid operation",
       changes: [{
         kind: "createFolder",
@@ -360,6 +444,7 @@ describe("workspace filesystem initialization", () => {
     const invalidMutation = await rejection(workspace.applyWorkspaceMutation({
       operationId: "00000000-0000-4000-8000-000000000076",
       expectedHead: accepted.head,
+      target: { kind: "accepted" },
       message: "Create reserved folder",
       changes: [{
         kind: "createFolder",

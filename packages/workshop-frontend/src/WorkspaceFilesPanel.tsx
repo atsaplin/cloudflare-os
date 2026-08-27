@@ -21,6 +21,7 @@ import {
   type WorkspaceFileMutation,
   type WorkspaceFileNode,
   type WorkspaceFileRevision,
+  type FileRef,
 } from '@gadgets/workshop-shared/api'
 import DeleteConfirmationDialog from './components/DeleteConfirmationDialog'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
@@ -30,6 +31,8 @@ import { reportIssue } from './errorReporting'
 interface WorkspaceFilesPanelProps {
   overseer: RpcStub<Overseer>
 }
+
+const ACCEPTED_TARGET = { kind: 'accepted' } as const
 
 interface FolderLocation {
   id: string
@@ -72,43 +75,58 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
   const [deleting, setDeleting] = useState<WorkspaceFileNode | null>(null)
 
   const currentFolderId = folders.at(-1)?.id ?? revision?.rootId
+  const folderReference = useCallback((folderId: string, source: WorkspaceFileRevision): FileRef => ({
+    workspaceId: source.workspaceId,
+    nodeId: folderId,
+    revision: source.revision,
+  }), [])
 
   const loadFolder = useCallback(async (folderId: string): Promise<void> => {
-    setNodes(await overseer.listWorkspaceChildren(folderId))
-  }, [overseer])
+    if (!revision) return
+    setNodes(await overseer.listWorkspaceChildren(folderReference(folderId, revision)))
+  }, [folderReference, overseer, revision])
 
   const refreshHistory = useCallback(async (): Promise<void> => {
-    setHistory(await overseer.getWorkspaceHistory(20))
+    setHistory(await overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20))
   }, [overseer])
 
   const refreshAcceptedWorkspace = useCallback(async (): Promise<void> => {
     const [nextRevision, nextHistory] = await Promise.all([
-      overseer.getWorkspaceRevision(),
-      overseer.getWorkspaceHistory(20),
+      overseer.getWorkspaceRevision(ACCEPTED_TARGET),
+      overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20),
     ])
     const requestedFolderId = currentFolderId ?? nextRevision.rootId
     try {
-      const nextNodes = await overseer.listWorkspaceChildren(requestedFolderId)
+      const nextNodes = await overseer.listWorkspaceChildren(
+        folderReference(requestedFolderId, nextRevision),
+      )
       setRevision(nextRevision)
       setNodes(nextNodes)
       setHistory(nextHistory)
     } catch (error) {
       if (requestedFolderId === nextRevision.rootId) throw error
-      const nextNodes = await overseer.listWorkspaceChildren(nextRevision.rootId)
+      const nextNodes = await overseer.listWorkspaceChildren(
+        folderReference(nextRevision.rootId, nextRevision),
+      )
       setRevision(nextRevision)
       setFolders([{ id: nextRevision.rootId, name: 'Files' }])
       setNodes(nextNodes)
       setHistory(nextHistory)
     }
-  }, [currentFolderId, overseer])
+  }, [currentFolderId, folderReference, overseer])
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
     setLoadFailed(false)
-    Promise.all([overseer.getWorkspaceRevision(), overseer.getWorkspaceHistory(20)])
+    Promise.all([
+      overseer.getWorkspaceRevision(ACCEPTED_TARGET),
+      overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20),
+    ])
       .then(async ([nextRevision, nextHistory]) => {
-        const nextNodes = await overseer.listWorkspaceChildren(nextRevision.rootId)
+        const nextNodes = await overseer.listWorkspaceChildren(
+          folderReference(nextRevision.rootId, nextRevision),
+        )
         if (cancelled) return
         setRevision(nextRevision)
         setFolders([{ id: nextRevision.rootId, name: 'Files' }])
@@ -126,22 +144,35 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         if (!cancelled) setLoading(false)
       })
     return () => { cancelled = true }
-  }, [loadAttempt, overseer])
+  }, [folderReference, loadAttempt, overseer])
 
   const applyMutation = useCallback(async (
     message: string,
     changes: WorkspaceFileMutation[],
-  ): Promise<void> => {
-    if (!revision || !currentFolderId) return
+  ): Promise<boolean> => {
+    if (!revision || !currentFolderId) return false
     const result = await overseer.applyWorkspaceMutation({
       operationId: crypto.randomUUID(),
       expectedHead: revision.head,
+      target: ACCEPTED_TARGET,
       message,
       changes,
     })
-    setRevision({ head: result.head, rootId: result.rootId })
-    await Promise.all([loadFolder(currentFolderId), refreshHistory()])
-  }, [currentFolderId, loadFolder, overseer, refreshHistory, revision])
+    if (result.outcome === 'stale') {
+      await refreshAcceptedWorkspace()
+      toastsRef.current.add({
+        title: 'Workspace changed. Files refreshed; try again.',
+        variant: 'error',
+      })
+      return false
+    }
+    setRevision(result)
+    await Promise.all([
+      overseer.listWorkspaceChildren(folderReference(currentFolderId, result)).then(setNodes),
+      refreshHistory(),
+    ])
+    return true
+  }, [currentFolderId, folderReference, overseer, refreshAcceptedWorkspace, refreshHistory, revision])
 
   const runMutation = useCallback(async (run: () => Promise<void>): Promise<void> => {
     setBusy(true)
@@ -221,14 +252,16 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
     const name = newFolderName.trim()
     if (!name || !currentFolderId) return
     void runMutation(async () => {
-      await applyMutation(`Create ${name}`, [{
+      const applied = await applyMutation(`Create ${name}`, [{
         kind: 'createFolder',
         clientId: 'folder',
         parent: { nodeId: currentFolderId },
         name,
       }])
-      setNewFolderName('')
-      setCreatingFolder(false)
+      if (applied) {
+        setNewFolderName('')
+        setCreatingFolder(false)
+      }
     })
   }
 
@@ -240,38 +273,38 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
       return
     }
     void runMutation(async () => {
-      await applyMutation(`Rename ${renaming.name} to ${name}`, [{
+      const applied = await applyMutation(`Rename ${renaming.name} to ${name}`, [{
         kind: 'move',
         nodeId: renaming.id,
         parent: { nodeId: currentFolderId },
         name,
       }])
-      setRenaming(null)
+      if (applied) setRenaming(null)
     })
   }
 
   const deleteNode = (): void => {
     if (!deleting) return
     void runMutation(async () => {
-      await applyMutation(`Delete ${deleting.name}`, [{
+      const applied = await applyMutation(`Delete ${deleting.name}`, [{
         kind: 'delete',
         nodeId: deleting.id,
         recursive: deleting.kind === 'folder',
       }])
-      setDeleting(null)
+      if (applied) setDeleting(null)
     })
   }
 
   const moveNode = (): void => {
     if (!moving || !currentFolderId || moving.parentId === currentFolderId) return
     void runMutation(async () => {
-      await applyMutation(`Move ${moving.name}`, [{
+      const applied = await applyMutation(`Move ${moving.name}`, [{
         kind: 'move',
         nodeId: moving.id,
         parent: { nodeId: currentFolderId },
         name: moving.name,
       }])
-      setMoving(null)
+      if (applied) setMoving(null)
     })
   }
 
@@ -298,7 +331,14 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
 
   const downloadFile = (file: WorkspaceFileNode): void => {
     void runMutation(() => saveStreamToFile(
-      () => overseer.readWorkspaceFile(file.id),
+      () => {
+        if (!revision) return Promise.reject(new Error('Workspace revision is unavailable.'))
+        return overseer.readWorkspaceFile({
+          workspaceId: revision.workspaceId,
+          nodeId: file.id,
+          revision: revision.revision,
+        })
+      },
       file.name,
       {
         description: file.name,

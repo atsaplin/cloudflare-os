@@ -1492,8 +1492,60 @@ export type WorkspaceFileNode = {
   updatedBy: string;
 };
 
-/** The current accepted workspace filesystem revision. */
+/** The immutable revision source carried by a workspace file reference. */
+export type WorkspaceFileRevisionRef =
+  | {
+      kind: "accepted";
+      commit: string;
+    }
+  | {
+      kind: "chat";
+      chatId: number;
+      epoch: number;
+      commit: string;
+    };
+
+/** A stable workspace node and the immutable revision whose bytes it identifies. */
+export type FileRef = {
+  workspaceId: string;
+  nodeId: string;
+  revision: WorkspaceFileRevisionRef;
+};
+
+/** Selects accepted workspace content or one chat-fork revision for a write. */
+export type WriteTarget =
+  | { kind: "accepted" }
+  | { kind: "chat"; chatId: number; epoch: number };
+
+/** The workspace roles whose rights are derived by the shared policy. */
+export type WorkspaceAccessRole = "owner" | CollaboratorRole;
+
+/** A workspace operation right derived from the caller's workspace role. */
+export type WorkspaceRight = "read" | "write" | "execute" | "manage";
+
+/** The complete workspace rights granted to a role. */
+export type WorkspaceRights = readonly WorkspaceRight[];
+
+/** Returns the workspace rights for a recognized workspace role, defaulting to deny. */
+export function workspaceRightsForRole(role: unknown): WorkspaceRights {
+  if (role === "owner" || role === "build") {
+    return ["read", "write", "execute", "manage"];
+  }
+  return [];
+}
+
+/** A read or write grant from one workspace subtree to another workspace. */
+export type WorkspaceGrant = {
+  sourceWorkspaceId: string;
+  targetWorkspaceId: string;
+  rootNodeId: string;
+  permission: "read" | "write";
+};
+
+/** A workspace filesystem revision selected by its immutable source. */
 export type WorkspaceFileRevision = {
+  workspaceId: string;
+  revision: WorkspaceFileRevisionRef;
   head: string;
   rootId: string;
 };
@@ -1501,7 +1553,7 @@ export type WorkspaceFileRevision = {
 /** A stable node or a node created earlier in the same workspace mutation. */
 export type WorkspaceFileNodeReference = { nodeId: string } | { clientId: string };
 
-/** One authorized change to accepted workspace files. File content uses a staged upload handle. */
+/** One authorized workspace change. File content uses a staged upload handle. */
 export type WorkspaceFileMutation =
   | {
       kind: "createFolder";
@@ -1533,19 +1585,36 @@ export type WorkspaceFileMutation =
       recursive?: boolean;
     };
 
-/** One idempotent compare-and-swap request against accepted workspace files. */
+/** One idempotent compare-and-swap request against an accepted or chat target. */
 export type WorkspaceFileMutationRequest = {
   operationId: string;
   expectedHead: string;
+  target: WriteTarget;
   message: string;
   changes: WorkspaceFileMutation[];
 };
 
-/** The accepted result of a workspace file mutation. */
+/** The applied result of a workspace file mutation. */
 export type WorkspaceFileMutationResult = WorkspaceFileRevision & {
+  outcome: "applied";
   operationId: string;
+  target: WriteTarget;
   created: Record<string, string>;
 };
+
+/** A compare-and-swap write that was not applied because its target head advanced. */
+export type WorkspaceFileMutationStaleResult = {
+  outcome: "stale";
+  operationId: string;
+  target: WriteTarget;
+  expectedHead: string;
+  currentHead: string;
+};
+
+/** The successful or stale outcome of one workspace file mutation. */
+export type WorkspaceFileMutationResponse =
+  | WorkspaceFileMutationResult
+  | WorkspaceFileMutationStaleResult;
 
 /** Product limits enforced by both the workspace capability and repository. */
 export const MAXIMUM_WORKSPACE_FILE_UPLOAD_BYTES = 25 * 1024 * 1024;
@@ -1554,6 +1623,7 @@ export const MAXIMUM_WORKSPACE_TOTAL_BYTES = 1024 * 1024 * 1024;
 /** Stable error codes attached to expected workspace file failures. */
 export const WORKSPACE_FILE_ERROR_CODES = {
   conflict: "WORKSPACE_FILE_CONFLICT",
+  accessDenied: "WORKSPACE_FILE_ACCESS_DENIED",
   invalidRequest: "WORKSPACE_FILE_INVALID_REQUEST",
   uploadQuotaExceeded: "WORKSPACE_FILE_UPLOAD_QUOTA_EXCEEDED",
   uploadUnavailable: "WORKSPACE_FILE_UPLOAD_UNAVAILABLE",
@@ -1570,6 +1640,7 @@ export type WorkspaceFileErrorCode =
 const workspaceFileErrors = codedErrorFamily<WorkspaceFileErrorCode>({
   [WORKSPACE_FILE_ERROR_CODES.conflict]:
     "Workspace files changed before this operation could be applied.",
+  [WORKSPACE_FILE_ERROR_CODES.accessDenied]: "Workspace file access was denied.",
   [WORKSPACE_FILE_ERROR_CODES.invalidRequest]: "The workspace file request is invalid.",
   [WORKSPACE_FILE_ERROR_CODES.uploadQuotaExceeded]: "Workspace upload capacity was exceeded.",
   [WORKSPACE_FILE_ERROR_CODES.uploadUnavailable]: "The workspace upload is unavailable.",
@@ -1732,25 +1803,25 @@ export interface Overseer extends RpcTarget {
   /** Get metadata describing this workspace. */
   getMetadata(): Promise<GadgetMetadata>;
 
-  /** Return the current accepted workspace filesystem head and stable root ID. */
-  getWorkspaceRevision(): Promise<WorkspaceFileRevision>;
+  /** Return the current head and stable root ID for the selected accepted or chat target. */
+  getWorkspaceRevision(target: WriteTarget): Promise<WorkspaceFileRevision>;
 
-  /** List the accepted direct children of one stable workspace folder ID. */
-  listWorkspaceChildren(folderId: string): Promise<WorkspaceFileNode[]>;
+  /** List direct children of one stable folder at its immutable accepted or chat revision. */
+  listWorkspaceChildren(folder: FileRef): Promise<WorkspaceFileNode[]>;
 
-  /** Stream the current accepted bytes for one stable workspace file ID. */
-  readWorkspaceFile(fileId: string): Promise<ReadableStream<Uint8Array>>;
+  /** Stream bytes for one stable file at its immutable accepted or chat revision. */
+  readWorkspaceFile(file: FileRef): Promise<ReadableStream<Uint8Array>>;
 
-  /** Return accepted workspace filesystem commits, newest first. */
-  getWorkspaceHistory(depth?: number): Promise<CommitInfo[]>;
+  /** Return commits for the selected accepted or chat target, newest first. */
+  getWorkspaceHistory(target: WriteTarget, depth?: number): Promise<CommitInfo[]>;
 
   /** Stage one bounded file stream for a subsequent create or replace mutation. */
   stageWorkspaceFileUpload(request: WorkspaceFileUploadRequest): Promise<WorkspaceFileUpload>;
 
-  /** Apply one build-authorized, idempotent mutation to accepted workspace files. */
+  /** Apply one build-authorized, idempotent mutation to the selected workspace target. */
   applyWorkspaceMutation(
     request: WorkspaceFileMutationRequest,
-  ): Promise<WorkspaceFileMutationResult>;
+  ): Promise<WorkspaceFileMutationResponse>;
 
   /**
    * Get metadata describing this workspace and subscribe to changes.
