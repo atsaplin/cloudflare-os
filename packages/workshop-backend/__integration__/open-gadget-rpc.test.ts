@@ -249,6 +249,17 @@ describe("workspace filesystem initialization", () => {
         createdBy: account.username,
       }),
     ]);
+    expect(await workspace.getWorkspaceNode({
+      workspaceId: accepted.workspaceId,
+      nodeId: accepted.created.documents,
+      revision: accepted.revision,
+    })).toEqual(expect.objectContaining({
+      id: accepted.created.documents,
+      parentId: accepted.rootId,
+      kind: "folder",
+      name: "Documents",
+      path: "Documents",
+    }));
     expect(await workspace.getWorkspaceHistory({ kind: "accepted" }, 10)).toEqual([
       expect.objectContaining({ oid: accepted.head, message: expect.stringContaining(
         "Create documents folder",
@@ -368,6 +379,14 @@ describe("workspace filesystem initialization", () => {
     });
     if (applied.outcome !== "applied") throw new Error("Chat workspace mutation was stale.");
 
+    expect(await workspace.listChats()).toEqual([
+      expect.objectContaining({
+        id: chatId,
+        hasProposedChanges: true,
+        hasWorkspaceFileChanges: true,
+      }),
+    ]);
+
     expect(await workspace.getWorkspaceRevision({ kind: "accepted" })).toEqual(initial);
     expect(await workspace.listWorkspaceChildren({
       workspaceId: applied.workspaceId,
@@ -376,6 +395,32 @@ describe("workspace filesystem initialization", () => {
     })).toEqual([
       expect.objectContaining({ id: applied.created.folder, name: "Chat only" }),
     ]);
+    expect(await workspace.getWorkspaceNode({
+      workspaceId: applied.workspaceId,
+      nodeId: applied.created.folder,
+      revision: applied.revision,
+    })).toEqual(expect.objectContaining({
+      id: applied.created.folder,
+      name: "Chat only",
+    }));
+
+    const staleChatId = await workspace.newChat("Stale workspace files", null);
+    const stale = await workspace.applyWorkspaceMutation({
+      operationId: "00000000-0000-4000-8000-000000000078",
+      expectedHead: "0".repeat(40),
+      target: { kind: "chat", chatId: staleChatId, epoch: 0 },
+      message: "Do not create a stale folder",
+      changes: [{
+        kind: "createFolder",
+        clientId: "stale-folder",
+        parent: { nodeId: initial.rootId },
+        name: "Stale",
+      }],
+    });
+    expect(stale.outcome).toBe("stale");
+    expect((await workspace.listChats()).find(chat => chat.id === staleChatId)).not.toEqual(
+      expect.objectContaining({ hasWorkspaceFileChanges: true }),
+    );
 
     const wrongEpoch = await rejection(workspace.getWorkspaceRevision({
       kind: "chat",

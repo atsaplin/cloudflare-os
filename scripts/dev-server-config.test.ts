@@ -2,9 +2,45 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  getDevArtifactsConfig,
   getDevServerConfig,
   getWranglerPortFromBackendHost,
 } from "./dev-server-config.ts";
+
+describe("getDevArtifactsConfig", () => {
+  it("returns no configuration when all values are absent", () => {
+    assert.equal(getDevArtifactsConfig({}), undefined);
+  });
+
+  it("trims a complete configuration", () => {
+    assert.deepEqual(getDevArtifactsConfig({
+      ARTIFACTS_ACCOUNT_ID: " account ",
+      ARTIFACTS_NAMESPACE: " namespace ",
+      ARTIFACTS_API_TOKEN: " token ",
+    }), {
+      accountId: "account",
+      namespace: "namespace",
+    });
+  });
+
+  for (const missing of [
+    "ARTIFACTS_ACCOUNT_ID",
+    "ARTIFACTS_NAMESPACE",
+    "ARTIFACTS_API_TOKEN",
+  ] as const) {
+    it(`rejects a configuration missing ${missing}`, () => {
+      const env = {
+        ARTIFACTS_ACCOUNT_ID: "account",
+        ARTIFACTS_NAMESPACE: "namespace",
+        ARTIFACTS_API_TOKEN: "token",
+      };
+      delete env[missing];
+      assert.throws(
+          () => getDevArtifactsConfig(env),
+          /ARTIFACTS_ACCOUNT_ID, ARTIFACTS_NAMESPACE, and ARTIFACTS_API_TOKEN must be set together/);
+    });
+  }
+});
 
 describe("getWranglerPortFromBackendHost", () => {
   it("extracts a port from a localhost backend host", () => {

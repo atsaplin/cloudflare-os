@@ -4516,6 +4516,7 @@ interface ChatInterfaceProps {
   renderExtraTab?: () => React.ReactNode;
   onHasAnyCodeChange?: (hasAnyCode: boolean) => void;
   onSelectedChatHasProposedChangesChange?: (hasProposedChanges: boolean) => void;
+  onWorkspaceFilesInvalidated?: () => void;
   constrainChatWidth?: boolean;
   onOpenGadget: (gadgetId: WorkpieceId) => void;
 
@@ -4698,6 +4699,7 @@ function ChatInterface({
   renderExtraTab,
   onHasAnyCodeChange,
   onSelectedChatHasProposedChangesChange,
+  onWorkspaceFilesInvalidated,
   constrainChatWidth,
   onOpenGadget,
   outputOfWorkpiece,
@@ -6125,6 +6127,7 @@ function ChatInterface({
         return;
       }
       toasts.add({ title: "Changes accepted", variant: "success" });
+      onWorkspaceFilesInvalidated?.();
     } catch (err) {
       console.error("Failed to accept changes:", err);
       toasts.add({ title: "Failed to accept changes", variant: "error" });
@@ -6203,6 +6206,7 @@ function ChatInterface({
         current?.chatId === target.chatId ? null : current,
       );
       toasts.add({ title: "Pending changes discarded", variant: "success" });
+      onWorkspaceFilesInvalidated?.();
     } catch (err) {
       console.error("Failed to discard pending changes:", err);
       // See handleRevertChanges: the server's refusals are instructive, so surface them.

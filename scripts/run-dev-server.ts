@@ -21,7 +21,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
 import { resolveBinEntry } from "./bin-entry.ts";
-import { getDevServerConfig } from "./dev-server-config.ts";
+import { getDevArtifactsConfig, getDevServerConfig } from "./dev-server-config.ts";
 import { killProcessTree } from "./kill-process-tree.ts";
 import { pnpmCommand } from "./pnpm-command.ts";
 import type { ServiceBinding, WranglerBuild } from "./release/manifest-lib.ts";
@@ -60,6 +60,8 @@ function loadDevVars(): void {
   }
 }
 loadDevVars();
+
+const devArtifacts = getDevArtifactsConfig(process.env);
 
 const useWorkersAi = process.argv.includes("--use-workers-ai-binding");
 
@@ -494,6 +496,19 @@ for (const gk of gatekeepers) {
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).
   for (const name of OPTIONAL_FEATURE_VARS) {
     if (process.env[name] !== undefined) config.vars[name] = process.env[name];
+  }
+
+  if (devArtifacts) {
+    config.vars.ARTIFACTS_ACCOUNT_ID = devArtifacts.accountId;
+    config.vars.ARTIFACTS_NAMESPACE = devArtifacts.namespace;
+    config.artifacts = (config.artifacts || []).map((artifact: Record<string, unknown>) => ({
+      ...artifact,
+      namespace: devArtifacts.namespace,
+    }));
+    config.secrets = {
+      ...config.secrets,
+      required: [...new Set([...(config.secrets?.required || []), "ARTIFACTS_API_TOKEN"])],
+    };
   }
 
   for (const gk of gatekeepers) {

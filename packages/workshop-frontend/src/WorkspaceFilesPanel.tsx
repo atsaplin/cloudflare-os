@@ -1,16 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
-import {
-  ArrowLeft,
-  ArrowRight,
-  DownloadSimple,
-  File,
-  Folder,
-  FolderPlus,
-  Pencil,
-  Trash,
-  UploadSimple,
-} from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import {
   getWorkspaceFileErrorCode,
@@ -19,48 +8,85 @@ import {
   type CommitInfo,
   type Overseer,
   type WorkspaceFileMutation,
+  type WorkspaceFileMutationResult,
   type WorkspaceFileNode,
   type WorkspaceFileRevision,
   type FileRef,
+  type WriteTarget,
 } from '@gadgets/workshop-shared/api'
-import DeleteConfirmationDialog from './components/DeleteConfirmationDialog'
-import { WorkshopButton, WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
+import { WorkshopButton } from './components/WorkshopControls'
 import { saveStreamToFile } from './fileTransfers'
 import { reportIssue } from './errorReporting'
+import WorkspaceFilesBrowser, { type WorkspaceFilesFolder } from './WorkspaceFilesBrowser'
+import WorkspaceFileEditor from './WorkspaceFileEditor'
 
 interface WorkspaceFilesPanelProps {
   overseer: RpcStub<Overseer>
+  target?: WriteTarget | null
+  refreshToken?: number
+  selectedNodeId?: string
+  selectedRevision?: string
+  onSelectionChange?(nodeId: string | undefined, revision: string | undefined): void
 }
 
 const ACCEPTED_TARGET = { kind: 'accepted' } as const
-
-interface FolderLocation {
-  id: string
-  name: string
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1_024) return `${bytes} B`
-  if (bytes < 1_024 * 1_024) return `${(bytes / 1_024).toFixed(1)} KB`
-  return `${(bytes / (1_024 * 1_024)).toFixed(1)} MB`
-}
 
 function extensionFor(filename: string): string {
   const dot = filename.lastIndexOf('.')
   return dot > 0 && dot < filename.length - 1 ? filename.slice(dot) : '.bin'
 }
 
-function historySummary(message: string): string {
-  return message.split('\n', 1)[0].trim() || 'Workspace update'
+function selectUploads(files: FileList | File[]): File[] {
+  const selected = Array.from(files)
+  const totalSize = selected.reduce((sum, file) => sum + file.size, 0)
+  if (totalSize > MAXIMUM_WORKSPACE_FILE_UPLOAD_BYTES) {
+    throw new Error('Selected files exceed the 25 MB operation limit.')
+  }
+  if (new Set(selected.map(file => file.name)).size !== selected.length) {
+    throw new Error('Selected files must have unique names.')
+  }
+  return selected
 }
 
-export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelProps) {
+async function stageUploadChange(
+  overseer: RpcStub<Overseer>,
+  file: File,
+  existing: WorkspaceFileNode | undefined,
+  parentId: string,
+  index: number,
+): Promise<WorkspaceFileMutation> {
+  if (existing?.kind === 'folder') throw new Error(`A folder named ${file.name} already exists.`)
+  const upload = await overseer.stageWorkspaceFileUpload({
+    content: file.stream(),
+    size: file.size,
+    ...(file.type ? { mediaType: file.type } : {}),
+  })
+  return existing ? {
+    kind: 'replaceFile',
+    nodeId: existing.id,
+    uploadId: upload.uploadId,
+  } : {
+    kind: 'createFile',
+    clientId: `upload-${index}`,
+    parent: { nodeId: parentId },
+    name: file.name,
+    uploadId: upload.uploadId,
+  }
+}
+
+export default function WorkspaceFilesPanel({
+  overseer,
+  target,
+  refreshToken = 0,
+  selectedNodeId,
+  selectedRevision,
+  onSelectionChange,
+}: WorkspaceFilesPanelProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
   toastsRef.current = toasts
-  const fileInputRef = useRef<HTMLInputElement>(null)
   const [revision, setRevision] = useState<WorkspaceFileRevision | null>(null)
-  const [folders, setFolders] = useState<FolderLocation[]>([])
+  const [folders, setFolders] = useState<WorkspaceFilesFolder[]>([])
   const [nodes, setNodes] = useState<WorkspaceFileNode[]>([])
   const [history, setHistory] = useState<CommitInfo[]>([])
   const [loading, setLoading] = useState(true)
@@ -69,10 +95,16 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
   const [busy, setBusy] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [creatingFolder, setCreatingFolder] = useState(false)
+  const [newFileName, setNewFileName] = useState('')
+  const [creatingFile, setCreatingFile] = useState(false)
   const [renaming, setRenaming] = useState<WorkspaceFileNode | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [moving, setMoving] = useState<WorkspaceFileNode | null>(null)
   const [deleting, setDeleting] = useState<WorkspaceFileNode | null>(null)
+  const [selectedNode, setSelectedNode] = useState<WorkspaceFileNode | null>(null)
+  const [editorDirty, setEditorDirty] = useState(false)
+
+  const activeTarget = target === undefined ? ACCEPTED_TARGET : target
 
   const currentFolderId = folders.at(-1)?.id ?? revision?.rootId
   const folderReference = useCallback((folderId: string, source: WorkspaceFileRevision): FileRef => ({
@@ -87,13 +119,15 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
   }, [folderReference, overseer, revision])
 
   const refreshHistory = useCallback(async (): Promise<void> => {
-    setHistory(await overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20))
-  }, [overseer])
+    if (!activeTarget) return
+    setHistory(await overseer.getWorkspaceHistory(activeTarget, 50))
+  }, [activeTarget, overseer])
 
-  const refreshAcceptedWorkspace = useCallback(async (): Promise<void> => {
+  const refreshWorkspace = useCallback(async (): Promise<void> => {
+    if (!activeTarget) return
     const [nextRevision, nextHistory] = await Promise.all([
-      overseer.getWorkspaceRevision(ACCEPTED_TARGET),
-      overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20),
+      overseer.getWorkspaceRevision(activeTarget),
+      overseer.getWorkspaceHistory(activeTarget, 50),
     ])
     const requestedFolderId = currentFolderId ?? nextRevision.rootId
     try {
@@ -113,15 +147,19 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
       setNodes(nextNodes)
       setHistory(nextHistory)
     }
-  }, [currentFolderId, folderReference, overseer])
+  }, [activeTarget, currentFolderId, folderReference, overseer])
 
   useEffect(() => {
+    if (!activeTarget) {
+      setLoading(true)
+      return
+    }
     let cancelled = false
     setLoading(true)
     setLoadFailed(false)
     Promise.all([
-      overseer.getWorkspaceRevision(ACCEPTED_TARGET),
-      overseer.getWorkspaceHistory(ACCEPTED_TARGET, 20),
+      overseer.getWorkspaceRevision(activeTarget),
+      overseer.getWorkspaceHistory(activeTarget, 50),
     ])
       .then(async ([nextRevision, nextHistory]) => {
         const nextNodes = await overseer.listWorkspaceChildren(
@@ -144,35 +182,85 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         if (!cancelled) setLoading(false)
       })
     return () => { cancelled = true }
-  }, [folderReference, loadAttempt, overseer])
+  }, [activeTarget, folderReference, loadAttempt, overseer, refreshToken])
+
+  useEffect(() => {
+    if (!selectedNodeId) return
+    if (!revision) {
+      setSelectedNode(null)
+      return
+    }
+    let cancelled = false
+    overseer.getWorkspaceNode({
+      workspaceId: revision.workspaceId,
+      nodeId: selectedNodeId,
+      revision: selectedRevision
+        ? { ...revision.revision, commit: selectedRevision }
+        : revision.revision,
+    }).then(node => {
+      if (!cancelled) setSelectedNode(node.kind === 'file' ? node : null)
+    }).catch(error => {
+      if (cancelled) return
+      reportIssue('workspace-files.selection', error)
+      setSelectedNode(null)
+      onSelectionChange?.(undefined, undefined)
+    })
+    return () => { cancelled = true }
+  }, [onSelectionChange, overseer, revision, selectedNodeId, selectedRevision])
+
+  const resolveSelectedNode = useCallback(async (
+    nextRevision: WorkspaceFileRevision,
+  ): Promise<WorkspaceFileNode | null | undefined> => {
+    const nodeId = selectedNode?.id ?? selectedNodeId
+    if (!nodeId) return undefined
+    try {
+      const nextNode = await overseer.getWorkspaceNode({
+        workspaceId: nextRevision.workspaceId,
+        nodeId,
+        revision: nextRevision.revision,
+      })
+      return nextNode.kind === 'file' ? nextNode : null
+    } catch (error) {
+      if (getWorkspaceFileErrorCode(error) === WORKSPACE_FILE_ERROR_CODES.invalidRequest) {
+        return null
+      }
+      reportIssue('workspace-files.selection-refresh', error)
+      return undefined
+    }
+  }, [onSelectionChange, overseer, selectedNode, selectedNodeId])
 
   const applyMutation = useCallback(async (
     message: string,
     changes: WorkspaceFileMutation[],
-  ): Promise<boolean> => {
-    if (!revision || !currentFolderId) return false
+  ): Promise<WorkspaceFileMutationResult | null> => {
+    if (!revision || !currentFolderId || !activeTarget) return null
     const result = await overseer.applyWorkspaceMutation({
       operationId: crypto.randomUUID(),
       expectedHead: revision.head,
-      target: ACCEPTED_TARGET,
+      target: activeTarget,
       message,
       changes,
     })
     if (result.outcome === 'stale') {
-      await refreshAcceptedWorkspace()
+      await refreshWorkspace()
       toastsRef.current.add({
         title: 'Workspace changed. Files refreshed; try again.',
         variant: 'error',
       })
-      return false
+      return null
     }
     setRevision(result)
+    const nextSelectedNode = await resolveSelectedNode(result)
+    if (nextSelectedNode !== undefined) {
+      setSelectedNode(nextSelectedNode)
+      if (!nextSelectedNode) onSelectionChange?.(undefined, undefined)
+    }
     await Promise.all([
       overseer.listWorkspaceChildren(folderReference(currentFolderId, result)).then(setNodes),
       refreshHistory(),
     ])
-    return true
-  }, [currentFolderId, folderReference, overseer, refreshAcceptedWorkspace, refreshHistory, revision])
+    return result
+  }, [activeTarget, currentFolderId, folderReference, onSelectionChange, overseer, refreshHistory, refreshWorkspace, resolveSelectedNode, revision])
 
   const runMutation = useCallback(async (run: () => Promise<void>): Promise<void> => {
     setBusy(true)
@@ -182,7 +270,7 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
       reportIssue('workspace-files.mutate', error)
       if (getWorkspaceFileErrorCode(error) === WORKSPACE_FILE_ERROR_CODES.conflict) {
         try {
-          await refreshAcceptedWorkspace()
+          await refreshWorkspace()
           toastsRef.current.add({
             title: 'Workspace changed. Files refreshed; try again.',
             variant: 'error',
@@ -199,52 +287,24 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
     } finally {
       setBusy(false)
     }
-  }, [refreshAcceptedWorkspace])
+  }, [refreshWorkspace])
 
-  const uploadFiles = (files: FileList | File[]): void => {
+  const uploadFiles = (files: FileList | File[], parentId = currentFolderId): void => {
     void runMutation(async () => {
-      if (!currentFolderId) return
-      const selected = Array.from(files)
-      const totalSize = selected.reduce((sum, file) => sum + file.size, 0)
-      if (totalSize > MAXIMUM_WORKSPACE_FILE_UPLOAD_BYTES) {
-        throw new Error('Selected files exceed the 25 MB operation limit.')
-      }
-      const selectedNames = new Set<string>()
-      const existingByName = new Map(nodes.map(node => [node.name, node]))
-      const changes: WorkspaceFileMutation[] = []
-      for (const [index, file] of selected.entries()) {
-        if (selectedNames.has(file.name)) {
-          throw new Error(`More than one selected file is named ${file.name}.`)
-        }
-        selectedNames.add(file.name)
-        const existing = existingByName.get(file.name)
-        if (existing?.kind === 'folder') {
-          throw new Error(`A folder named ${file.name} already exists.`)
-        }
-        const upload = await overseer.stageWorkspaceFileUpload({
-          content: file.stream(),
-          size: file.size,
-          ...(file.type ? { mediaType: file.type } : {}),
-        })
-        changes.push(existing ? {
-          kind: 'replaceFile',
-          nodeId: existing.id,
-          uploadId: upload.uploadId,
-        } : {
-          kind: 'createFile',
-          clientId: `upload-${index}`,
-          parent: { nodeId: currentFolderId },
-          name: file.name,
-          uploadId: upload.uploadId,
-        })
-      }
+      if (!parentId || !revision) return
+      const selected = selectUploads(files)
+      const destinationNodes = parentId === currentFolderId
+        ? nodes
+        : await overseer.listWorkspaceChildren(folderReference(parentId, revision))
+      const existingByName = new Map(destinationNodes.map(node => [node.name, node]))
+      const changes = await Promise.all(selected.map((file, index) =>
+        stageUploadChange(overseer, file, existingByName.get(file.name), parentId, index)))
       if (changes.length > 0) {
         const message = changes.length === 1
           ? `Add ${selected[0].name}`
           : `Add ${changes.length} files`
         await applyMutation(message, changes)
       }
-      if (fileInputRef.current) fileInputRef.current.value = ''
     })
   }
 
@@ -262,6 +322,30 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         setNewFolderName('')
         setCreatingFolder(false)
       }
+    })
+  }
+
+  const createFile = (): void => {
+    const name = newFileName.trim()
+    if (!name || !currentFolderId) return
+    void runMutation(async () => {
+      const upload = await overseer.stageWorkspaceFileUpload({
+        content: new ReadableStream({ start(controller) { controller.close() } }),
+        size: 0,
+        mediaType: 'text/plain',
+      })
+      const applied = await applyMutation(`Create ${name}`, [{
+        kind: 'createFile',
+        clientId: 'file',
+        parent: { nodeId: currentFolderId },
+        name,
+        uploadId: upload.uploadId,
+      }])
+      const createdId = applied?.created.file
+      if (!createdId) return
+      setNewFileName('')
+      setCreatingFile(false)
+      onSelectionChange?.(createdId, undefined)
     })
   }
 
@@ -291,7 +375,10 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         nodeId: deleting.id,
         recursive: deleting.kind === 'folder',
       }])
-      if (applied) setDeleting(null)
+      if (applied) {
+        if (deleting.id === selectedNode?.id) onSelectionChange?.(undefined, undefined)
+        setDeleting(null)
+      }
     })
   }
 
@@ -318,6 +405,14 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
     })
   }
 
+  const selectFile = (file: WorkspaceFileNode): void => {
+    if (file.kind !== 'file') return
+    if (editorDirty && selectedNode?.id !== file.id &&
+        !window.confirm('Discard unsaved changes and open another file?')) return
+    onSelectionChange?.(file.id, undefined)
+    if (!onSelectionChange) setSelectedNode(file)
+  }
+
   const goBack = (): void => {
     if (folders.length <= 1) return
     const parent = folders[folders.length - 2]
@@ -336,7 +431,9 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         return overseer.readWorkspaceFile({
           workspaceId: revision.workspaceId,
           nodeId: file.id,
-          revision: revision.revision,
+          revision: selectedRevision
+            ? { ...revision.revision, commit: selectedRevision }
+            : revision.revision,
         })
       },
       file.name,
@@ -346,6 +443,34 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
         extension: extensionFor(file.name),
       },
     ))
+  }
+
+  const handleEditorSaved = (nextRevision: WorkspaceFileRevision): void => {
+    setRevision(nextRevision)
+    setEditorDirty(false)
+    if (!currentFolderId) return
+    void Promise.all([
+      overseer.listWorkspaceChildren(folderReference(currentFolderId, nextRevision)).then(setNodes),
+      refreshHistory(),
+      selectedNode ? overseer.getWorkspaceNode({
+        workspaceId: nextRevision.workspaceId,
+        nodeId: selectedNode.id,
+        revision: nextRevision.revision,
+      }).then(setSelectedNode) : Promise.resolve(),
+    ])
+  }
+
+  const moveDroppedNode = (nodeId: string, destinationId: string): void => {
+    const source = nodes.find(node => node.id === nodeId)
+    if (!source || source.id === destinationId || source.parentId === destinationId) return
+    void runMutation(async () => {
+      await applyMutation(`Move ${source.name}`, [{
+        kind: 'move',
+        nodeId: source.id,
+        parent: { nodeId: destinationId },
+        name: source.name,
+      }])
+    })
   }
 
   if (loading) {
@@ -362,185 +487,62 @@ export default function WorkspaceFilesPanel({ overseer }: WorkspaceFilesPanelPro
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-kumo-base">
-      <div className="flex flex-wrap items-center gap-2 border-b border-kumo-line px-4 py-3">
-        <WorkshopIconButton
-          aria-label="Back to parent folder"
-          disabled={folders.length <= 1 || busy}
-          onClick={goBack}
-        >
-          <ArrowLeft size={16} />
-        </WorkshopIconButton>
-        <div className="min-w-0 flex-1 truncate text-[13px] text-kumo-subtle">
-          {folders.map(folder => folder.name).join(' / ')}
-        </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={event => {
-            if (event.target.files) uploadFiles(event.target.files)
-          }}
-        />
-        <WorkshopButton disabled={busy} onClick={() => fileInputRef.current?.click()}>
-          <UploadSimple size={15} />
-          Upload
-        </WorkshopButton>
-        <WorkshopButton disabled={busy} onClick={() => setCreatingFolder(true)}>
-          <FolderPlus size={15} />
-          New folder
-        </WorkshopButton>
-      </div>
-
-      {creatingFolder && (
-        <div className="flex items-center gap-2 border-b border-kumo-line bg-kumo-elevated px-4 py-2">
-          <WorkshopInput
-            autoFocus
-            aria-label="New folder name"
-            value={newFolderName}
-            onChange={event => setNewFolderName(event.target.value)}
-            onKeyDown={event => {
-              if (event.key === 'Enter') createFolder()
-              if (event.key === 'Escape') setCreatingFolder(false)
-            }}
-          />
-          <WorkshopButton tone="primary" disabled={!newFolderName.trim() || busy} onClick={createFolder}>
-            Create
-          </WorkshopButton>
-          <WorkshopButton disabled={busy} onClick={() => setCreatingFolder(false)}>Cancel</WorkshopButton>
-        </div>
-      )}
-
-      {moving && (
-        <div className="flex flex-wrap items-center gap-2 border-b border-kumo-line bg-kumo-elevated px-4 py-2">
-          <span className="min-w-0 flex-1 truncate text-[12px] text-kumo-subtle">
-            Choose a destination for <span className="font-medium text-kumo-default">{moving.name}</span>.
-          </span>
-          <WorkshopButton
-            tone="primary"
-            disabled={busy || moving.parentId === currentFolderId}
-            onClick={moveNode}
-          >
-            Move {moving.name} here
-          </WorkshopButton>
-          <WorkshopButton disabled={busy} onClick={() => setMoving(null)}>Cancel</WorkshopButton>
-        </div>
-      )}
-
-      <div className="min-h-0 flex-1 overflow-auto">
-        {nodes.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
-            <Folder size={32} className="text-kumo-inactive" />
-            <p className="text-sm text-kumo-default">This folder is empty.</p>
-            <p className="text-xs text-kumo-subtle">Upload any file type, up to 25 MB at a time.</p>
-          </div>
-        ) : (
-          <div role="list" aria-label="Workspace files" className="divide-y divide-kumo-line">
-            {nodes.map(node => (
-              <div key={node.id} role="listitem" className="group flex min-w-0 items-center gap-3 px-4 py-3 hover:bg-kumo-tint/40">
-                {renaming?.id === node.id ? (
-                  <div className="flex min-w-0 flex-1 items-center gap-3">
-                    {node.kind === 'folder'
-                      ? <Folder size={19} className="shrink-0 text-kumo-brand" weight="fill" />
-                      : <File size={19} className="shrink-0 text-kumo-subtle" />}
-                    <div className="min-w-0 flex-1">
-                      <WorkshopInput
-                        autoFocus
-                        aria-label={`Rename ${node.name}`}
-                        value={renameValue}
-                        onChange={event => setRenameValue(event.target.value)}
-                        onKeyDown={event => {
-                          if (event.key === 'Enter') renameNode()
-                          if (event.key === 'Escape') setRenaming(null)
-                        }}
-                      />
-                      <span className="block truncate text-[11px] text-kumo-inactive">
-                        {node.kind === 'file' ? `${formatBytes(node.size)} · ` : ''}
-                        Modified by {node.updatedBy}
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={busy || node.kind !== 'folder'}
-                    onClick={() => openFolder(node)}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-default"
-                  >
-                    {node.kind === 'folder'
-                      ? <Folder size={19} className="shrink-0 text-kumo-brand" weight="fill" />
-                      : <File size={19} className="shrink-0 text-kumo-subtle" />}
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[13px] font-medium text-kumo-default">{node.name}</span>
-                      <span className="block truncate text-[11px] text-kumo-inactive">
-                        {node.kind === 'file' ? `${formatBytes(node.size)} · ` : ''}
-                        Modified by {node.updatedBy}
-                      </span>
-                    </span>
-                  </button>
-                )}
-                {renaming?.id === node.id ? (
-                  <WorkshopButton
-                    disabled={busy || !renameValue.trim() || renameValue.trim() === renaming.name}
-                    onClick={renameNode}
-                  >
-                    Save
-                  </WorkshopButton>
-                ) : (
-                  <>
-                    {node.kind === 'file' && (
-                      <WorkshopIconButton aria-label={`Download ${node.name}`} disabled={busy} onClick={() => downloadFile(node)}>
-                        <DownloadSimple size={16} />
-                      </WorkshopIconButton>
-                    )}
-                    <WorkshopIconButton
-                      aria-label={`Rename ${node.name}`}
-                      disabled={busy}
-                      onClick={() => { setRenaming(node); setRenameValue(node.name) }}
-                    >
-                      <Pencil size={16} />
-                    </WorkshopIconButton>
-                    <WorkshopIconButton
-                      aria-label={`Move ${node.name}`}
-                      disabled={busy}
-                      onClick={() => setMoving(node)}
-                    >
-                      <ArrowRight size={16} />
-                    </WorkshopIconButton>
-                    <WorkshopIconButton aria-label={`Delete ${node.name}`} danger disabled={busy} onClick={() => setDeleting(node)}>
-                      <Trash size={16} />
-                    </WorkshopIconButton>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <details className="shrink-0 border-t border-kumo-line px-4 py-3">
-        <summary className="cursor-pointer text-[12px] font-medium text-kumo-default">
-          Version history ({history.length})
-        </summary>
-        <div className="mt-2 max-h-40 space-y-2 overflow-auto">
-          {history.map(commit => (
-            <div key={commit.oid} className="text-[11px] text-kumo-subtle">
-              <div className="truncate font-medium text-kumo-default">{historySummary(commit.message)}</div>
-              <div>{commit.author.name} · {commit.timestamp.toLocaleString()}</div>
-            </div>
-          ))}
-        </div>
-      </details>
-
-      <DeleteConfirmationDialog
-        open={deleting !== null}
-        title={`Delete ${deleting?.name ?? 'item'}?`}
-        description="This creates a new workspace version without the selected item."
-        isDeleting={busy}
-        onOpenChange={open => { if (!open) setDeleting(null) }}
-        onConfirm={deleteNode}
+    <div className="flex h-full min-h-0 flex-col bg-kumo-base md:flex-row">
+      <WorkspaceFilesBrowser
+        folders={folders}
+        nodes={nodes}
+        history={history}
+        selectedNode={selectedNode}
+        currentFolderId={currentFolderId}
+        busy={busy}
+        creatingFile={creatingFile}
+        newFileName={newFileName}
+        creatingFolder={creatingFolder}
+        newFolderName={newFolderName}
+        renaming={renaming}
+        renameValue={renameValue}
+        moving={moving}
+        deleting={deleting}
+        onRefresh={() => void runMutation(refreshWorkspace)}
+        onUploadFiles={uploadFiles}
+        onNewFileNameChange={value => { setNewFileName(value); setCreatingFile(true) }}
+        onCreateFile={createFile}
+        onCancelCreateFile={() => setCreatingFile(false)}
+        onNewFolderNameChange={value => { setNewFolderName(value); setCreatingFolder(true) }}
+        onCreateFolder={createFolder}
+        onCancelCreateFolder={() => setCreatingFolder(false)}
+        onRenameValueChange={setRenameValue}
+        onRenameNode={renameNode}
+        onCancelRename={() => setRenaming(null)}
+        onMoveNode={moveNode}
+        onCancelMove={() => setMoving(null)}
+        onDeleteNode={deleteNode}
+        onCancelDelete={() => setDeleting(null)}
+        onDownload={downloadFile}
+        onOpenFolder={openFolder}
+        onSelectFile={selectFile}
+        onGoBack={goBack}
+        onStartRename={node => { setRenaming(node); setRenameValue(node.name) }}
+        onStartMove={node => setMoving(node)}
+        onStartDelete={node => setDeleting(node)}
+        onMoveDroppedNode={moveDroppedNode}
       />
+      {selectedNode && revision && activeTarget && (
+        <div className="min-h-0 min-w-0 flex-1">
+          <WorkspaceFileEditor
+            overseer={overseer}
+            target={activeTarget}
+            revision={revision}
+            node={selectedNode}
+            history={history}
+            selectedCommit={selectedRevision}
+            onRevisionChange={commit => onSelectionChange?.(selectedNode.id, commit)}
+            onDownload={() => downloadFile(selectedNode)}
+            onSaved={handleEditorSaved}
+            onDirtyChange={setEditorDirty}
+          />
+        </div>
+      )}
     </div>
   )
 }

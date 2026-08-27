@@ -1,11 +1,13 @@
 import { createFileRoute } from '@tanstack/react-router'
 import GadgetEditor from '../GadgetEditor'
 
-type GadgetSearch = {
+/** Parsed workspace route search state. */
+export type WorkspaceSearch = {
   chat?: number
-  // Selected workpiece (gadget) ID. Workpiece IDs start at 0, so parsing must not treat 0 as
-  // absent.
+  /** Selected workpiece ID. Zero is valid. */
   w?: number
+  file?: string
+  revision?: string
 }
 
 function parseIntParam(value: unknown): number | undefined {
@@ -17,12 +19,21 @@ function parseIntParam(value: unknown): number | undefined {
   return undefined
 }
 
+function parseStringParam(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/** Parse workspace route search values without losing numeric zero. */
+export function parseWorkspaceSearch(search: Record<string, unknown>): WorkspaceSearch {
+  return {
+    chat: parseIntParam(search.chat),
+    w: parseIntParam(search.w),
+    file: parseStringParam(search.file),
+    revision: parseStringParam(search.revision),
+  }
+}
+
 export const Route = createFileRoute('/workspace/$id')({
   component: GadgetEditor,
-  validateSearch: (search: Record<string, unknown>): GadgetSearch => ({
-    chat: typeof search.chat === 'number' ? search.chat
-      : typeof search.chat === 'string' ? Number(search.chat) || undefined
-      : undefined,
-    w: parseIntParam(search.w),
-  }),
+  validateSearch: parseWorkspaceSearch,
 })

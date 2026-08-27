@@ -1,3 +1,27 @@
+export interface DevArtifactsConfig {
+  accountId: string;
+  namespace: string;
+}
+
+export function getDevArtifactsConfig(
+  env: NodeJS.ProcessEnv,
+): DevArtifactsConfig | undefined {
+  const accountId = env.ARTIFACTS_ACCOUNT_ID;
+  const namespace = env.ARTIFACTS_NAMESPACE;
+  const apiToken = env.ARTIFACTS_API_TOKEN;
+  if (accountId === undefined && namespace === undefined && apiToken === undefined) {
+    return undefined;
+  }
+  if (!accountId?.trim() || !namespace?.trim() || !apiToken?.trim()) {
+    throw new Error(
+        "ARTIFACTS_ACCOUNT_ID, ARTIFACTS_NAMESPACE, and ARTIFACTS_API_TOKEN must be set together.");
+  }
+  return {
+    accountId: accountId.trim(),
+    namespace: namespace.trim(),
+  };
+}
+
 /**
  * The port a `VITE_BACKEND_HOST` names, as a string, or null when it names no port. Throws on a
  * value that is not a bare `host[:port]`.
