@@ -30,6 +30,9 @@ export default defineConfig({
   ],
   test: {
     include: ["__tests__/*.test.ts"],
+    // These files share fixed Durable Object namespaces and process-wide TestHooks state.
+    // Running them together lets one file's reset race another file's in-flight RPCs.
+    fileParallelism: false,
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ["../../scripts/assert-workerd.ts"],
   },
