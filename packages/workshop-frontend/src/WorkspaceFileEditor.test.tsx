@@ -364,6 +364,7 @@ describe('WorkspaceFileEditor', () => {
         stream(reference.revision.commit === selected ? 'new' : 'old')
       )),
     } as unknown as RpcStub<Overseer>
+    const onDownload = vi.fn<() => void>()
 
     await act(async () => root.render(
       <WorkspaceFileEditor
@@ -374,6 +375,7 @@ describe('WorkspaceFileEditor', () => {
         history={history}
         selectedCommit={selected}
         onRevisionChange={() => {}}
+        onDownload={onDownload}
         onSaved={() => {}}
       />,
     ))
@@ -382,6 +384,11 @@ describe('WorkspaceFileEditor', () => {
     expect(container.querySelector('[data-testid="diff"]')?.textContent).toBe('old|new')
     expect(container.textContent).toContain('Historical revision')
     expect(container.textContent).not.toContain('Save')
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find(button => button.textContent === 'Download')?.click()
+    })
+    expect(onDownload).toHaveBeenCalledOnce()
   })
 
   it('keeps dirty edits out of history until explicitly discarded', async () => {

@@ -69,8 +69,14 @@ vi.mock('./components/WorkshopControls', () => ({
 }))
 
 vi.mock('./WorkspaceFileEditor', () => ({
-  default: ({ node: file }: { node: WorkspaceFileNode }) => (
-    <div data-testid="workspace-file-editor">Open {file.name}</div>
+  default: ({ node: file, onDownload }: {
+    node: WorkspaceFileNode
+    onDownload?: () => void
+  }) => (
+    <div data-testid="workspace-file-editor">
+      Open {file.name}
+      {onDownload && <button aria-label="Download open file" onClick={onDownload}>Download</button>}
+    </div>
   ),
 }))
 
@@ -109,6 +115,52 @@ function node(overrides: Partial<WorkspaceFileNode>): WorkspaceFileNode {
 }
 
 describe('WorkspaceFilesPanel', () => {
+  it('keeps a deleted file open at its requested immutable revision', async () => {
+    const current = 'a'.repeat(40)
+    const historical = 'b'.repeat(40)
+    const deletedFile = node({ id: 'file', name: 'deleted.txt', path: 'deleted.txt' })
+    const getWorkspaceNode = vi.fn<Overseer['getWorkspaceNode']>(async request => {
+      if (request.revision.commit === historical) return deletedFile
+      throw createWorkspaceFileError(WORKSPACE_FILE_ERROR_CODES.invalidRequest)
+    })
+    const readWorkspaceFile = vi.fn<Overseer['readWorkspaceFile']>(async () => (
+      new Blob(['historical content']).stream()
+    ))
+    const onSelectionChange = vi.fn<(
+      nodeId: string | undefined,
+      revision: string | undefined,
+    ) => void>()
+    const overseer = {
+      getWorkspaceRevision: vi.fn<Overseer['getWorkspaceRevision']>(async () => revision(current)),
+      listWorkspaceChildren: vi.fn<Overseer['listWorkspaceChildren']>(async () => []),
+      getWorkspaceHistory: vi.fn<Overseer['getWorkspaceHistory']>(async () => []),
+      getWorkspaceNode,
+      readWorkspaceFile,
+    } as unknown as RpcStub<Overseer>
+    saveStreamToFile.mockImplementation(async read => { await read() })
+
+    await act(async () => root.render(
+      <WorkspaceFilesPanel
+        overseer={overseer}
+        selectedNodeId="file"
+        selectedRevision={historical}
+        onSelectionChange={onSelectionChange}
+      />,
+    ))
+    await act(async () => {})
+
+    expect(container.textContent).toContain('Open deleted.txt')
+    expect(onSelectionChange).not.toHaveBeenCalled()
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Download open file"]')?.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+    })
+    expect(readWorkspaceFile).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: 'file',
+      revision: { kind: 'accepted', commit: historical },
+    }))
+  })
+
   it('reloads the same chat target after a command closes its pending fork', async () => {
     const initial = chatRevision('a'.repeat(40))
     const reset = chatRevision('b'.repeat(40))

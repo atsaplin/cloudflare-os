@@ -194,7 +194,9 @@ export default function WorkspaceFilesPanel({
     overseer.getWorkspaceNode({
       workspaceId: revision.workspaceId,
       nodeId: selectedNodeId,
-      revision: revision.revision,
+      revision: selectedRevision
+        ? { ...revision.revision, commit: selectedRevision }
+        : revision.revision,
     }).then(node => {
       if (!cancelled) setSelectedNode(node.kind === 'file' ? node : null)
     }).catch(error => {
@@ -204,7 +206,7 @@ export default function WorkspaceFilesPanel({
       onSelectionChange?.(undefined, undefined)
     })
     return () => { cancelled = true }
-  }, [onSelectionChange, overseer, revision, selectedNodeId])
+  }, [onSelectionChange, overseer, revision, selectedNodeId, selectedRevision])
 
   const resolveSelectedNode = useCallback(async (
     nextRevision: WorkspaceFileRevision,
@@ -535,6 +537,7 @@ export default function WorkspaceFilesPanel({
             history={history}
             selectedCommit={selectedRevision}
             onRevisionChange={commit => onSelectionChange?.(selectedNode.id, commit)}
+            onDownload={() => downloadFile(selectedNode)}
             onSaved={handleEditorSaved}
             onDirtyChange={setEditorDirty}
           />

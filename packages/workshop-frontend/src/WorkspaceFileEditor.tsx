@@ -28,6 +28,7 @@ interface WorkspaceFileEditorProps {
   history: CommitInfo[]
   selectedCommit?: string
   onRevisionChange(commit: string | undefined): void
+  onDownload?(): void
   onSaved(revision: WorkspaceFileRevision): void
   onDirtyChange?(dirty: boolean): void
 }
@@ -278,6 +279,7 @@ interface EditorToolbarProps {
   saving: boolean
   conflict: boolean
   onModeChange(mode: EditorMode): void
+  onDownload?: () => void
   onSave(): void
   onDiscard(): void
 }
@@ -292,6 +294,7 @@ function EditorToolbar({
   saving,
   conflict,
   onModeChange,
+  onDownload,
   onSave,
   onDiscard,
 }: EditorToolbarProps) {
@@ -300,6 +303,7 @@ function EditorToolbar({
       <span className="min-w-0 flex-1 truncate text-sm font-medium text-kumo-default">{filename}</span>
       {selectedCommit && <span className="text-xs text-kumo-subtle">Historical revision</span>}
       {dirty && <span className="text-xs text-kumo-warning">Unsaved changes</span>}
+      {selectedCommit && onDownload && <WorkshopButton onClick={onDownload}>Download</WorkshopButton>}
       {textFile && (
         <>
           <WorkshopButton disabled={mode === 'edit'} onClick={() => onModeChange('edit')}>Edit</WorkshopButton>
@@ -335,6 +339,7 @@ export default function WorkspaceFileEditor({
   history,
   selectedCommit,
   onRevisionChange,
+  onDownload,
   onSaved,
   onDirtyChange,
 }: WorkspaceFileEditorProps) {
@@ -461,6 +466,7 @@ export default function WorkspaceFileEditor({
         saving={saving}
         conflict={conflict !== null}
         onModeChange={setMode}
+        onDownload={onDownload}
         onSave={() => void save()}
         onDiscard={discardChanges}
       />
